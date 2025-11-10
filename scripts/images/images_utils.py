@@ -8,6 +8,8 @@ import joblib
 import os
 from enum import Enum
 
+from .grf_data import load_grf_dataset
+
 from torchcfm.models.unet import UNetModel  # type: ignore
 
 
@@ -92,12 +94,23 @@ def load_imagenette_by_class(size):
     return trainset, testset, classes, dims
 
 
-def load_data(dataname, size):
+def load_data(dataname, size, **kwargs):
     if dataname == 'imagenette':
         return load_imagenette_by_class(size)
 
-    elif dataname == 'cifar10':
+    if dataname == 'cifar10':
         return load_cifar10_by_class()
+
+    if dataname == 'grf':
+        dataset = load_grf_dataset(
+            kwargs.get('grf_path', './data/mm_data.npz'),
+            test_size=kwargs.get('grf_test_size', 0.2),
+            seed=kwargs.get('grf_seed', 42),
+            normalise=kwargs.get('grf_normalise', True),
+        )
+        return dataset.trainset, dataset.testset, dataset.classes, dataset.dims
+
+    raise ValueError(f'Unsupported dataset "{dataname}"')
 
 
 def get_hypers(dataname, size, dims):
@@ -125,6 +138,13 @@ def get_hypers(dataname, size, dims):
     elif dataname == 'cifar10':
         hypers['dims'] = dims
         hypers['channels'] = 256
+        hypers['depth'] = 2
+        hypers['channel_mult'] = (1, 2, 2, 2)
+        hypers['attention_res'] = '16'
+        hypers['use_fp16'] = False
+    elif dataname == 'grf':
+        hypers['dims'] = dims
+        hypers['channels'] = 128
         hypers['depth'] = 2
         hypers['channel_mult'] = (1, 2, 2, 2)
         hypers['attention_res'] = '16'
