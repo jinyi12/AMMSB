@@ -19,6 +19,15 @@ __all__ = [
     'fit_regressor',
     'interpolate',
     'DiffusionRegressor',
+    'build_frame_kernel',
+    'select_non_harmonic_coordinates',
+    'fit_coordinate_splines',
+    'evaluate_coordinate_splines',
+    'compute_latent_harmonics',
+    'GeometricHarmonicsModel',
+    'fit_geometric_harmonics',
+    'nystrom_extension',
+    'geometric_harmonics_lift',
 ]
 
 from abc import ABC, abstractmethod
@@ -30,6 +39,7 @@ import numpy as np
 from scipy import sparse
 from scipy.interpolate import CubicSpline
 from scipy.spatial import cKDTree
+from scipy.spatial.distance import cdist, pdist, squareform
 from scipy.sparse.linalg import eigsh as scipy_eigsh
 
 try:  # Allow importing the module without CuPy present.
@@ -45,23 +55,9 @@ except ModuleNotFoundError as exc:  # pragma: no cover - exercised when CuPy mis
 else:  # pragma: no cover - optional path when CuPy is installed.
     _CUPY_IMPORT_ERROR = None
 
-try:
-    import jax
-    import jax.numpy as jnp
-except ModuleNotFoundError as exc:  # pragma: no cover - exercised when JAX missing.
-    jax = None
-    jnp = None
-    _JAX_IMPORT_ERROR = exc
-else:  # pragma: no cover - optional success path.
-    _JAX_IMPORT_ERROR = None
-try:
-    from jaxtyping import Array, Float
-except ModuleNotFoundError:  # pragma: no cover - type annotations fallback.
-    class _JaxtypingPlaceholder:
-        def __getitem__(self, _):
-            return Any
-
-    Array = Float = _JaxtypingPlaceholder()  # type: ignore
+import jax
+import jax.numpy as jnp
+from jaxtyping import Array, Float
 
 from .distance import CuPyDistanceMixin, JAXDistanceMixin
 from .kernels import exponential_kernel
@@ -87,7 +83,7 @@ class BaseDiffusionMaps(ABC):
     alpha: float
     points: Float[Array, 'm n']
     kernel_matrix: Float[Array, 'm m']
-    eigenvalues: Float[Array, 'm']
+    eigenvalues: Float[Array, ' m']
     eigenvectors: Float[Array, 'm n']
 
     def __init__(
@@ -139,7 +135,7 @@ class BaseDiffusionMaps(ABC):
     @abstractmethod
     def _solve_eigenproblem(
         kernel_matrix: Float[Array, 'n n'], k: int
-    ) -> tuple[Float[Array, 'n'], Float[Array, 'n k']]:
+    ) -> tuple[Float[Array, ' n'], Float[Array, 'n k']]:
         """Return eigendecomposition."""
 
     @abstractmethod
@@ -191,7 +187,7 @@ class DiffusionMaps(CuPyDistanceMixin, BaseDiffusionMaps):
     @staticmethod
     def _solve_eigenproblem(
         kernel_matrix: Float[Array, 'n n'], k: int
-    ) -> tuple[Float[Array, 'n'], Float[Array, 'n k']]:
+    ) -> tuple[Float[Array, ' n'], Float[Array, 'n k']]:
         # Apply similarity transformation to reduce to a symmetric
         # eigenproblem.
         inv_sqrt_diag_vector = cupyx.rsqrt(kernel_matrix.sum(axis=1))
@@ -255,7 +251,7 @@ if jax is not None:
         @partial(jax.jit, static_argnames=['k'])
         def _solve_eigenproblem(
             kernel_matrix: Float[Array, 'n n'], k: int
-        ) -> tuple[Float[Array, 'n'], Float[Array, 'n k']]:
+        ) -> tuple[Float[Array, ' n'], Float[Array, 'n k']]:
             # Apply similarity transformation.
             sqrt_diag_vector = jnp.sqrt(kernel_matrix.sum(axis=1))
             symmetric_kernel_matrix = (
@@ -324,7 +320,7 @@ else:
         def __init__(self, *args, **kwargs):
             raise ModuleNotFoundError(
                 'DifferentiableDiffusionMaps requires jax; please install it.'
-            ) from _JAX_IMPORT_ERROR
+            )
 
 
 def _reshape_scalar_field(
@@ -583,6 +579,36 @@ def fit_voxel_splines(
     return splines
 
 
+def fit_coordinate_splines(
+    coords: np.ndarray,
+    t_grid: Sequence[float],
+    *,
+    bc_type: str | tuple = 'natural',
+) -> list[CubicSpline]:
+    """Fit cubic splines for low-dimensional intrinsic coordinates."""
+    coords = np.asarray(coords)
+    if coords.ndim != 2:
+        raise ValueError('coords must have shape (num_times, num_coords).')
+    t_grid = np.asarray(t_grid, dtype=np.float64)
+    if coords.shape[0] != t_grid.shape[0]:
+        raise ValueError('coords and t_grid must share the first dimension.')
+
+    splines = [
+        CubicSpline(t_grid, coords[:, j], bc_type=bc_type)
+        for j in range(coords.shape[1])
+    ]
+    return splines
+
+
+def evaluate_coordinate_splines(
+    splines: Sequence[CubicSpline], t_star: float
+) -> np.ndarray:
+    """Evaluate a list of per-dimension splines at ``t_star``."""
+    if not splines:
+        raise ValueError('splines list is empty.')
+    return np.column_stack([s(t_star) for s in splines])
+
+
 @dataclass
 class DiffusionRegressor:
     """Simple ridge regressor mapping diffusion coords to scalar values."""
@@ -642,3 +668,305 @@ def interpolate(
             raise ValueError('grid_shape mismatch with number of voxels.')
         return predictions.reshape(grid_shape)
     return predictions.reshape(-1)
+
+
+def build_frame_kernel(
+    frames: np.ndarray,
+    *,
+    epsilon: Optional[float] = None,
+    weight_mode: str = 'rbf',
+) -> sparse.csr_matrix:
+    """Return an adjacency matrix where each node represents a full frame."""
+    arrays = np.asarray(frames)
+    if arrays.ndim < 2:
+        raise ValueError('frames must have at least two dimensions.')
+    num_frames = arrays.shape[0]
+    flat = arrays.reshape(num_frames, -1)
+    if num_frames < 2:
+        raise ValueError('Need at least two frames to build a kernel.')
+
+    distances2 = squareform(pdist(flat, metric='sqeuclidean'))
+    mask = distances2 > 0
+    if epsilon is None:
+        epsilon = float(np.median(distances2[mask])) if np.any(mask) else 1.0
+    if epsilon <= 0:
+        epsilon = 1.0
+
+    if weight_mode not in {'rbf', 'binary'}:
+        raise ValueError("weight_mode must be 'rbf' or 'binary'.")
+    if weight_mode == 'rbf':
+        kernel = np.exp(-distances2 / epsilon)
+    else:
+        kernel = np.ones_like(distances2)
+
+    np.fill_diagonal(kernel, 0.0)
+    return sparse.csr_matrix(kernel)
+
+
+def select_non_harmonic_coordinates(
+    eigenvalues: np.ndarray,
+    diffusion_coords: np.ndarray,
+    *,
+    residual_threshold: float = 1e-3,
+    min_coordinates: int = 2,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Heuristically select intrinsic, non-harmonic coordinates via residuals.
+
+    The residual proxy follows the spirit of the Dsilva et al. diagnostic by
+    ranking coordinates with the largest deviation from harmonic behaviour,
+    measured here through finite differences in the spectrum. Components with
+    residuals above ``residual_threshold`` are retained, with at least
+    ``min_coordinates`` kept even if the threshold is not met.
+    """
+    eigenvalues = np.asarray(eigenvalues)
+    coords = np.asarray(diffusion_coords)
+    if coords.ndim != 2:
+        raise ValueError('diffusion_coords must be a 2D array.')
+    if eigenvalues.ndim != 1 or eigenvalues.shape[0] != coords.shape[1]:
+        raise ValueError('eigenvalues must align with diffusion coordinate columns.')
+
+    lam = np.maximum(np.abs(eigenvalues), 1e-12)
+    forward = np.roll(lam, -1)
+    forward[-1] = lam[-1]
+    residuals = np.abs((lam - forward) / lam)
+
+    mask = residuals >= residual_threshold
+    if mask.sum() < min_coordinates:
+        top_idx = np.argsort(residuals)[::-1][:min_coordinates]
+        mask[top_idx] = True
+
+    intrinsic = coords[:, mask]
+    return intrinsic, mask, residuals
+
+
+def compute_latent_harmonics(
+    intrinsic_coords: np.ndarray,
+    *,
+    ell: Optional[int] = None,
+    epsilon: Optional[float] = None,
+    alpha: float = 0.0,
+) -> tuple[np.ndarray, np.ndarray, float, np.ndarray]:
+    """Compute latent harmonics (DDM second pass) on intrinsic coordinates.
+    
+    According to Giovanis et al. (2025), this computes eigenfunctions of the
+    Laplace-Beltrami operator on the intrinsic manifold.
+    
+    Returns
+    -------
+    eigenvalues : np.ndarray
+        Eigenvalues λ_j (shape: ell,)
+    eigenvectors : np.ndarray  
+        Normalized eigenvectors ψ_j (shape: num_samples, ell)
+    epsilon : float
+        Bandwidth parameter used for the kernel.
+    weights : np.ndarray
+        Sampling weights proportional to latent-kernel row sums (shape num_samples,).
+    """
+    coords = np.asarray(intrinsic_coords)
+    if coords.ndim != 2:
+        raise ValueError('intrinsic_coords must be (num_samples, num_dims).')
+    num_samples = coords.shape[0]
+    if num_samples < 2:
+        raise ValueError('Need at least two samples to compute latent harmonics.')
+    if ell is None:
+        ell = max(1, min(32, num_samples - 1))
+
+    # Build kernel on intrinsic manifold
+    distances2 = squareform(pdist(coords, metric='sqeuclidean'))
+    mask = distances2 > 0
+    if epsilon is None:
+        epsilon = float(np.median(distances2[mask])) if np.any(mask) else 1.0
+    if epsilon <= 0:
+        epsilon = 1.0
+
+    adjacency = np.exp(-distances2 / epsilon)
+    np.fill_diagonal(adjacency, 0.0)
+    weights = adjacency.sum(axis=1)
+    if np.any(weights <= 0):
+        raise ValueError('Latent kernel produced zero row sums; graph is disconnected.')
+    weights = weights / weights.sum()
+    W = sparse.csr_matrix(adjacency)
+    
+    # Get eigendecomposition
+    # diffusion_embedding returns (λ, Φ) where Φ = eigenvectors * λ (diffusion coordinates)
+    latent_vals, latent_diffusion_coords = diffusion_embedding(
+        W, r=min(ell, num_samples - 1), alpha=alpha
+    )
+    
+    # CRITICAL FIX: Recover eigenvectors from diffusion coordinates
+    # Since Φ[:,j] = eigenvectors[:,j] * λ[j], we have eigenvectors[:,j] = Φ[:,j] / λ[j]
+    # Use the original eigenvalues (with sign) for division
+    safe_vals = np.where(np.abs(latent_vals) < 1e-12, 1e-12, latent_vals)
+    latent_vecs = latent_diffusion_coords / safe_vals[np.newaxis, :]
+    
+    # Normalize eigenvectors to unit length under the weighted inner product.
+    weighted_norms = np.sqrt((weights[:, None] * latent_vecs**2).sum(axis=0))
+    weighted_norms = np.maximum(weighted_norms, 1e-12)
+    latent_vecs = latent_vecs / weighted_norms[np.newaxis, :]
+    
+    return latent_vals, latent_vecs, epsilon, weights
+
+
+
+
+@dataclass
+class GeometricHarmonicsModel:
+    """Container with the information required for GH lifting."""
+
+    g_train: np.ndarray
+    psi: np.ndarray
+    sigma: np.ndarray
+    coeffs: np.ndarray
+    eps_star: float
+    weights: np.ndarray
+    ridge: float = 0.0
+    grid_shape: Optional[tuple[int, int]] = None
+    mean_field: Optional[np.ndarray] = None
+
+
+def fit_geometric_harmonics(
+    intrinsic_coords: np.ndarray,
+    samples: np.ndarray,
+    *,
+    ell: Optional[int] = None,
+    epsilon_star: Optional[float] = None,
+    alpha: float = 0.0,
+    delta: float = 1e-3,
+    ridge: float = 1e-6,
+    grid_shape: Optional[tuple[int, int]] = None,
+    center: bool = True,
+) -> GeometricHarmonicsModel:
+    """Fit latent harmonics and compute geometric harmonic lift coefficients.
+    
+    This implements the geometric harmonics approach from Giovanis et al. (2025).
+    The key idea: represent ambient data f as f(g) = Σ c_j ψ_j(g) where
+    ψ_j are eigenfunctions on the intrinsic manifold.
+    """
+    values = np.asarray(samples)
+    if values.ndim != 2:
+        raise ValueError('samples must be a 2D array (num_samples, ambient_dim).')
+    if intrinsic_coords.shape[0] != values.shape[0]:
+        raise ValueError('intrinsic_coords and samples must align on the first axis.')
+
+    if ridge < 0:
+        raise ValueError('ridge must be non-negative.')
+
+    # Compute eigenfunctions on intrinsic manifold
+    sigma, psi, eps_star, weights = compute_latent_harmonics(
+        intrinsic_coords, ell=ell, epsilon=epsilon_star, alpha=alpha
+    )
+    
+    # Filter small eigenvalues for numerical stability
+    # CRITICAL FIX: Ensure at least 1 component is kept
+    if delta <= 0 or delta >= 1:
+        raise ValueError('delta must lie in (0, 1).')
+    
+    if len(sigma) == 0:
+        raise ValueError('No eigenvalues computed. Check intrinsic coordinates.')
+    
+    # Use absolute values for filtering (eigenvalues can be negative due to numerical issues)
+    sigma_abs = np.abs(sigma)
+    cutoff = sigma_abs[0] * delta
+    mask = sigma_abs >= cutoff
+    
+    # Ensure at least one eigenvalue is kept
+    if not np.any(mask):
+        mask[0] = True
+    
+    psi_kept = psi[:, mask]
+    sigma_kept = sigma[mask]
+
+    if center:
+        mean_field = np.average(values, axis=0, weights=weights)
+        centered_values = values - mean_field
+    else:
+        mean_field = None
+        centered_values = values
+
+    # Weighted projection: a_j = Σ_i w_i h_i ψ_j(i)
+    weighted_values = centered_values * weights[:, None]
+    coeffs = psi_kept.T @ weighted_values
+
+    return GeometricHarmonicsModel(
+        g_train=np.asarray(intrinsic_coords),
+        psi=psi_kept,
+        sigma=sigma_kept,
+        coeffs=coeffs,
+        eps_star=eps_star,
+        weights=weights,
+        ridge=ridge,
+        grid_shape=grid_shape,
+        mean_field=mean_field,
+    )
+
+
+
+def nystrom_extension(
+    query_coords: np.ndarray,
+    *,
+    reference_coords: np.ndarray,
+    psi: np.ndarray,
+    sigma: np.ndarray,
+    epsilon: float,
+    ridge: float = 0.0,
+) -> np.ndarray:
+    """Evaluate latent harmonics at query points via the Nyström formula.
+
+    Implements ψ_j(g*) = (1/λ_j) · Σ_i k(g*, g_i) ψ_j(g_i) following the
+    out-of-sample extension in Coifman & Lafon (2006) and the DDM+GH workflow
+    of Giovanis et al. (2025).
+    """
+    queries = np.atleast_2d(query_coords)
+    refs = np.asarray(reference_coords)
+    if refs.ndim != 2:
+        raise ValueError('reference_coords must be 2D.')
+    if refs.shape[0] != psi.shape[0]:
+        raise ValueError('psi must align with reference_coords.')
+
+    if ridge < 0:
+        raise ValueError('ridge must be non-negative.')
+
+    # Compute kernel between query and reference points
+    distances2 = cdist(queries, refs, metric='sqeuclidean')
+    kernel_weights = np.exp(-distances2 / epsilon)
+
+    # Nyström formula with ridge: ψ_j(g*) = Σ_i k(g*, g_i) ψ_j(g_i) / (λ_j + λ_ridge)
+    denom = sigma + ridge
+    sign = np.sign(denom)
+    sign[sign == 0] = 1.0
+    safe_denom = sign * np.maximum(np.abs(denom), 1e-12)
+    weighted_sum = kernel_weights @ psi
+    evaluations = weighted_sum / safe_denom[np.newaxis, :]
+
+    return evaluations
+
+
+def geometric_harmonics_lift(
+    query_coords: np.ndarray,
+    model: GeometricHarmonicsModel,
+) -> np.ndarray:
+    """Lift intrinsic coordinates to ambient space using GH coefficients.
+    
+    Reconstructs: f̂(g*) = Σ_j c_j ψ_j(g*)
+    """
+    # Evaluate harmonics at query points
+    Psi_star = nystrom_extension(
+        query_coords,
+        reference_coords=model.g_train,
+        psi=model.psi,
+        sigma=model.sigma,
+        epsilon=model.eps_star,
+        ridge=model.ridge,
+    )
+    
+    # Reconstruct: f = Ψ @ c
+    fields = Psi_star @ model.coeffs
+    if model.mean_field is not None:
+        fields = fields + model.mean_field
+
+    if model.grid_shape is None:
+        return fields
+    grid_size = model.grid_shape[0] * model.grid_shape[1]
+    if fields.shape[1] != grid_size:
+        raise ValueError('grid_shape mismatch with GH coefficient dimension.')
+    return fields.reshape(-1, *model.grid_shape)

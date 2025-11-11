@@ -12,7 +12,7 @@ else:  # pragma: no cover
 
 try:
     from jaxtyping import Array, Float
-except ModuleNotFoundError:  # pragma: no cover - type annotations fallback.
+except ModuleNotFoundError:  # pragma: no cover - fallback when jaxtyping missing.
     class _JaxtypingPlaceholder:
         def __getitem__(self, _):
             return Any

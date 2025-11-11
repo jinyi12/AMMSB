@@ -24,13 +24,12 @@ else:  # pragma: no cover - optional success path.
 
 try:
     from jaxtyping import Array, Float
-except ModuleNotFoundError:  # pragma: no cover - type annotations fallback.
+except ModuleNotFoundError:  # pragma: no cover - fallback when jaxtyping missing.
     class _JaxtypingPlaceholder:
         def __getitem__(self, _):
             return Any
 
     Array = Float = _JaxtypingPlaceholder()  # type: ignore
-
 
 class DistanceMixin(ABC):
     """Squared distances."""
