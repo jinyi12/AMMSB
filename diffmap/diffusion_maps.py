@@ -28,12 +28,14 @@ __all__ = [
     'fit_geometric_harmonics',
     'nystrom_extension',
     'geometric_harmonics_lift',
+    'geometric_harmonics_diagnostics',
 ]
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from functools import partial
 from typing import Any, Callable, Optional, Sequence
+import warnings
 
 import numpy as np
 from scipy import sparse
@@ -703,20 +705,72 @@ def build_frame_kernel(
     return sparse.csr_matrix(kernel)
 
 
+def _local_linear_regression_residual(
+    predictors: np.ndarray,
+    target: np.ndarray,
+    *,
+    bandwidth: Optional[float],
+    ridge: float,
+) -> float:
+    """Return the LLR leave-one-out error for ``target ~ predictors``."""
+    predictors = np.asarray(predictors, dtype=np.float64)
+    target = np.asarray(target, dtype=np.float64).ravel()
+    n, d = predictors.shape
+    if n < 3 or d == 0:
+        return 1.0
+
+    if bandwidth is None:
+        pairwise = squareform(pdist(predictors, metric='euclidean'))
+        median = np.median(pairwise[pairwise > 0])
+        bandwidth = median / 3.0 if median > 0 else 1.0
+    bandwidth = float(max(bandwidth, 1e-12))
+    ridge = float(max(ridge, 0.0))
+
+    design = np.hstack([np.ones((n, 1)), predictors])
+    predictions = np.zeros(n, dtype=np.float64)
+
+    for i in range(n):
+        diff = predictors - predictors[i]
+        sq_dist = np.sum(diff * diff, axis=1)
+        weights = np.exp(-sq_dist / (bandwidth**2))
+        weights[i] = 0.0
+        if np.sum(weights) <= 1e-12:
+            predictions[i] = 0.0
+            continue
+        sqrt_w = np.sqrt(weights)[:, None]
+        Aw = design * sqrt_w
+        yw = target[:, None] * sqrt_w
+        gram = Aw.T @ Aw
+        gram.flat[:: gram.shape[0] + 1] += ridge
+        rhs = Aw.T @ yw
+        try:
+            theta = np.linalg.solve(gram, rhs)
+        except np.linalg.LinAlgError:
+            theta = np.linalg.lstsq(gram, rhs, rcond=None)[0]
+        predictions[i] = design[i] @ theta
+
+    residual = target - predictions
+    denom = np.linalg.norm(target)
+    if denom <= 1e-12:
+        return 0.0
+    return float(np.linalg.norm(residual) / denom)
+
+
 def select_non_harmonic_coordinates(
     eigenvalues: np.ndarray,
     diffusion_coords: np.ndarray,
     *,
-    residual_threshold: float = 1e-3,
+    residual_threshold: float = 1e-1,
     min_coordinates: int = 2,
+    llr_bandwidth: Optional[float] = None,
+    llr_ridge: float = 1e-8,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Heuristically select intrinsic, non-harmonic coordinates via residuals.
+    """Identify intrinsic coordinates using the Dsilva et al. LLR diagnostic.
 
-    The residual proxy follows the spirit of the Dsilva et al. diagnostic by
-    ranking coordinates with the largest deviation from harmonic behaviour,
-    measured here through finite differences in the spectrum. Components with
-    residuals above ``residual_threshold`` are retained, with at least
-    ``min_coordinates`` kept even if the threshold is not met.
+    Each diffusion eigenvector φ_k is regressed locally onto the preceding
+    eigenvectors (φ_1, …, φ_{k-1}) using kernel-weighted least squares. The
+    normalized leave-one-out error r_k serves as the test statistic: components
+    with r_k above ``residual_threshold`` are deemed unique eigendirections.
     """
     eigenvalues = np.asarray(eigenvalues)
     coords = np.asarray(diffusion_coords)
@@ -724,11 +778,21 @@ def select_non_harmonic_coordinates(
         raise ValueError('diffusion_coords must be a 2D array.')
     if eigenvalues.ndim != 1 or eigenvalues.shape[0] != coords.shape[1]:
         raise ValueError('eigenvalues must align with diffusion coordinate columns.')
+    if residual_threshold <= 0 or residual_threshold >= 1.0:
+        raise ValueError('residual_threshold must lie in (0, 1).')
+    if min_coordinates < 1:
+        raise ValueError('min_coordinates must be positive.')
 
-    lam = np.maximum(np.abs(eigenvalues), 1e-12)
-    forward = np.roll(lam, -1)
-    forward[-1] = lam[-1]
-    residuals = np.abs((lam - forward) / lam)
+    safe_vals = np.where(np.abs(eigenvalues) < 1e-12, 1e-12, eigenvalues)
+    eigenvectors = coords / safe_vals[np.newaxis, :]
+
+    residuals = np.ones(eigenvectors.shape[1], dtype=np.float64)
+    for k in range(1, eigenvectors.shape[1]):
+        predictors = eigenvectors[:, :k]
+        target = eigenvectors[:, k]
+        residuals[k] = _local_linear_regression_residual(
+            predictors, target, bandwidth=llr_bandwidth, ridge=llr_ridge
+        )
 
     mask = residuals >= residual_threshold
     if mask.sum() < min_coordinates:
@@ -742,9 +806,7 @@ def select_non_harmonic_coordinates(
 def compute_latent_harmonics(
     intrinsic_coords: np.ndarray,
     *,
-    ell: Optional[int] = None,
     epsilon: Optional[float] = None,
-    alpha: float = 0.0,
 ) -> tuple[np.ndarray, np.ndarray, float, np.ndarray]:
     """Compute latent harmonics (DDM second pass) on intrinsic coordinates.
     
@@ -762,14 +824,12 @@ def compute_latent_harmonics(
     weights : np.ndarray
         Sampling weights proportional to latent-kernel row sums (shape num_samples,).
     """
-    coords = np.asarray(intrinsic_coords)
+    coords = np.asarray(intrinsic_coords, dtype=np.float64)
     if coords.ndim != 2:
         raise ValueError('intrinsic_coords must be (num_samples, num_dims).')
     num_samples = coords.shape[0]
     if num_samples < 2:
         raise ValueError('Need at least two samples to compute latent harmonics.')
-    if ell is None:
-        ell = max(1, min(32, num_samples - 1))
 
     # Build kernel on intrinsic manifold
     distances2 = squareform(pdist(coords, metric='sqeuclidean'))
@@ -785,26 +845,17 @@ def compute_latent_harmonics(
     if np.any(weights <= 0):
         raise ValueError('Latent kernel produced zero row sums; graph is disconnected.')
     weights = weights / weights.sum()
-    W = sparse.csr_matrix(adjacency)
-    
-    # Get eigendecomposition
-    # diffusion_embedding returns (λ, Φ) where Φ = eigenvectors * λ (diffusion coordinates)
-    latent_vals, latent_diffusion_coords = diffusion_embedding(
-        W, r=min(ell, num_samples - 1), alpha=alpha
-    )
-    
-    # CRITICAL FIX: Recover eigenvectors from diffusion coordinates
-    # Since Φ[:,j] = eigenvectors[:,j] * λ[j], we have eigenvectors[:,j] = Φ[:,j] / λ[j]
-    # Use the original eigenvalues (with sign) for division
-    safe_vals = np.where(np.abs(latent_vals) < 1e-12, 1e-12, latent_vals)
-    latent_vecs = latent_diffusion_coords / safe_vals[np.newaxis, :]
-    
-    # Normalize eigenvectors to unit length under the weighted inner product.
-    weighted_norms = np.sqrt((weights[:, None] * latent_vecs**2).sum(axis=0))
+
+    sigma, psi = np.linalg.eigh(adjacency)
+    order = np.argsort(sigma)[::-1]
+    sigma = sigma[order]
+    psi = psi[:, order]
+
+    weighted_norms = np.sqrt((weights[:, None] * psi**2).sum(axis=0))
     weighted_norms = np.maximum(weighted_norms, 1e-12)
-    latent_vecs = latent_vecs / weighted_norms[np.newaxis, :]
+    psi = psi / weighted_norms[np.newaxis, :]
     
-    return latent_vals, latent_vecs, epsilon, weights
+    return sigma, psi, epsilon, weights
 
 
 
@@ -827,10 +878,7 @@ class GeometricHarmonicsModel:
 def fit_geometric_harmonics(
     intrinsic_coords: np.ndarray,
     samples: np.ndarray,
-    *,
-    ell: Optional[int] = None,
     epsilon_star: Optional[float] = None,
-    alpha: float = 0.0,
     delta: float = 1e-3,
     ridge: float = 1e-6,
     grid_shape: Optional[tuple[int, int]] = None,
@@ -847,31 +895,29 @@ def fit_geometric_harmonics(
         raise ValueError('samples must be a 2D array (num_samples, ambient_dim).')
     if intrinsic_coords.shape[0] != values.shape[0]:
         raise ValueError('intrinsic_coords and samples must align on the first axis.')
-
     if ridge < 0:
         raise ValueError('ridge must be non-negative.')
 
     # Compute eigenfunctions on intrinsic manifold
     sigma, psi, eps_star, weights = compute_latent_harmonics(
-        intrinsic_coords, ell=ell, epsilon=epsilon_star, alpha=alpha
+        intrinsic_coords, epsilon=epsilon_star
     )
     
     # Filter small eigenvalues for numerical stability
-    # CRITICAL FIX: Ensure at least 1 component is kept
+    # Ensure at least 1 component is kept
     if delta <= 0 or delta >= 1:
         raise ValueError('delta must lie in (0, 1).')
     
     if len(sigma) == 0:
         raise ValueError('No eigenvalues computed. Check intrinsic coordinates.')
     
-    # Use absolute values for filtering (eigenvalues can be negative due to numerical issues)
     sigma_abs = np.abs(sigma)
+    if sigma_abs[0] <= 0:
+        raise ValueError('Leading eigenvalue is non-positive; check latent kernel.')
     cutoff = sigma_abs[0] * delta
     mask = sigma_abs >= cutoff
-    
-    # Ensure at least one eigenvalue is kept
     if not np.any(mask):
-        mask[0] = True
+        raise ValueError('delta removed all latent harmonics; decrease delta.')
     
     psi_kept = psi[:, mask]
     sigma_kept = sigma[mask]
@@ -970,3 +1016,69 @@ def geometric_harmonics_lift(
     if fields.shape[1] != grid_size:
         raise ValueError('grid_shape mismatch with GH coefficient dimension.')
     return fields.reshape(-1, *model.grid_shape)
+
+
+def geometric_harmonics_diagnostics(
+    *,
+    model: GeometricHarmonicsModel,
+    training_values: np.ndarray,
+    n_energy_fields: int = 5,
+    rng: Optional[np.random.Generator] = None,
+) -> dict[str, Any]:
+    """Run basic GH diagnostics: identity, constant test, Nyström, and energy."""
+    values = np.asarray(training_values, dtype=np.float64)
+    if values.ndim != 2:
+        raise ValueError('training_values must be a 2D array.')
+    if values.shape[0] != model.psi.shape[0]:
+        raise ValueError('training_values must align with GH training samples.')
+
+    recon = model.psi @ model.coeffs
+    if model.mean_field is not None:
+        recon = recon + model.mean_field
+
+    train_rmse = float(np.sqrt(np.mean((recon - values) ** 2)))
+
+    Psi_star = nystrom_extension(
+        model.g_train,
+        reference_coords=model.g_train,
+        psi=model.psi,
+        sigma=model.sigma,
+        epsilon=model.eps_star,
+        ridge=model.ridge,
+    )
+    recon_nystrom = Psi_star @ model.coeffs
+    if model.mean_field is not None:
+        recon_nystrom = recon_nystrom + model.mean_field
+    nystrom_rmse = float(np.sqrt(np.mean((recon_nystrom - values) ** 2)))
+
+    const_field = np.ones((model.psi.shape[0], 1))
+    const_coeffs = model.psi.T @ (model.weights[:, None] * const_field)
+    const_recon = model.psi @ const_coeffs
+    const_rmse = float(np.sqrt(np.mean((const_recon.ravel() - 1.0) ** 2)))
+
+    rng = np.random.default_rng(rng)
+    ambient_dim = values.shape[1]
+    sample_size = min(max(1, n_energy_fields), ambient_dim)
+    idx = rng.choice(ambient_dim, size=sample_size, replace=False)
+    energy = []
+    for voxel in idx:
+        original_norm = float(np.linalg.norm(values[:, voxel]))
+        recon_norm = float(np.linalg.norm(recon[:, voxel]))
+        ratio = recon_norm / (original_norm + 1e-12)
+        energy.append(
+            {
+                'voxel': int(voxel),
+                'original_norm': original_norm,
+                'recon_norm': recon_norm,
+                'ratio': float(ratio),
+            }
+        )
+
+    return {
+        'train_rmse': train_rmse,
+        'nystrom_rmse': nystrom_rmse,
+        'constant_rmse': const_rmse,
+        'constant_min': float(const_recon.min()),
+        'constant_max': float(const_recon.max()),
+        'energy': energy,
+    }
