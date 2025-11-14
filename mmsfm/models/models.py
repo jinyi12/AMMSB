@@ -67,6 +67,53 @@ class ResNet(nn.Module):
         for block in self.blocks:
             h = block(h)
         return self.output_layer(h)
+    
+class TimeEmbedding(nn.Module):
+    def __init__(self, emb_dim=32):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(1, emb_dim),
+            nn.SiLU(),
+            nn.Linear(emb_dim, emb_dim),
+        )
+
+    def forward(self, s):  # s: (B, ...) , take last dim as time
+        s = s[..., -1:]  # take last dim as time
+        s = s.view(-1, 1)  # flatten to (B, 1)
+        return self.mlp(s)
+
+    
+class FiLMLayer(nn.Module):
+    def __init__(self, dim_h, dim_t):
+        super().__init__()
+        self.fc = nn.Linear(dim_h, dim_h)
+        self.act = nn.SELU()
+        self.to_gamma_beta = nn.Linear(dim_t, 2 * dim_h)
+
+    def forward(self, h, t_emb):
+        gamma, beta = self.to_gamma_beta(t_emb).chunk(2, dim=-1)  # (B,dim_h)
+        h = self.fc(h)
+        h = gamma * h + beta      # time-dependent scaling + shift
+        return self.act(h)
+
+
+class TimeFiLMMLP(nn.Module):
+    def __init__(self, dim_x, dim_out, w=128, depth=3, t_dim=32):
+        super().__init__()
+        self.time_emb = TimeEmbedding(t_dim)
+        self.in_fc = nn.Linear(dim_x, w)
+        self.layers = nn.ModuleList([FiLMLayer(w, t_dim) for _ in range(depth)])
+        self.out_fc = nn.Linear(w, dim_out)
+
+    def forward(self, x, t):
+        # x: (B, dim_x), t: (B, 1)
+        t_emb = self.time_emb(t)      # (B, t_dim)
+        h = self.in_fc(x)
+        h = torch.nn.functional.selu(h)
+        for layer in self.layers:
+            h = layer(h, t_emb)
+        return self.out_fc(h)
+
 
 
 ## Adapted from MIOFlow

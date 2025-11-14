@@ -10,6 +10,8 @@ import torch
 from pathlib import Path
 from tqdm import tqdm
 import wandb
+from typing import Any
+from scipy.spatial.distance import pdist, squareform
 
 from modelagent import build_agent
 from plotter import Plotter
@@ -25,6 +27,11 @@ from utils import (
     update_eval_losses_dict,
     write_eval_losses,
     get_run_id
+)
+from diffmap.diffusion_maps import (
+    time_coupled_diffusion_map,
+    build_time_coupled_trajectory,
+    ConvexHullInterpolator,
 )
 
 
@@ -55,7 +62,14 @@ class PCADataAgent:
         return reconstructed
 
 
-def load_pca_data(data_path, test_size=0.2, seed=42):
+def load_pca_data(
+    data_path,
+    test_size=0.2,
+    seed=42,
+    *,
+    return_indices: bool = False,
+    return_full: bool = False,
+):
     """Load PCA coefficient data from npz file and split into train/test.
     
     Since PCA coefficients are naturally paired across marginals (same sample index
@@ -112,7 +126,105 @@ def load_pca_data(data_path, test_size=0.2, seed=42):
         print("Warning: 'is_whitened' flag not found in dataset. Assuming coefficients are whitened.")
         pca_info['is_whitened'] = True
 
-    return data, testdata, pca_info
+    outputs: list[Any] = [data, testdata, pca_info]
+    if return_indices:
+        outputs.append((train_idx, test_idx))
+    if return_full:
+        outputs.append(all_marginals)
+    return tuple(outputs)
+
+
+def prepare_timecoupled_latents(
+    full_marginals: list[np.ndarray],
+    *,
+    train_idx: np.ndarray,
+    test_idx: np.ndarray,
+    zt_rem_idxs: np.ndarray,
+    tc_k: int,
+    tc_alpha: float,
+    tc_epsilon_scale: float,
+    tc_power_iter_tol: float,
+    tc_power_iter_maxiter: int,
+) -> dict[str, Any]:
+    """Compute time-coupled diffusion embeddings for all samples then split train/test."""
+    if not full_marginals:
+        raise ValueError('full_marginals list is empty.')
+    selected = [full_marginals[i] for i in zt_rem_idxs]
+    frames = np.stack(selected, axis=0)  # (T, N_all, D)
+
+    epsilons_base: list[float] = []
+    for snapshot in frames:
+        d2 = squareform(pdist(snapshot, metric='sqeuclidean'))
+        mask = d2 > 0
+        if np.any(mask):
+            eps = float(np.median(d2[mask]))
+        else:
+            eps = 1.0
+        epsilons_base.append(eps)
+    epsilons = (np.array(epsilons_base) * tc_epsilon_scale).tolist()
+
+    tc_result = time_coupled_diffusion_map(
+        list(frames),
+        k=tc_k,
+        alpha=tc_alpha,
+        epsilons=epsilons,
+        t=frames.shape[0],
+        power_iter_tol=tc_power_iter_tol,
+        power_iter_maxiter=tc_power_iter_maxiter,
+    )
+
+    coords_time_major, stationaries, sigma_traj = build_time_coupled_trajectory(
+        tc_result.transition_operators,
+        embed_dim=tc_k,
+        power_iter_tol=tc_power_iter_tol,
+        power_iter_maxiter=tc_power_iter_maxiter,
+    )
+
+    latent_train = coords_time_major[:, train_idx, :]
+    latent_test = coords_time_major[:, test_idx, :]
+    train_micro = frames[:, train_idx, :]
+
+    macro_states = np.transpose(latent_train, (1, 0, 2)).reshape(-1, tc_k)
+    micro_states = np.transpose(train_micro, (1, 0, 2)).reshape(-1, frames.shape[2])
+    lifter = ConvexHullInterpolator(macro_states, micro_states)
+
+    latent_train_list = [latent_train[t] for t in range(latent_train.shape[0])]
+    latent_test_list = [latent_test[t] for t in range(latent_test.shape[0])]
+
+    return {
+        'latent_train': latent_train_list,
+        'latent_test': latent_test_list,
+        'latent_tensor': coords_time_major,
+        'epsilons': epsilons,
+        'tc_result': tc_result,
+        'stationaries': stationaries,
+        'sigma_traj': sigma_traj,
+        'lifter': lifter,
+        'train_micro_tensor': train_micro,
+    }
+
+
+def lift_latent_trajectory(
+    traj_latent: np.ndarray,
+    lifter: ConvexHullInterpolator,
+    *,
+    neighbor_k: int,
+    batch_size: int,
+) -> np.ndarray:
+    """Lift latent MMSFM trajectories back into PCA coefficient space."""
+    if lifter is None:
+        raise ValueError('ConvexHullInterpolator lifter is required for lifting trajectories.')
+    traj_latent = np.asarray(traj_latent, dtype=np.float64)
+    if traj_latent.ndim != 3:
+        raise ValueError('Expected trajectory array with shape (T, N, latent_dim).')
+    T, N, _ = traj_latent.shape
+    flat = np.ascontiguousarray(traj_latent.reshape(T * N, -1))
+    lifted = lifter.batch_lift(
+        flat,
+        k=neighbor_k,
+        batch_size=batch_size,
+    )
+    return lifted.reshape(T, N, -1)
 
 
 if __name__ == '__main__':
@@ -163,6 +275,22 @@ if __name__ == '__main__':
         parser.add_argument('--hold_one_out', type=int, default=None)
         parser.add_argument('--rand_heldouts', action='store_true')
 
+        ### Time-coupled Diffusion Map Args ###
+        parser.add_argument('--use_timecoupled_dm', action='store_true',
+                            help='Project data into time-coupled diffusion map latent space before training.')
+        parser.add_argument('--tc_k', type=int, default=16,
+                            help='Number of diffusion coordinates to retain.')
+        parser.add_argument('--tc_alpha', type=float, default=1.0,
+                            help='Density normalisation exponent for diffusion maps.')
+        parser.add_argument('--tc_epsilon_scale', type=float, default=0.01,
+                            help='Scale multiplier applied to per-time median bandwidths.')
+        parser.add_argument('--tc_power_iter_tol', type=float, default=1e-12)
+        parser.add_argument('--tc_power_iter_maxiter', type=int, default=10_000)
+        parser.add_argument('--tc_neighbor_k', type=int, default=16,
+                            help='Number of neighbours used for convex-hull lifting/restriction.')
+        parser.add_argument('--tc_batch_lift', type=int, default=32,
+                            help='Batch size for lifting latent trajectories back to coefficient space.')
+
         ### Inference Args ###
         parser.add_argument('--n_infer', '-i', type=int, default=1000)
         parser.add_argument('--t_infer', '-t', type=int, default=400)
@@ -206,7 +334,26 @@ if __name__ == '__main__':
         
         ### Load PCA Data
         print('Loading PCA coefficient data...')
-        data, testdata, pca_info = load_pca_data(args.data_path, args.test_size, args.seed)
+        if args.use_timecoupled_dm:
+            data_tuple = load_pca_data(
+                args.data_path,
+                args.test_size,
+                args.seed,
+                return_indices=True,
+                return_full=True,
+            )
+            data, testdata, pca_info, (train_idx, test_idx), full_marginals = data_tuple
+            coeff_testdata = [np.array(marg, copy=True) for marg in testdata]
+        else:
+            data, testdata, pca_info = load_pca_data(
+                args.data_path,
+                args.test_size,
+                args.seed,
+            )
+            train_idx = None
+            test_idx = None
+            full_marginals = None
+            coeff_testdata = testdata
         print(f'Total marginals loaded: {len(data)}')
         print(f'Train samples per marginal: {[d.shape[0] for d in data]}')
         print(f'Test samples per marginal: {[d.shape[0] for d in testdata]}')
@@ -225,7 +372,6 @@ if __name__ == '__main__':
         args.eval_zt_idx = eval_zt_idx
 
         ### Set Flags and Finish Experiment Setup
-        dim = data[0].shape[1]
         is_sb = args.flowmatcher == 'sb'
         outdir = set_up_exp(args)
 
@@ -233,11 +379,36 @@ if __name__ == '__main__':
         ### Hold out timepoints if specified
         zt_rem_idxs = np.arange(zt.shape[0], dtype=int)
         if args.hold_one_out is not None:
-            # list of timepoints after holding out
             zt_rem_idxs = np.delete(zt_rem_idxs, args.hold_one_out)
             print(f'Holding out marginal at index {args.hold_one_out}')
             print(f'Training on marginal indices: {zt_rem_idxs.tolist()}')
         data = [data[i] for i in zt_rem_idxs]
+
+        if args.use_timecoupled_dm and full_marginals is not None:
+            full_marginals = [full_marginals[i] for i in zt_rem_idxs]
+            testdata = [testdata[i] for i in zt_rem_idxs]
+            coeff_testdata = [coeff_testdata[i] for i in zt_rem_idxs]
+
+        if args.use_timecoupled_dm:
+            if train_idx is None or test_idx is None or full_marginals is None:
+                raise ValueError('Train/test indices and full marginals are required for time-coupled diffusion maps.')
+            print('Computing time-coupled diffusion map embeddings...')
+            tc_info = prepare_timecoupled_latents(
+                full_marginals,
+                train_idx=train_idx,
+                test_idx=test_idx,
+                zt_rem_idxs=np.arange(len(full_marginals)),
+                tc_k=args.tc_k,
+                tc_alpha=args.tc_alpha,
+                tc_epsilon_scale=args.tc_epsilon_scale,
+                tc_power_iter_tol=args.tc_power_iter_tol,
+                tc_power_iter_maxiter=args.tc_power_iter_maxiter,
+            )
+            data = tc_info['latent_train']
+            testdata = tc_info['latent_test']
+            print('Time-coupled diffusion map epsilon summary:', tc_info['epsilons'])
+        else:
+            tc_info = None
 
         ### Normalize Data (PCA coefficients are already centered)
         if args.scaler_type == 'minmax':
@@ -253,6 +424,7 @@ if __name__ == '__main__':
         norm_xT = scaler.transform(testdata)[-1]
 
         ### Set Up Agent
+        dim = data[0].shape[1]
         if args.agent_type == 'mm':
             extra_args = (args.window_size,)
         else:
@@ -324,12 +496,30 @@ if __name__ == '__main__':
             else:
                 sde_traj = None
 
-            ### Rescale Trajs to Original Domain
-            ode_traj = scaler.inverse_transform(ode_traj)
-            ode_traj_at_zt = agent._get_traj_at_zt(ode_traj, zt)
-            np.save(f'{outdir}/ode_traj_epoch{i+1}.npy', ode_traj)
+            ### Rescale Trajs to Latent Domain + Lift to PCA Coefficients
+            ode_traj_latent = scaler.inverse_transform(ode_traj)
+            if tc_info is not None:
+                ode_traj_coeffs = lift_latent_trajectory(
+                    ode_traj_latent,
+                    tc_info['lifter'],
+                    neighbor_k=args.tc_neighbor_k,
+                    batch_size=args.tc_batch_lift,
+                )
+            else:
+                ode_traj_coeffs = ode_traj_latent
+
+            ode_traj_at_zt = agent._get_traj_at_zt(ode_traj_latent, zt)
+            np.save(f'{outdir}/ode_traj_epoch{i+1}.npy', ode_traj_latent)
             np.save(f'{outdir}/ode_traj_at_zt_epoch{i+1}.npy', ode_traj_at_zt)
-            ode_eval_losses_dict_i = agent.traj_eval(testdata, ode_traj, zt)
+
+            if tc_info is not None:
+                ode_traj_coeff_at_zt = agent._get_traj_at_zt(ode_traj_coeffs, zt)
+                np.save(f'{outdir}/ode_traj_coeff_epoch{i+1}.npy', ode_traj_coeffs)
+                np.save(f'{outdir}/ode_traj_coeff_at_zt_epoch{i+1}.npy', ode_traj_coeff_at_zt)
+            else:
+                ode_traj_coeff_at_zt = ode_traj_at_zt
+
+            ode_eval_losses_dict_i = agent.traj_eval(testdata, ode_traj_latent, zt)
 
             ## log evaluation metrics
             print('Logging evaluation metrics over epochs at all marginals for ODE trajs...')
@@ -349,17 +539,32 @@ if __name__ == '__main__':
             update_eval_losses_dict(ode_eval_losses_dict, ode_eval_losses_dict_i)
 
             if is_sb:
-                sde_traj = scaler.inverse_transform(sde_traj)
+                sde_traj_latent = scaler.inverse_transform(sde_traj)
                 # sde_traj is already flipped to forward-time (t=0→1) for evaluation
                 # Create backward-time version for visualization (t=1→0)
-                sde_traj_backward = np.flip(sde_traj, axis=0).copy()
-                sde_traj_at_zt = agent._get_traj_at_zt(sde_traj, zt)
+                sde_traj_backward_latent = np.flip(sde_traj_latent, axis=0).copy()
+                sde_traj_at_zt = agent._get_traj_at_zt(sde_traj_latent, zt)
+
+                if tc_info is not None:
+                    sde_traj_coeffs = lift_latent_trajectory(
+                        sde_traj_latent,
+                        tc_info['lifter'],
+                        neighbor_k=args.tc_neighbor_k,
+                        batch_size=args.tc_batch_lift,
+                    )
+                    sde_traj_backward_coeffs = np.flip(sde_traj_coeffs, axis=0).copy()
+                else:
+                    sde_traj_coeffs = sde_traj_latent
+                    sde_traj_backward_coeffs = sde_traj_backward_latent
                 
                 # Save both: forward-time for evaluation, backward-time for visualization
-                np.save(f'{outdir}/sde_traj_epoch{i+1}.npy', sde_traj)
-                np.save(f'{outdir}/sde_traj_backward_epoch{i+1}.npy', sde_traj_backward)
+                np.save(f'{outdir}/sde_traj_epoch{i+1}.npy', sde_traj_latent)
+                np.save(f'{outdir}/sde_traj_backward_epoch{i+1}.npy', sde_traj_backward_latent)
                 np.save(f'{outdir}/sde_traj_at_zt_epoch{i+1}.npy', sde_traj_at_zt)
-                sde_eval_losses_dict_i = agent.traj_eval(testdata, sde_traj, zt)
+                if tc_info is not None:
+                    np.save(f'{outdir}/sde_traj_coeff_epoch{i+1}.npy', sde_traj_coeffs)
+                    np.save(f'{outdir}/sde_traj_coeff_backward_epoch{i+1}.npy', sde_traj_backward_coeffs)
+                sde_eval_losses_dict_i = agent.traj_eval(testdata, sde_traj_latent, zt)
 
                 print('Logging evaluation metrics over epochs at all marginals for SDE trajs...')
                 for metricname, evals in sde_eval_losses_dict_i.items():
@@ -406,7 +611,7 @@ if __name__ == '__main__':
         print('Plotting results...')
 
         res_plotter.plot_all(
-            testdata, ode_traj,
+            coeff_testdata, ode_traj_coeffs,
             flow_losses, ode_eval_losses_dict,
             legend=True, score=False, pca_info=pca_info
         )
@@ -414,7 +619,7 @@ if __name__ == '__main__':
         if is_sb:
             # Use backward-time trajectory for visualization to show generation process (t=1→0)
             res_plotter.plot_all(
-                testdata, sde_traj_backward,
+                coeff_testdata, sde_traj_backward_coeffs,
                 score_losses, sde_eval_losses_dict,
                 legend=True, score=True, pca_info=pca_info
             )

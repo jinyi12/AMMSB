@@ -12,7 +12,7 @@ from os.path import isdir
 from torchcfm.conditional_flow_matching import *             # type: ignore
 from torchcfm.utils import plot_trajectories, torch_wrapper  # type: ignore
 
-from mmsfm.models import MLP, ResNet
+from mmsfm.models import MLP, ResNet, TimeFiLMMLP
 
 from mmsfm.multimarginal_cfm import (
     PairwiseExactOptimalTransportConditionalFlowMatcher,
@@ -47,7 +47,33 @@ class ODE(torch.nn.Module):
 
     def forward(self, x):
         # x = x.view(-1, *self.input_size)
-        return self.drift(x).flatten(start_dim=1)   
+        return self.drift(x).flatten(start_dim=1)
+
+
+class ForwardSDE(torch.nn.Module):
+    """Stochastic forward dynamics used when running SB models."""
+    noise_type = "diagonal"
+    sde_type = "ito"
+
+    def __init__(self, ode_drift, input_size, sigma=1.0):
+        super().__init__()
+        self.drift = ode_drift
+        self.input_size = input_size
+        self.sigma = float(sigma)
+
+    def _concat_time(self, t, y):
+        if len(t.shape) == len(y.shape):
+            return torch.cat([y, t], 1)
+        return torch.cat([y, t.repeat(y.shape[0])[:, None]], 1)
+
+    def f(self, t, y):
+        y = y.view(-1, *self.input_size)
+        x = self._concat_time(t, y)
+        velocity = self.drift(x).flatten(start_dim=1)
+        return velocity
+
+    def g(self, t, y):
+        return torch.ones_like(y) * self.sigma
 
 
 class SDE(torch.nn.Module):
@@ -172,11 +198,12 @@ class BaseAgent(ABC):
     def _build_model(self):
         if self.modelname == 'mlp':
             model = (
-                MLP(
-                    dim=self.dim,
+                TimeFiLMMLP(
+                    dim_x=self.dim,
+                    dim_out=self.dim,
                     w=self.w_len,
                     depth=self.modeldepth,
-                    time_varying=True,
+                    t_dim=32,
                 ).to(self.device)
             )
         elif self.modelname == 'resnet':
@@ -236,17 +263,20 @@ class BaseAgent(ABC):
 
     ######   PRED & EVAL  ######
     @timer_func
-    def traj_gen(self, x0, generate_backward=False):
+    def traj_gen(self, x0, generate_backward=False, forward_stochastic=None):
         """
         Generate trajectories using asymmetric bridge.
         
-        Forward: deterministic ODE dX_t = v_t(X_t) dt
+        Forward: deterministic ODE dX_t = v_t(X_t) dt (or stochastic SB SDE when enabled)
         Backward: stochastic SDE dX_t = [v_t - (σ²/2)∇log p_t] dt + σ dW_t
         
         Args:
             x0: Initial conditions (forward) or terminal conditions (backward)
             generate_backward: If True, generate backward SDE trajectories from x0
                              If False, generate forward ODE trajectories from x0
+            forward_stochastic: Overrides default forward behavior. When None, SB agents
+                                 run stochastic forward sampling and OT agents remain
+                                 deterministic.
         
         Returns:
             forward_traj: Forward ODE trajectories (if not generate_backward)
@@ -268,14 +298,33 @@ class BaseAgent(ABC):
         )
         t_span = torch.linspace(0, 1, self.t_infer)
 
+        if forward_stochastic is None:
+            forward_stochastic = self.is_sb
+
 
         if not generate_backward:
-            # Forward ODE: deterministic trajectory
+            if forward_stochastic:
+                if not self.is_sb:
+                    raise ValueError('Forward stochastic trajectories require SB setup.')
+
+                sde = ForwardSDE(
+                    self.model,
+                    input_size=(self.dim,),
+                    sigma=self.sigma
+                ).to(self.device)
+
+                print('Solving forward SDE and computing trajectories...')
+                with torch.no_grad():
+                    forward_traj = torchsde.sdeint(
+                        sde,
+                        x0,
+                        ts=t_span.to(self.device)
+                    ).cpu().numpy()  # type: ignore[arg-type]
+
+                return forward_traj, None
+
             solver = 'euler' if self.is_sb else 'dopri5'
-            # solver = 'dopri5' # deterministic ODE 
-            # ode_model = ODE(self.model, input_size=(self.dim,))
             node = NeuralODE(
-                # ode_model,
                 torch_wrapper(self.model),
                 solver=solver,
                 sensitivity='adjoint',
@@ -289,7 +338,7 @@ class BaseAgent(ABC):
                     x0,
                     t_span=t_span
                 ).cpu().numpy()
-            
+
             return forward_traj, None
         
         else:
@@ -581,8 +630,9 @@ class PairwiseAgent(BaseAgent):
             self.optimizer.zero_grad()
             ## eps is None if OT, float if SB
             t, xt, ut, eps, ab = self.batch_fn(X, return_noise=self.is_sb)
-            xt_t = torch.cat([xt, t[:, None]], dim=-1)
-            vt = self.model(xt_t)
+            # xt_t = torch.cat([xt, t[:, None]], dim=-1)
+            # vt = self.model(xt_t)
+            vt = self.model(xt, t = t)  # type: ignore
             flow_mse = torch.mean((vt - ut) ** 2)
             flow_losses[i] = flow_mse.item()
             loss = self.flow_loss_weight * flow_mse
@@ -590,7 +640,7 @@ class PairwiseAgent(BaseAgent):
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             if self.is_sb:
                 lambda_t = self.FM.compute_lambda(t, ab)
-                st = self.score_model(xt_t)  # type: ignore
+                st = self.score_model(xt, t = t)  # type: ignore
                 score_mse = torch.mean((lambda_t[:, None] * st + eps) ** 2)
                 score_losses[i] = score_mse.item()  # type: ignore
                 loss = loss + self.score_loss_weight * score_mse
@@ -775,8 +825,9 @@ class TripletAgent(BaseAgent):
             self.optimizer.zero_grad()
             ## eps, ab is None if OT, float if SB
             t, xt, ut, eps, ab = self.batch_fn(X, return_noise=self.is_sb)
-            xt_t = torch.cat([xt, t[:, None]], dim=-1)
-            vt = self.model(xt_t)
+            vt = self.model(xt, t = t)  # type: ignore
+            # xt_t = torch.cat([xt, t[:, None]], dim=-1)
+            # vt = self.model(xt_t)
             flow_mse = torch.mean((vt - ut) ** 2)
             flow_losses[i] = flow_mse.item()
             loss = self.flow_loss_weight * flow_mse
@@ -787,7 +838,8 @@ class TripletAgent(BaseAgent):
                 lambda_t = self.FM.compute_lambda(t, ab)
                 ## check that all lambda_t values are valid (no nans and no infs)
                 assert not torch.any(torch.isnan(lambda_t) | torch.isinf(lambda_t))
-                st = self.score_model(xt_t)  # type: ignore
+                # st = self.score_model(xt_t)  # type: ignore
+                st = self.score_model(xt, t = t)  # type: ignore
                 score_mse = torch.mean((lambda_t[:, None] * st + eps) ** 2)
                 score_losses[i] = score_mse.item()  # type: ignore
                 loss = loss + self.score_loss_weight * score_mse
