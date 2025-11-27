@@ -1,0 +1,68 @@
+/data1/jy384/research/MMSFM/notebooks/explore_tran_inclusions.py:246: SyntaxWarning: invalid escape sequence '\e'
+  ax.plot(times_arr, selected_epsilons, 'o-', label='connectivity-tuned $\epsilon_t$')
+/data1/jy384/research/MMSFM/notebooks/explore_tran_inclusions.py:247: SyntaxWarning: invalid escape sequence '\e'
+  ax.set(xlabel='time', ylabel='$\epsilon$', title='Per-time bandwidths')
+/data1/jy384/research/MMSFM/notebooks/explore_tran_inclusions.py:757: SyntaxWarning: invalid escape sequence '\p'
+  axes[0].set_ylabel('$\psi_1$')
+/data1/jy384/research/MMSFM/notebooks/explore_tran_inclusions.py:766: SyntaxWarning: invalid escape sequence '\p'
+  axes[1].set_ylabel('$\psi_2$')
+/data1/jy384/research/MMSFM/notebooks/explore_tran_inclusions.py:774: SyntaxWarning: invalid escape sequence '\p'
+  axes[2].set_xlabel('$\psi_1$')
+/data1/jy384/research/MMSFM/notebooks/explore_tran_inclusions.py:775: SyntaxWarning: invalid escape sequence '\p'
+  axes[2].set_ylabel('$\psi_2$')
+findfont: Font family ['cursive'] not found. Falling back to DejaVu Sans.
+findfont: Generic family 'cursive' not found because none of the following families were found: Apple Chancery, Textile, Zapf Chancery, Sand, Script MT, Felipa, Comic Neue, Comic Sans MS, cursive
+Available keys in npz: ['data_dim', 'dataset_format', 'scale_mode', 'scaling_epsilon', 'data_generator', 'minmax_data_min', 'minmax_data_scale', 'raw_marginal_0.0', 'raw_marginal_0.25', 'raw_marginal_0.5', 'raw_marginal_0.75', 'raw_marginal_1.0', 'marginal_0.0', 'marginal_0.25', 'marginal_0.5', 'marginal_0.75', 'marginal_1.0', 'pca_components', 'pca_mean', 'pca_explained_variance', 'is_whitened', 'whitening_epsilon']
+Times: [0.0, 0.25, 0.5, 0.75, 1.0]
+Available keys in npz: ['data_dim', 'dataset_format', 'scale_mode', 'scaling_epsilon', 'data_generator', 'minmax_data_min', 'minmax_data_scale', 'raw_marginal_0.0', 'raw_marginal_0.25', 'raw_marginal_0.5', 'raw_marginal_0.75', 'raw_marginal_1.0', 'marginal_0.0', 'marginal_0.25', 'marginal_0.5', 'marginal_0.75', 'marginal_1.0', 'pca_components', 'pca_mean', 'pca_explained_variance', 'is_whitened', 'whitening_epsilon']
+Using mode: pca Found times: [0.0, 0.25, 0.5, 0.75, 1.0]
+All frames tensor shape: (4, 1000, 390) (time x samples x components)
+Unique times: [0.25 0.5  0.75 1.  ]
+Number of PCA components: 390
+Diffusion config → k=8, alpha=0.5, beta=-0.2, variable_bandwidth=True
+Base epsilon estimates (median squared distances):
+  t=0.25: median=2.326e+03, IQR=(2.156e+03, 2.494e+03)
+  t=0.50: median=9.302e+02, IQR=(8.290e+02, 1.037e+03)
+  t=0.75: median=4.171e+02, IQR=(3.505e+02, 4.925e+02)
+  t=1.00: median=7.146e+01, IQR=(5.018e+01, 9.896e+01)
+Chosen epsilons by connectivity:
+[475.08076987 168.63730492  67.12952024   8.04917167]
+KDE bandwidths used: [2.4423807  1.54435144 1.03410767 0.42805898]
+Constructed 4 operators with embedding shape (1000, 8).
+Stationary distribution min/max: 0.0009640641612515603 0.0010426349904200855
+Time-coupled embeddings tensor: (4, 1000, 8)
+Spline interpolation complete: 1000 samples; latent dim = 8
+Shape of tc_result.singular_values[0].shape: (8,)
+Shape of tc_result.left_singular_vectors[0].shape: (1000, 8)
+Shape of tc_result.embeddings[0].shape: (1000, 8)
+check syl solve
+True
+here
+True
+6.319174286442425e-14
+Use algebraic Stiefel log, metric alpha =  -0.0
+dist 3.7699111843077513
+NORM TEST1: 0.0
+NORM TEST2: 2.1077887699116893e-13
+NORM TEST3: 7.96194707386455e-15
+Stacked left singular vectors: (4, 1000, 8)
+Use algebraic Stiefel log, metric alpha =  1e-08
+Use algebraic Stiefel log, metric alpha =  1e-08
+Use algebraic Stiefel log, metric alpha =  1e-08
+Use algebraic Stiefel log, metric alpha =  1e-08
+Use algebraic Stiefel log, metric alpha =  1e-08
+Use algebraic Stiefel log, metric alpha =  1e-08
+Use algebraic Stiefel log, metric alpha =  1e-08
+Use algebraic Stiefel log, metric alpha =  1e-08
+Mean err_st to U_global: 7.8609e+00
+Mean err_st to U_frechet: 3.1634e+00
+Principal angles U_global vs U_frechet (rad): [1.54781658 1.54947574 1.5497764  1.55126746 1.55167952 1.55523149
+ 1.55688082 1.56062   ]
+Log spread → global: 1.9524e+01, Frechet: 5.8681e+00
+Log smoothness → global: 3.9457e+01, Frechet: 2.4282e+01
+Stiefel interpolation complete. Shapes → global: (200, 1000, 8), Frechet: (200, 1000, 8)
+Sigma dense shape: (200, 8)
+Pi dense shape: (200, 1000)
+Reconstructed embeddings → global: (200, 1000, 8), Frechet: (200, 1000, 8)
+Mean validation err_st → global: 3.7090e+00, Frechet: 4.5436e+00
+Validation embedding MSE → global: 5.5292e-07, Frechet: 6.6248e-07

@@ -71,6 +71,14 @@ def chk_fmt_args(args):
     ## check that progression is supplied
     assert args.progression is not None, 'Progression of classes is missing.'
 
+    if args.dataname == 'grf':
+        assert 0.0 < args.grf_test_size < 1.0, 'grf_test_size must be in (0, 1)'
+        if not os.path.exists(args.grf_path):
+            raise FileNotFoundError(f'GRF dataset not found at {args.grf_path}')
+        args.grf_normalise = not args.grf_disable_normalise
+    else:
+        args.grf_normalise = not args.grf_disable_normalise
+
     ## check and format zt by normalizing to [0, 1]
     if args.zt == None:
         args.zt = np.linspace(0, 1, len(args.progression))
@@ -169,9 +177,20 @@ def main():
 
     ## Train Args
     parser.add_argument('--dataname', '-d', type=str, required=True,
-                        choices=['imagenette', 'cifar10'])
+                        choices=['imagenette', 'cifar10', 'grf'])
     parser.add_argument('--size', type=int, default=32,
                         choices=[32, 64, 128])
+    parser.add_argument('--grf_path', type=str, default='data/mm_data.npz',
+                        help='Path to GRF dataset (npz) when using dataname=grf')
+    parser.add_argument('--grf_test_size', type=float, default=0.2,
+                        help='Holdout fraction for GRF evaluation split')
+    parser.add_argument('--grf_seed', type=int, default=42,
+                        help='Random seed for GRF train/test split')
+    parser.add_argument('--grf_disable_normalise', action='store_const', const=True,
+                        default=False,
+                        help='Keep raw GRF values instead of scaling to [-1, 1]')
+    parser.add_argument('--paired', action='store_const', const=True, default=False,
+                        help='Use paired samplers that preserve sample correspondences across marginals')
     parser.add_argument('--window_size', '-K', type=int, default=2)
     parser.add_argument('--spline', type=str, default='cubic',
                         choices=['linear', 'cubic'])

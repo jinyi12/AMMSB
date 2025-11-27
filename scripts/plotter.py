@@ -8,12 +8,16 @@ from scipy.stats import scoreatpercentile
 import scprep
 import wandb
 
-# Import PCA field visualization utilities
+# Import field visualization utilities
 try:
-    from images.pca_field_plot import visualize_all_field_reconstructions
+    from images.field_visualization import visualize_all_field_reconstructions
     HAS_FIELD_VIZ = True
 except ImportError:
-    HAS_FIELD_VIZ = False
+    try:
+        from scripts.images.field_visualization import visualize_all_field_reconstructions
+        HAS_FIELD_VIZ = True
+    except ImportError:
+        HAS_FIELD_VIZ = False
 
 
 class Plotter():
@@ -683,4 +687,3 @@ class Plotter():
             visualize_all_field_reconstructions(
                 traj, data, pca_info, self.zt, self.outdir, self.run, score=score
             )
-

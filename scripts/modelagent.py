@@ -68,8 +68,9 @@ class ForwardSDE(torch.nn.Module):
 
     def f(self, t, y):
         y = y.view(-1, *self.input_size)
-        x = self._concat_time(t, y)
-        velocity = self.drift(x).flatten(start_dim=1)
+        # x = self._concat_time(t, y)
+        # velocity = self.drift(x).flatten(start_dim=1)
+        velocity = self.drift(y, t = t).flatten(start_dim=1)  # type: ignore
         return velocity
 
     def g(self, t, y):
@@ -203,7 +204,7 @@ class BaseAgent(ABC):
                     dim_out=self.dim,
                     w=self.w_len,
                     depth=self.modeldepth,
-                    t_dim=32,
+                    t_dim=self.args.t_dim,
                 ).to(self.device)
             )
         elif self.modelname == 'resnet':
@@ -694,6 +695,50 @@ class TripletAgent(BaseAgent):
             )
         return FM
 
+    def _sample_closed_form_miniflow(self, z, window_zt):
+        """Sample a mini-flow batch and build closed-form MMSFM targets."""
+        z = z.to(self.device)
+        zhat = self.FM.ot_sampler.sample_plan(z)
+        t = self.FM._sample_t(zhat, window_zt)
+        eps = self.FM.sample_noise_like(zhat[0])
+        xt = self.FM.sample_xt(zhat, window_zt, t, eps)
+        ut = self._compute_closed_form_velocity_targets(zhat, xt, t, window_zt)
+        return t, xt, ut, eps
+
+    def _compute_closed_form_velocity_targets(self, zhat, xt, t, window_zt):
+        batch = xt.shape[0]
+        cf_targets = []
+        a = float(window_zt[0])
+        b = float(window_zt[-1])
+        for idx in range(batch):
+            repeated_t = t[idx].repeat(batch)
+            repeated_xt = xt[idx].repeat(batch, 1)
+            cond_ut = self.FM.compute_conditional_flow(
+                zhat, repeated_t, repeated_xt, a, b
+            )
+            mu_vals = self.FM.compute_mu_t(zhat, repeated_t)
+            sigma_vals = self._compute_sigma_tensor(repeated_t, a, b)
+            log_weights = self._gaussian_log_weights(xt[idx], mu_vals, sigma_vals)
+            weights = torch.softmax(log_weights, dim=0)
+            cf_targets.append(torch.sum(weights[:, None] * cond_ut, dim=0))
+
+        return torch.stack(cf_targets, dim=0)
+
+    def _compute_sigma_tensor(self, t_values, a, b):
+        sigma_vals = self.FM.compute_sigma_t(t_values, a, b)
+        if torch.is_tensor(sigma_vals):
+            sigma_vals = sigma_vals.to(device=t_values.device, dtype=t_values.dtype)
+        else:
+            sigma_vals = torch.full_like(t_values, float(sigma_vals))
+        return sigma_vals
+
+    def _gaussian_log_weights(self, x_target, means, sigmas):
+        diff = x_target.unsqueeze(0) - means
+        sigma_sq = torch.clamp(sigmas.pow(2), min=1e-12)
+        log_det = -0.5 * self.dim * torch.log(2 * torch.pi * sigma_sq)
+        mahal = -0.5 * (diff.pow(2).sum(dim=-1) / sigma_sq)
+        return log_det + mahal
+
     def _get_batch(self, X, return_noise=False):
         ts = []
         xts = []
@@ -715,17 +760,13 @@ class TripletAgent(BaseAgent):
                 z[z_idx] = torch.from_numpy(
                     X[i][indices]
                 ).float()
-            z = z.to(self.device)
-
-            t, xt, ut, *eps = self.FM.sample_location_and_conditional_flow(
-                z, self.zt[k:k+3], return_noise=return_noise
-            )
+            t, xt, ut, eps = self._sample_closed_form_miniflow(z, self.zt[k:k+3])
 
             ts.append(t)
             xts.append(xt)
             uts.append(ut)
             if return_noise:
-                noises.append(eps[0])  # type: ignore
+                noises.append(eps)
 
         t = torch.cat(ts)
         xt = torch.cat(xts)
@@ -769,17 +810,13 @@ class TripletAgent(BaseAgent):
                 z[z_idx] = torch.from_numpy(
                     X[m][indices]
                 ).float()
-            z = z.to(self.device)
-
-            t, xt, ut, *eps = self.FM.sample_location_and_conditional_flow(
-                z, rem_zts[k:k+3], return_noise=return_noise
-            )
+            t, xt, ut, eps = self._sample_closed_form_miniflow(z, rem_zts[k:k+3])
 
             ts.append(t)
             xts.append(xt)
             uts.append(ut)
             if return_noise:
-                noises.append(eps[0])  # type: ignore
+                noises.append(eps)
 
         t = torch.cat(ts)
         xt = torch.cat(xts)
@@ -1017,8 +1054,9 @@ class MultiMarginalAgent(BaseAgent):
             self.optimizer.zero_grad()
             ## eps, ab is None if OT, float if SB
             t, xt, ut, eps, ab = self.batch_fn(X, return_noise=self.is_sb)
-            xt_t = torch.cat([xt, t[:, None]], dim=-1)
-            vt = self.model(xt_t)
+            # xt_t = torch.cat([xt, t[:, None]], dim=-1)
+            vt = self.model(xt, t = t)  # type: ignore
+            # vt = self.model(xt_t)
             flow_mse = torch.mean((vt - ut) ** 2)
             flow_losses[i] = flow_mse.item()
             loss = self.flow_loss_weight * flow_mse
@@ -1029,7 +1067,8 @@ class MultiMarginalAgent(BaseAgent):
                 lambda_t = self.FM.compute_lambda(t, ab)
                 ## check that all lambda_t values are valid (no nans and no infs)
                 assert not torch.any(torch.isnan(lambda_t) | torch.isinf(lambda_t))
-                st = self.score_model(xt_t)  # type: ignore
+                # st = self.score_model(xt_t)  # type: ignore
+                st = self.score_model(xt, t = t)  # type: ignore
                 score_mse = torch.mean((lambda_t[:, None] * st + eps) ** 2)
                 score_losses[i] = score_mse.item()  # type: ignore
                 loss = loss + self.score_loss_weight * score_mse

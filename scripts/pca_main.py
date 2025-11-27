@@ -267,6 +267,8 @@ if __name__ == '__main__':
         parser.add_argument('--score_lr', type=float, default=None,
                     help='Override learning rate for the score model parameters (SB only)')
         parser.add_argument('--w_len', '-w', type=int, default=64)
+        parser.add_argument('--t_dim', type=int, default=32,
+                            help='Time embedding dimension')
         parser.add_argument('--flow_loss_weight', type=float, default=1.0,
                     help='Weight applied to the flow-matching loss during optimization')
         parser.add_argument('--score_loss_weight', type=float, default=1.0,

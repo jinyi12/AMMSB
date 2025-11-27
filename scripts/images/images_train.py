@@ -14,7 +14,11 @@ from mmsfm.multimarginal_cfm import (
     PairwiseExactOptimalTransportConditionalFlowMatcher,
     PairwiseSchrodingerBridgeConditionalFlowMatcher,
     MultiMarginalExactOptimalTransportConditionalFlowMatcher,
-    MultiMarginalSchrodingerBridgeConditionalFlowMatcher
+    MultiMarginalSchrodingerBridgeConditionalFlowMatcher,
+    PairwisePairedExactOTConditionalFlowMatcher,
+    PairwisePairedSchrodingerBridgeConditionalFlowMatcher,
+    MultiMarginalPairedExactOTConditionalFlowMatcher,
+    MultiMarginalPairedSchrodingerBridgeConditionalFlowMatcher
 )
 
 from scripts.images.images_utils import (
@@ -95,27 +99,53 @@ def build_FM(
         method,
         t_sampler,
         diff_ref,
-        device
+        device,
+        paired=False,
 ):
-    if K == 1 and sm:
-        FM = PairwiseSchrodingerBridgeConditionalFlowMatcher(
-            zt=zt, sigma=sigma, diff_ref=diff_ref, ot_method=method
-        )
-    elif K == 1 and not sm:
-        FM = PairwiseExactOptimalTransportConditionalFlowMatcher(
-            zt=zt, sigma=sigma
-        )
-    elif K > 1 and sm:
-        FM = MultiMarginalSchrodingerBridgeConditionalFlowMatcher(
-            sigma=sigma, spline=spline, monotonic=monotonic,
-            t_sampler=t_sampler, diff_ref=diff_ref,
-            method=method, device=device
-        )
-    else:
-        FM = MultiMarginalExactOptimalTransportConditionalFlowMatcher(
-            sigma=sigma, spline=spline, monotonic=monotonic,
-            t_sampler=t_sampler, device=device
-        )
+    if K == 1:
+        if sm:
+            if paired:
+                FM = PairwisePairedSchrodingerBridgeConditionalFlowMatcher(
+                    zt=zt, sigma=sigma, diff_ref=diff_ref
+                )
+            else:
+                FM = PairwiseSchrodingerBridgeConditionalFlowMatcher(
+                    zt=zt, sigma=sigma, diff_ref=diff_ref, ot_method=method
+                )
+        else:
+            if paired:
+                FM = PairwisePairedExactOTConditionalFlowMatcher(
+                    zt=zt, sigma=sigma
+                )
+            else:
+                FM = PairwiseExactOptimalTransportConditionalFlowMatcher(
+                    zt=zt, sigma=sigma
+                )
+    else:  # K > 1
+        if sm:
+            if paired:
+                FM = MultiMarginalPairedSchrodingerBridgeConditionalFlowMatcher(
+                    sigma=sigma, spline=spline, monotonic=monotonic,
+                    t_sampler=t_sampler, diff_ref=diff_ref,
+                    method=method, device=device
+                )
+            else:
+                FM = MultiMarginalSchrodingerBridgeConditionalFlowMatcher(
+                    sigma=sigma, spline=spline, monotonic=monotonic,
+                    t_sampler=t_sampler, diff_ref=diff_ref,
+                    method=method, device=device
+                )
+        else:
+            if paired:
+                FM = MultiMarginalPairedExactOTConditionalFlowMatcher(
+                    sigma=sigma, spline=spline, monotonic=monotonic,
+                    t_sampler=t_sampler, device=device
+                )
+            else:
+                FM = MultiMarginalExactOptimalTransportConditionalFlowMatcher(
+                    sigma=sigma, spline=spline, monotonic=monotonic,
+                    t_sampler=t_sampler, device=device
+                )
 
     return FM
 
@@ -128,7 +158,8 @@ def get_batch(
         zt,
         sm,
         K=2,
-        device='cpu'
+        device='cpu',
+        paired=False,
 ):
     ts = []
     xts = []
@@ -138,10 +169,18 @@ def get_batch(
 
     for t_idx, k in enumerate(range(len(X) - K)):
         z = torch.zeros(K+1, batch_size, *dims)
+        if paired:
+            window_lengths = [X[i].shape[0] for i in range(k, k+K+1)]
+            if len(set(window_lengths)) != 1:
+                raise ValueError('Paired sampling requires all marginals in the window to have the same number of samples.')
+            idxs_shared = np.random.randint(window_lengths[0], size=batch_size)
         for z_idx, i in enumerate(range(k, k+K+1)):
             n = X[i].shape[0]
-            idxs = np.random.randint(n, size=batch_size)
-            z[z_idx] = X[i][idxs]
+            if paired:
+                z[z_idx] = X[i][idxs_shared]
+            else:
+                idxs = np.random.randint(n, size=batch_size)
+                z[z_idx] = X[i][idxs]
         z = z.to(device)
 
         if K == 1:  # Pairwise
@@ -198,6 +237,7 @@ def train(
     K,
     FM,
     sm,
+    paired,
     flow_losses,
     score_losses,
     lrs,
@@ -233,6 +273,7 @@ def train(
             K,
             FM,
             sm,
+            paired,
             flow_losses,
             score_losses,
             lrs,
@@ -309,6 +350,7 @@ def train_epoch(
     K,
     FM,
     sm,
+    paired,
     flow_losses,
     score_losses,
     lrs,
@@ -328,7 +370,17 @@ def train_epoch(
         optimizer.zero_grad()
         ## gradient accumulation for effective batch size of batch_size * accum_steps
         for accum_i in range(accum_steps):
-            t, xt, ut, eps, ab = get_batch(FM, X, batch_size, dims, zt, sm, K=K, device=device)
+            t, xt, ut, eps, ab = get_batch(
+                FM,
+                X,
+                batch_size,
+                dims,
+                zt,
+                sm,
+                K=K,
+                device=device,
+                paired=paired,
+            )
             try:  ## check for nans in inputs, outputs, and loss
                 assert not torch.any(torch.isnan(t) | torch.isinf(t))
                 assert not torch.any(torch.isnan(xt) | torch.isinf(xt))
@@ -432,19 +484,43 @@ def main(args, run) -> RetCode :
     print('Effective Batch Size:', e_batch_size)
     print('Effective Batch Size per Window:', e_batch_size_per_window)
 
-    trainset, testset, classes, dims = load_data(dataname, size)  # type: ignore
+    trainset, testset, classes, dims = load_data(  # type: ignore
+        dataname,
+        size,
+        grf_path=args.grf_path,
+        grf_test_size=args.grf_test_size,
+        grf_seed=args.grf_seed,
+        grf_normalise=args.grf_normalise,
+    )
     X = [trainset[i].to(device) for i in progression]
+    if args.paired:
+        base_len = X[0].shape[0]
+        if any(x.shape[0] != base_len for x in X):
+            raise ValueError('Paired sampling requires all selected marginals to share the same number of samples.')
     run.config.update(
         {
             'progression_classes'  : [classes[i] for i in progression],
             'effective_batch_size' : e_batch_size,
             'ckpt_safety_factor'   : CKPT_SAFETY,
+            'paired_sampling'      : args.paired,
         },
         allow_val_change=True,
     )
     print(' -> '.join([classes[i] for i in progression]))
 
-    FM = build_FM(K, sm, zt, sigma, spline, monotonic, method, t_sampler, diff_ref, device)
+    FM = build_FM(
+        K,
+        sm,
+        zt,
+        sigma,
+        spline,
+        monotonic,
+        method,
+        t_sampler,
+        diff_ref,
+        device,
+        paired=args.paired,
+    )
     hypers = get_hypers(dataname, size, dims)
     model, score_model = build_models(hypers, sm, device)
     optimizer, scheduler = build_optimizer_and_scheduler(
@@ -514,6 +590,7 @@ def main(args, run) -> RetCode :
         K,
         FM,
         sm,
+        args.paired,
         flow_losses,
         score_losses,
         lrs,

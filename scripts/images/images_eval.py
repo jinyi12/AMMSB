@@ -20,7 +20,9 @@ class SDE(nn.Module):
     SDE for backward trajectory generation in asymmetric Schrödinger Bridge.
     
     Backward SDE:
-        dX_t = [v_t(X_t) - (σ²/2) ∇_x log p_t(x)] dt + σ dW_t
+        dX_t = [v_t(X_t) - s_t] dt + σ dW_t
+        with time flipped as t -> 1 - t and we integrate forward in solver time
+        
     """
     noise_type = "diagonal"
     sde_type = "ito"
@@ -40,11 +42,10 @@ class SDE(nn.Module):
         y = y.view(-1, *self.input_size)
         if len(t_physical.shape) != len(y.shape):
             t_physical = t_physical.repeat(y.shape[0])
-        # Backward SDE drift: v_t - (σ²/2) ∇log p_t
+        
         velocity = self.drift(t_physical, y)
         score = self.score(t_physical, y)
-        sigma_sq_half = 0.5 * (self.sigma ** 2)
-        out = velocity - sigma_sq_half * score
+        out = -velocity + score
         return out.flatten(start_dim=1)
 
     # Diffusion
@@ -152,7 +153,14 @@ def main(args, run) -> RetCode :
     device = args.device
     outdir = args.outdir
 
-    trainset, testset, classes, dims = load_data(dataname, size)  # type: ignore
+    trainset, testset, classes, dims = load_data(  # type: ignore
+        dataname,
+        size,
+        grf_path=args.grf_path,
+        grf_test_size=args.grf_test_size,
+        grf_seed=args.grf_seed,
+        grf_normalise=args.grf_normalise,
+    )
     X = [testset[i].to(device) for i in progression]
 
     hypers = get_hypers(dataname, size, dims)

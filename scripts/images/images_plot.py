@@ -6,7 +6,71 @@ from matplotlib import animation as animation
 
 import wandb
 
+from scripts.images.grf_data import load_grf_dataset
+from scripts.images.field_visualization import (
+    plot_field_snapshots,
+    plot_field_evolution_gif,
+    plot_field_statistics,
+    plot_spatial_correlation,
+)
 from scripts.images.images_utils import RetCode
+
+
+def _denormalise_grf_tensor(tensor: torch.Tensor, metadata: dict) -> torch.Tensor:
+    """Map normalised GRF tensors back to their original field values."""
+    if not metadata.get('normalise', False):
+        return tensor
+
+    train_min = metadata['train_min'].to(tensor.device, tensor.dtype)
+    train_max = metadata['train_max'].to(tensor.device, tensor.dtype)
+    scale = torch.clamp(train_max - train_min, min=1e-6)
+    return ((tensor + 1.0) * 0.5) * scale + train_min
+
+
+def _prepare_grf_fields(trajs: torch.Tensor | None, metadata: dict) -> np.ndarray | None:
+    """Convert saved trajectory tensors into (T, N, H, W) numpy arrays."""
+    if trajs is None:
+        return None
+
+    fields = _denormalise_grf_tensor(trajs, metadata)
+    fields = fields.squeeze(2)  # remove channel dimension for scalar fields
+    fields_np = fields.cpu().numpy().transpose(1, 0, 2, 3)
+    return fields_np
+
+
+def _prepare_grf_test_fields(testset, metadata: dict):
+    """Return list of test-field arrays for statistical comparisons."""
+    test_fields = []
+    for marginal in testset:
+        denorm = _denormalise_grf_tensor(marginal, metadata)
+        test_fields.append(denorm.squeeze(1).cpu().numpy())
+    return test_fields
+
+
+def _log_grf_field_visuals(
+    fields: np.ndarray | None,
+    zt,
+    test_fields,
+    outdir: str,
+    run,
+    *,
+    score: bool,
+):
+    """Log colour-field visualisations to WandB using PCA helpers."""
+    if fields is None:
+        return
+
+    num_samples = fields.shape[1]
+    plot_field_snapshots(fields, zt, outdir, run, n_samples=min(5, num_samples), score=score)
+    plot_field_evolution_gif(fields, zt, outdir, run, sample_idx=0, score=score, fps=5)
+
+    for extra_idx in (1, 2):
+        if extra_idx < num_samples:
+            plot_field_evolution_gif(fields, zt, outdir, run, sample_idx=extra_idx, score=score, fps=5)
+
+    if test_fields:
+        plot_field_statistics(fields, zt, test_fields, outdir, run, score=score)
+    plot_spatial_correlation(fields, zt, outdir, run, score=score)
 
 
 def plot_imgs(imgs, figname, outdir, run, scale=4):
@@ -174,6 +238,22 @@ def main(args, run) -> RetCode :
     load_models = args.load_models
     scale = args.scale
     outdir = args.outdir
+    dataname = args.dataname
+
+    grf_metadata = None
+    grf_test_fields = None
+    zt_values = np.array(args.zt)
+
+    if dataname == 'grf':
+        dataset = load_grf_dataset(
+            args.grf_path,
+            test_size=args.grf_test_size,
+            seed=args.grf_seed,
+            normalise=args.grf_normalise,
+        )
+        grf_metadata = dataset.metadata
+        grf_test_fields = _prepare_grf_test_fields(dataset.testset, grf_metadata)
+        zt_values = np.array(dataset.metadata.get('times', zt_values))
 
     if load_models is None:
         flow_losses = np.load(f'{outdir}/flow_losses.npy')
@@ -184,23 +264,42 @@ def main(args, run) -> RetCode :
         plot_lrs(lrs, outdir, run)
 
         torch_ode_trajs = torch.load(f'{outdir}/torch_ode_trajs.pt')
-        plot_imgs(torch_ode_trajs, 'ode_trajs', outdir, run, scale=scale)
-        plot_snapshot_gif(torch_ode_trajs, 'ode_trajs_snapshots', outdir, run, scale=scale)
+        if dataname == 'grf':
+            assert grf_metadata is not None
+            ode_fields = _prepare_grf_fields(torch_ode_trajs, grf_metadata)
+            _log_grf_field_visuals(ode_fields, zt_values, grf_test_fields, outdir, run, score=False)
+        else:
+            plot_imgs(torch_ode_trajs, 'ode_trajs', outdir, run, scale=scale)
+            plot_snapshot_gif(torch_ode_trajs, 'ode_trajs_snapshots', outdir, run, scale=scale)
 
         if sm:
             torch_sde_trajs = torch.load(f'{outdir}/torch_sde_trajs.pt')
-            plot_imgs(torch_sde_trajs, 'sde_trajs', outdir, run, scale=scale)
-            plot_snapshot_gif(torch_sde_trajs, 'sde_trajs_snapshots', outdir, run, scale=scale)
+            if dataname == 'grf':
+                assert grf_metadata is not None
+                sde_fields = _prepare_grf_fields(torch_sde_trajs, grf_metadata)
+                _log_grf_field_visuals(sde_fields, zt_values, grf_test_fields, outdir, run, score=True)
+            else:
+                plot_imgs(torch_sde_trajs, 'sde_trajs', outdir, run, scale=scale)
+                plot_snapshot_gif(torch_sde_trajs, 'sde_trajs_snapshots', outdir, run, scale=scale)
 
     else:
         torch_ode_trajs = torch.load(f'{outdir}/torch_ode_trajs_{load_models}.pt')
-        plot_imgs(torch_ode_trajs, f'ode_trajs_{load_models}', outdir, run, scale=scale)
-        plot_snapshot_gif(torch_ode_trajs, f'ode_trajs_snapshots_{load_models}', outdir, run, scale=scale)
+        if dataname == 'grf':
+            assert grf_metadata is not None
+            ode_fields = _prepare_grf_fields(torch_ode_trajs, grf_metadata)
+            _log_grf_field_visuals(ode_fields, zt_values, grf_test_fields, outdir, run, score=False)
+        else:
+            plot_imgs(torch_ode_trajs, f'ode_trajs_{load_models}', outdir, run, scale=scale)
+            plot_snapshot_gif(torch_ode_trajs, f'ode_trajs_snapshots_{load_models}', outdir, run, scale=scale)
 
         if sm:
             torch_sde_trajs = torch.load(f'{outdir}/torch_sde_trajs_{load_models}.pt')
-            plot_imgs(torch_sde_trajs, f'sde_trajs_{load_models}', outdir, run, scale=scale)
-            plot_snapshot_gif(torch_sde_trajs, f'sde_trajs_snapshots_{load_models}', outdir, run, scale=scale)
+            if dataname == 'grf':
+                assert grf_metadata is not None
+                sde_fields = _prepare_grf_fields(torch_sde_trajs, grf_metadata)
+                _log_grf_field_visuals(sde_fields, zt_values, grf_test_fields, outdir, run, score=True)
+            else:
+                plot_imgs(torch_sde_trajs, f'sde_trajs_{load_models}', outdir, run, scale=scale)
+                plot_snapshot_gif(torch_sde_trajs, f'sde_trajs_snapshots_{load_models}', outdir, run, scale=scale)
 
     return RetCode.DONE
-

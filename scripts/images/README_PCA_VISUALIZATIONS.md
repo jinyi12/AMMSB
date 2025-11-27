@@ -1,4 +1,4 @@
-# PCA Field Reconstruction Visualizations
+# Field Reconstruction Visualizations
 
 This module provides visualization tools for reconstructed random fields from PCA coefficient trajectories in the multi-marginal flow matching framework.
 
@@ -44,14 +44,27 @@ The following visualizations are automatically generated when running `pca_main.
   - Standard deviation over time
 - Validates that generated fields match test data statistics
 
-### 4. Spatial Correlation (`spatial_correlation_{ode/sde}.png`)
+### 4. Field Sample Comparison (`field_sample_comparison_{ode/sde}.png`)
+- Side-by-side grid of target, generated, and difference fields for matched time points
+- Highlights qualitative agreement between generated samples and ground truths
+- Uses robust percentile-based colour scaling per time slice
+
+### 5. Covariance Diagnostics
+- `covariance_diagnostics_{ode/sde}_eigenvalues.{png,pdf}` and `_cumulative_variance.{png,pdf}`:
+  - Log-log eigenvalue spectra and cumulative variance explained for target vs generated samples
+  - Shared variance-threshold markers to compare effective dimensionality
+- `truncated_covariance_{ode/sde}.{png,pdf}`:
+  - Heatmaps of truncated correlation matrices and absolute differences
+  - Displays relative Frobenius distance metrics per time point
+
+### 6. Spatial Correlation (`spatial_correlation_{ode/sde}.png`)
 - 2D autocorrelation structure at different time points
 - Shows how spatial correlations evolve with coarse-graining
 - Averaged over multiple samples for stability
 
 ## Files Added
 
-- **`pca_field_plot.py`**: Core module with all field reconstruction and visualization functions
+- **`field_visualization.py`**: Core module with all field reconstruction and visualization functions
 - **`README_PCA_VISUALIZATIONS.md`**: This documentation file
 
 ## Files Modified
