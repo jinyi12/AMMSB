@@ -19,10 +19,14 @@ __all__ = [
     'CoordinateSplineWindow',
     'compute_latent_harmonics',
     'GeometricHarmonicsModel',
+    'SpatioTemporalGeometricHarmonicsModel',
     'fit_geometric_harmonics',
+    'fit_spatiotemporal_geometric_harmonics',
     'nystrom_extension',
+    'spatiotemporal_nystrom_extension',
     'geometric_harmonics_lift',
     'geometric_harmonics_lift_local',
+    'spatiotemporal_geometric_harmonics_lift',
     'geometric_harmonics_diagnostics',
     'TimeCoupledGeometricHarmonicsModel',
     'fit_time_coupled_geometric_harmonics',
@@ -45,7 +49,10 @@ __all__ = [
     'fractional_step_operator',
     'local_time_operator',
     'interpolate_diffusion_embedding',
+    'interpolate_diffusion_embedding',
     'align_singular_vectors',
+    'compute_semigroup_error',
+    'select_optimal_bandwidth',
 ]
 
 from abc import ABC, abstractmethod
@@ -90,6 +97,27 @@ from jaxtyping import Array, Float
 from .distance import CuPyDistanceMixin, JAXDistanceMixin
 from .kernels import exponential_kernel
 from .utils import guess_spatial_scale
+from .geometric_harmonics import (
+    GeometricHarmonicsModel,
+    compute_latent_harmonics,
+    fit_geometric_harmonics,
+    geometric_harmonics_lift,
+    geometric_harmonics_lift_local,
+    geometric_harmonics_diagnostics,
+    nystrom_extension,
+)
+from .geometric_harmonics_archive import (
+    TimeCoupledGeometricHarmonicsModel,
+    SpatioTemporalGeometricHarmonicsModel,
+    spatiotemporal_nystrom_extension,
+    fit_spatiotemporal_geometric_harmonics,
+    spatiotemporal_geometric_harmonics_lift,
+    time_coupled_nystrom_extension,
+    fit_time_coupled_geometric_harmonics,
+    time_coupled_geometric_harmonics_lift,
+    time_coupled_geometric_harmonics_diagnostics,
+    select_bandwidth_semigroup_error_intrinsic,
+)
 
 
 DEFAULT_ALPHA: float = 1.0  # Renormalization exponent.
@@ -749,7 +777,7 @@ def build_time_coupled_trajectory(
     )
 
 
-def _semigroup_error_for_snapshot(
+def compute_semigroup_error(
     points_t: np.ndarray,
     epsilon: float,
     *,
@@ -758,6 +786,7 @@ def _semigroup_error_for_snapshot(
     beta: float = -0.2,
     density_bandwidth: Optional[float] = None,
     norm: str = 'operator',
+    epsilon_scaling: float = 4.0,
 ) -> float:
     """
     Return the semigroup error SGE(ε) = ||A_ε^2 - A_{2ε}|| for a snapshot.
@@ -784,6 +813,7 @@ def _semigroup_error_for_snapshot(
         variable_bandwidth=variable_bandwidth,
         beta=beta,
         density_bandwidth=density_bandwidth,
+        epsilon_scaling=epsilon_scaling,
     )
     A_eps, _ = normalize_markov_operator(P_eps, symmetrize=True)
 
@@ -795,6 +825,7 @@ def _semigroup_error_for_snapshot(
         variable_bandwidth=variable_bandwidth,
         beta=beta,
         density_bandwidth=density_bandwidth,
+        epsilon_scaling=epsilon_scaling,
     )
     A_2eps, _ = normalize_markov_operator(P_2eps, symmetrize=True)
 
@@ -834,6 +865,74 @@ def _semigroup_error_for_snapshot(
             tol=1e-6
         )
         return float(np.abs(evals[0]))
+
+
+def select_optimal_bandwidth(
+    points: np.ndarray,
+    candidate_epsilons: np.ndarray,
+    *,
+    alpha: float = 1.0,
+    variable_bandwidth: bool = False,
+    beta: float = -0.2,
+    density_bandwidth: Optional[float] = None,
+    norm: str = 'operator',
+    epsilon_scaling: float = 4.0,
+    selection: Literal['global_min', 'first_local_minimum'] = 'global_min',
+) -> tuple[float, float]:
+    """Select the optimal bandwidth from candidates using the semigroup error criterion.
+    
+    Returns
+    -------
+    best_epsilon : float
+        The selected bandwidth.
+    best_score : float
+        The corresponding semigroup error.
+    """
+    # Sort candidates to ensure correct local minimum detection
+    candidates = np.sort(candidate_epsilons)
+    
+    # Compute all scores first
+    scores = []
+    for eps in candidates:
+        scores.append(compute_semigroup_error(
+            points,
+            float(eps),
+            alpha=alpha,
+            variable_bandwidth=variable_bandwidth,
+            beta=beta,
+            density_bandwidth=density_bandwidth,
+            norm=norm,
+            epsilon_scaling=epsilon_scaling,
+        ))
+    
+    scores_arr = np.array(scores)
+    
+    if selection == 'global_min':
+        idx = np.argmin(scores_arr)
+        return float(candidates[idx]), float(scores_arr[idx])
+    else: # first_local_minimum
+        # Find local minima
+        # A point is a local minimum if it's smaller than neighbors.
+        # Handle boundaries.
+        if len(scores) < 3:
+             idx = np.argmin(scores_arr)
+             return float(candidates[idx]), float(scores_arr[idx])
+        
+        local_min_indices = []
+        for i in range(1, len(scores) - 1):
+            if scores[i] < scores[i-1] and scores[i] < scores[i+1]:
+                local_min_indices.append(i)
+        
+        if local_min_indices:
+            idx = local_min_indices[0]
+            return float(candidates[idx]), float(scores_arr[idx])
+        else:
+            # Fallback to global min
+            idx = np.argmin(scores_arr)
+            return float(candidates[idx]), float(scores_arr[idx])
+
+# Alias for backward compatibility if needed, or just replace usage
+_semigroup_error_for_snapshot = compute_semigroup_error
 
 
 def _first_local_minimum_index(values: Sequence[float]) -> Optional[int]:
@@ -954,7 +1053,7 @@ def select_epsilons_by_semigroup(
 
         for scale in scales_arr:
             eps = float(max(base_eps[idx] * scale, 1e-12))
-            sge = _semigroup_error_for_snapshot(
+            sge = compute_semigroup_error(
                 sample,
                 eps,
                 alpha=alpha,
@@ -1740,6 +1839,7 @@ def _time_slice_markov(
     variable_bandwidth: bool = False,
     beta: float = -0.2,
     density_bandwidth: Optional[float] = None,
+    epsilon_scaling: float = 4.0,
 ) -> tuple[np.ndarray, float, Optional[float]]:
     """Return a single time-slice diffusion operator using Coifman–Lafon α-normalisation.
 
@@ -1773,10 +1873,10 @@ def _time_slice_markov(
         rho = np.power(density / mean_density, beta)
         rho_sum = rho[:, None] + rho[None, :]
         rho_sum = np.maximum(rho_sum, 1e-12)
-        scale = 2.0 * eps_used * rho_sum
+        scale = epsilon_scaling * eps_used * rho_sum
         kernel = np.exp(-distances2 / scale)
     else:
-        kernel = np.exp(-distances2 / (4.0 * eps_used))
+        kernel = np.exp(-distances2 / (epsilon_scaling * eps_used))
     np.fill_diagonal(kernel, 0.0)
     P_t = _row_normalize_kernel(kernel, alpha=alpha)
     return P_t, eps_used, density_bandwidth_used
@@ -1946,620 +2046,5 @@ def select_non_harmonic_coordinates(
 
 
 
-def compute_latent_harmonics(
-    intrinsic_coords: np.ndarray,
-    *,
-    epsilon: Optional[float] = None,
-) -> tuple[np.ndarray, np.ndarray, float, np.ndarray]:
-    """Compute eigenpairs of a radial kernel on intrinsic coordinates."""
-    coords = np.asarray(intrinsic_coords, dtype=np.float64)
-    if coords.ndim != 2:
-        raise ValueError('intrinsic_coords must be (num_samples, num_dims).')
-    num_samples = coords.shape[0]
-    if num_samples < 2:
-        raise ValueError('Need at least two samples to compute latent harmonics.')
-
-    distances2 = squareform(pdist(coords, metric='sqeuclidean'))
-    mask = distances2 > 0
-    if epsilon is None:
-        epsilon = float(np.median(distances2[mask])) if np.any(mask) else 1.0
-    epsilon = float(max(epsilon, 1e-12))
-
-    adjacency = np.exp(-distances2 / epsilon)
-    np.fill_diagonal(adjacency, 0.0)
-    weights = adjacency.sum(axis=1)
-    if np.any(weights <= 0):
-        raise ValueError('Latent kernel produced zero row sums; graph is disconnected.')
-    weights = weights / weights.sum()
-
-    eigenvalues, psi = np.linalg.eigh(adjacency)
-    order = np.argsort(eigenvalues)[::-1]
-    eigenvalues = eigenvalues[order]
-    psi = psi[:, order]
-
-    weighted_norms = np.sqrt((weights[:, None] * psi**2).sum(axis=0))
-    weighted_norms = np.maximum(weighted_norms, 1e-12)
-    psi = psi / weighted_norms[np.newaxis, :]
-    return eigenvalues, psi, epsilon, weights
-
-
-@dataclass
-class GeometricHarmonicsModel:
-    """Container for geometric harmonics lifting."""
-
-    g_train: np.ndarray
-    psi: np.ndarray
-    sigma: np.ndarray
-    coeffs: np.ndarray
-    eps_star: float
-    weights: np.ndarray
-    ridge: float = 0.0
-    grid_shape: Optional[tuple[int, int]] = None
-    mean_field: Optional[np.ndarray] = None
-    residuals: Optional[np.ndarray] = None
-    w_train: Optional[np.ndarray] = None
-
-
-def fit_geometric_harmonics(
-    intrinsic_coords: np.ndarray,
-    samples: np.ndarray,
-    epsilon_star: Optional[float] = None,
-    delta: float = 1e-3,
-    ridge: float = 1e-6,
-    grid_shape: Optional[tuple[int, int]] = None,
-    center: bool = False,
-) -> GeometricHarmonicsModel:
-    """Fit latent harmonics and compute GH coefficients."""
-    values = np.asarray(samples, dtype=np.float64)
-    intrinsic = np.asarray(intrinsic_coords, dtype=np.float64)
-    if values.ndim != 2:
-        raise ValueError('samples must be a 2D array (num_samples, ambient_dim).')
-    if intrinsic.shape[0] != values.shape[0]:
-        raise ValueError('intrinsic_coords and samples must align on the first axis.')
-    if not (0.0 < delta < 1.0):
-        raise ValueError('delta must lie in (0, 1).')
-    if ridge < 0:
-        raise ValueError('ridge must be non-negative.')
-
-    sigma, psi, eps_star, weights = compute_latent_harmonics(intrinsic, epsilon=epsilon_star)
-    if sigma.size == 0:
-        raise ValueError('No eigenvalues computed. Check intrinsic coordinates.')
-
-    sigma_abs = np.abs(sigma)
-    cutoff = sigma_abs[0] * delta
-    mask = sigma_abs >= cutoff
-    if not np.any(mask):
-        mask = np.zeros_like(sigma_abs, dtype=bool)
-        mask[0] = True
-
-    psi_kept = psi[:, mask]
-    sigma_kept = sigma[mask]
-
-    if center:
-        mean_field = np.average(values, axis=0, weights=weights)
-        centered_values = values - mean_field
-    else:
-        mean_field = None
-        centered_values = values
-
-    weighted_values = centered_values * weights[:, None]
-    coeffs = psi_kept.T @ weighted_values
-    residuals = centered_values - (psi_kept @ coeffs)
-
-    return GeometricHarmonicsModel(
-        g_train=intrinsic,
-        psi=psi_kept,
-        sigma=sigma_kept,
-        coeffs=coeffs,
-        eps_star=eps_star,
-        weights=weights,
-        ridge=ridge,
-        grid_shape=grid_shape,
-        mean_field=mean_field,
-        residuals=residuals,
-        w_train=weights,
-    )
-
-
-def geometric_harmonics_lift(
-    query_coords: np.ndarray,
-    model: GeometricHarmonicsModel,
-) -> np.ndarray:
-    """Lift intrinsic coordinates to ambient space using GH coefficients."""
-    Psi_star = nystrom_extension(
-        query_coords,
-        reference_coords=model.g_train,
-        psi=model.psi,
-        sigma=model.sigma,
-        epsilon=model.eps_star,
-        ridge=model.ridge,
-    )
-    fields = Psi_star @ model.coeffs
-    if model.mean_field is not None:
-        fields = fields + model.mean_field
-
-    if model.grid_shape is None:
-        return fields
-    grid_size = model.grid_shape[0] * model.grid_shape[1]
-    if fields.shape[1] != grid_size:
-        raise ValueError('grid_shape mismatch with GH coefficient dimension.')
-    return fields.reshape(-1, *model.grid_shape)
-
-
-def geometric_harmonics_lift_local(
-    query_coords: np.ndarray,
-    model: GeometricHarmonicsModel,
-    *,
-    k_neighbors: int = 128,
-    delta: float = 5e-3,
-    ridge: float = 1e-3,
-    max_local_modes: int = 8,
-    allowed_indices: Optional[np.ndarray] = None,
-) -> np.ndarray:
-    """Two-level GH: global prediction plus local correction on residuals."""
-    Q = np.atleast_2d(query_coords).astype(np.float64)
-    if Q.shape[1] != model.g_train.shape[1]:
-        raise ValueError('latent dim mismatch.')
-
-    if allowed_indices is not None:
-        pool_idx = np.asarray(allowed_indices, dtype=int).ravel()
-        if pool_idx.size == 0:
-            raise ValueError('allowed_indices must be non-empty when provided.')
-        g_pool = model.g_train[pool_idx]
-        psi_pool = model.psi[pool_idx]
-        residual_pool = model.residuals[pool_idx] if model.residuals is not None else None
-    else:
-        g_pool = model.g_train
-        psi_pool = model.psi
-        residual_pool = model.residuals
-
-    base_prediction = geometric_harmonics_lift(Q, model)
-    if base_prediction.ndim > 2:
-        base_prediction = base_prediction.reshape(base_prediction.shape[0], -1)
-
-    k = min(k_neighbors, g_pool.shape[0])
-    tree = cKDTree(g_pool)
-    dist, idx = tree.query(Q, k=k, workers=-1)
-
-    dist = np.asarray(dist)
-    idx = np.asarray(idx)
-    if dist.ndim == 0:
-        dist = dist.reshape(1, 1)
-        idx = idx.reshape(1, 1)
-    elif dist.ndim == 1:
-        dist = dist.reshape(1, -1)
-        idx = idx.reshape(1, -1)
-
-    kernel_local = np.exp(-(dist**2) / model.eps_star)
-    weights_local = kernel_local / kernel_local.sum(axis=1, keepdims=True)
-
-    Phi_patch = psi_pool[idx]
-    sigma = model.sigma
-    keep_global = (np.abs(sigma) / np.abs(sigma[0])) >= delta
-    Phi_patch = Phi_patch[:, :, keep_global]
-    sigma_sel = sigma[keep_global] + ridge
-    if Phi_patch.shape[2] > max_local_modes:
-        Phi_patch = Phi_patch[:, :, :max_local_modes]
-        sigma_sel = sigma_sel[:max_local_modes]
-
-    if residual_pool is None:
-        raise ValueError('model.residuals is required for local GH correction.')
-    R_patch = residual_pool[idx]
-    A = np.einsum('mk, mkl, mkd -> mld', weights_local, Phi_patch, R_patch)
-    A /= sigma_sel[None, :, None]
-
-    Psi_star = np.einsum('mk, mkl -> ml', kernel_local, Phi_patch) / sigma_sel[None, :]
-    X1 = np.einsum('ml, mld -> md', Psi_star, A)
-
-    if model.grid_shape is None:
-        return base_prediction + X1
-    corrected = base_prediction + X1
-    return corrected.reshape(-1, *model.grid_shape)
-
-
-def geometric_harmonics_diagnostics(
-    *,
-    model: GeometricHarmonicsModel,
-    training_values: np.ndarray,
-    n_energy_fields: int = 5,
-    rng: Optional[np.random.Generator] = None,
-) -> dict[str, Any]:
-    """Run basic GH diagnostics: identity, constant test, Nyström, and energy."""
-    values = np.asarray(training_values, dtype=np.float64)
-    if values.ndim != 2:
-        raise ValueError('training_values must be a 2D array.')
-    if values.shape[0] != model.psi.shape[0]:
-        raise ValueError('training_values must align with GH training samples.')
-
-    recon = model.psi @ model.coeffs
-    if model.mean_field is not None:
-        recon = recon + model.mean_field
-    train_rmse = float(np.sqrt(np.mean((recon - values) ** 2)))
-
-    Psi_star = nystrom_extension(
-        model.g_train,
-        reference_coords=model.g_train,
-        psi=model.psi,
-        sigma=model.sigma,
-        epsilon=model.eps_star,
-        ridge=model.ridge,
-    )
-    recon_nystrom = Psi_star @ model.coeffs
-    if model.mean_field is not None:
-        recon_nystrom = recon_nystrom + model.mean_field
-    nystrom_rmse = float(np.sqrt(np.mean((recon_nystrom - values) ** 2)))
-
-    const_field = np.ones((model.psi.shape[0], 1))
-    const_coeffs = model.psi.T @ (model.weights[:, None] * const_field)
-    const_recon = model.psi @ const_coeffs
-    const_rmse = float(np.sqrt(np.mean((const_recon.ravel() - 1.0) ** 2)))
-
-    rng = np.random.default_rng(rng)
-    ambient_dim = values.shape[1]
-    sample_size = min(max(1, n_energy_fields), ambient_dim)
-    idx = rng.choice(ambient_dim, size=sample_size, replace=False)
-    energy = []
-    for voxel in idx:
-        original_norm = float(np.linalg.norm(values[:, voxel]))
-        recon_norm = float(np.linalg.norm(recon[:, voxel]))
-        ratio = recon_norm / (original_norm + 1e-12)
-        energy.append(
-            {
-                'voxel': int(voxel),
-                'original_norm': original_norm,
-                'recon_norm': recon_norm,
-                'ratio': float(ratio),
-            }
-        )
-
-    return {
-        'train_rmse': train_rmse,
-        'nystrom_rmse': nystrom_rmse,
-        'constant_rmse': const_rmse,
-        'constant_min': float(const_recon.min()),
-        'constant_max': float(const_recon.max()),
-        'energy': energy,
-    }
-
-
-def nystrom_extension(
-    query_coords: np.ndarray,
-    *,
-    reference_coords: np.ndarray,
-    psi: np.ndarray,
-    sigma: np.ndarray,
-    epsilon: float,
-    ridge: float = 0.0,
-) -> np.ndarray:
-    """Evaluate latent harmonics at query points via the Nyström formula.
-
-    Implements ψ_j(g*) = (1/λ_j) · Σ_i k(g*, g_i) ψ_j(g_i) following the
-    out-of-sample extension in Coifman & Lafon (2006) and the DDM+GH workflow
-    of Giovanis et al. (2025).
-    """
-    queries = np.atleast_2d(query_coords)
-    refs = np.asarray(reference_coords)
-    if refs.ndim != 2:
-        raise ValueError('reference_coords must be 2D.')
-    if refs.shape[0] != psi.shape[0]:
-        raise ValueError('psi must align with reference_coords.')
-
-    if ridge < 0:
-        raise ValueError('ridge must be non-negative.')
-
-    # Compute kernel between query and reference points
-    distances2 = cdist(queries, refs, metric='sqeuclidean')
-    kernel_weights = np.exp(-distances2 / epsilon)
-
-    # Nyström formula with ridge: ψ_j(g*) = Σ_i k(g*, g_i) ψ_j(g_i) / (λ_j + λ_ridge)
-
-    denom = sigma + ridge
-    sign = np.sign(denom)
-    sign[sign == 0] = 1.0
-    safe_denom = sign * np.maximum(np.abs(denom), 1e-12)
-    weighted_sum = kernel_weights @ psi
-    evaluations = weighted_sum / safe_denom[np.newaxis, :]
-
-    return evaluations
-
-
-@dataclass
-class TimeCoupledGeometricHarmonicsModel:
-    """Container for time-coupled geometric harmonics."""
-
-    g_train: np.ndarray
-    A_operators: list[np.ndarray]
-    psi_per_time: list[np.ndarray]
-    eigenvalues_per_time: list[np.ndarray]
-    coeffs_per_time: list[np.ndarray]
-    mean_fields: list[Optional[np.ndarray]]
-    weights_per_time: list[np.ndarray]
-    epsilon_star_per_time: list[float]
-    stationary_distributions: Optional[list[np.ndarray]] = None
-    singular_values_per_time: Optional[list[np.ndarray]] = None
-    delta: float = 1e-3
-    ridge: float = 1e-6
-
-
-def select_bandwidth_semigroup_error_intrinsic(
-    g_t: np.ndarray,
-    *,
-    candidate_epsilons: Optional[np.ndarray] = None,
-    n_neighbors: Optional[int] = None,
-    norm: str = 'fro',
-) -> float:
-    """Select intrinsic-space bandwidth via the semigroup error criterion."""
-    coords = np.asarray(g_t, dtype=np.float64)
-    if coords.ndim != 2:
-        raise ValueError('g_t must be a 2D array (N, d_emb).')
-    if coords.shape[0] < 2:
-        raise ValueError('Need at least two intrinsic points to select a bandwidth.')
-    if norm not in ('fro', 'operator'):
-        raise ValueError("norm must be 'fro' or 'operator'.")
-
-    distances2 = squareform(pdist(coords, metric='sqeuclidean'))
-    if candidate_epsilons is None:
-        mask = distances2 > 0
-        median_d2 = np.median(distances2[mask]) if np.any(mask) else 1.0
-        candidate_eps = median_d2 * np.logspace(-1.0, 1.0, num=10)
-    else:
-        candidate_eps = np.asarray(candidate_epsilons, dtype=np.float64).ravel()
-    candidate_eps = candidate_eps[candidate_eps > 0]
-    if candidate_eps.size == 0:
-        raise ValueError('candidate_epsilons must contain positive values.')
-
-    def _markov(eps: float) -> np.ndarray:
-        kernel = np.exp(-distances2 / eps)
-        np.fill_diagonal(kernel, 0.0)
-        if n_neighbors is not None and n_neighbors > 0 and n_neighbors < kernel.shape[0]:
-            k = min(int(n_neighbors), kernel.shape[0] - 1)
-            idx = np.argpartition(distances2, kth=k, axis=1)[:, : k + 1]
-            mask_knn = np.zeros_like(kernel, dtype=bool)
-            rows = np.arange(kernel.shape[0])[:, None]
-            mask_knn[rows, idx] = True
-            mask_knn[idx, rows] = True
-            kernel = kernel * mask_knn
-        row_sums = kernel.sum(axis=1, keepdims=True)
-        if np.any(row_sums <= 0):
-            raise ValueError('Intrinsic kernel produced empty rows; adjust epsilon or n_neighbors.')
-        return kernel / row_sums
-
-    best_eps = float(candidate_eps[0])
-    best_score = np.inf
-
-    for eps in candidate_eps:
-        eps_val = float(eps)
-        P_eps = _markov(eps_val)
-        P_2eps = _markov(2.0 * eps_val)
-        diff = P_eps @ P_eps - P_2eps
-        if norm == 'fro':
-            num = np.linalg.norm(diff, ord='fro')
-            denom = max(np.linalg.norm(P_2eps, ord='fro'), 1e-12)
-        else:
-            num = float(np.max(np.abs(np.linalg.eigvalsh(diff))))
-            denom = max(float(np.max(np.abs(np.linalg.eigvalsh(P_2eps)))) or 0.0, 1e-12)
-        score = float(num / denom)
-        if score < best_score:
-            best_score = score
-            best_eps = eps_val
-    return best_eps
-
-
-def time_coupled_nystrom_extension(
-    query_coords: np.ndarray,
-    *,
-    reference_coords: np.ndarray,
-    psi_t: np.ndarray,
-    lambda_t: np.ndarray,
-    epsilon: float,
-    ridge: float = 0.0,
-) -> np.ndarray:
-    """Nyström extension for a single time slice using eigenvalues of A^(t)."""
-    queries = np.atleast_2d(query_coords)
-    refs = np.asarray(reference_coords)
-    if refs.ndim != 2:
-        raise ValueError('reference_coords must be 2D.')
-    if refs.shape[0] != psi_t.shape[0]:
-        raise ValueError('psi_t must align with reference_coords.')
-    if lambda_t.ndim != 1:
-        raise ValueError('lambda_t must be a 1D array.')
-    if ridge < 0:
-        raise ValueError('ridge must be non-negative.')
-
-    distances2 = cdist(queries, refs, metric='sqeuclidean')
-    kernel_weights = np.exp(-distances2 / epsilon)
-
-    denom = lambda_t + ridge
-    sign = np.sign(denom)
-    sign[sign == 0] = 1.0
-    safe_denom = sign * np.maximum(np.abs(denom), 1e-12)
-
-    weighted_sum = kernel_weights @ psi_t
-    return weighted_sum / safe_denom[np.newaxis, :]
-
-
-def fit_time_coupled_geometric_harmonics(
-    trajectory: TimeCoupledTrajectoryResult,
-    pca_fields: Sequence[np.ndarray],
-    *,
-    delta: float = 1e-3,
-    ridge: float = 1e-6,
-    center: bool = False,
-    semigroup_bandwidth_params: Optional[dict[str, Any]] = None,
-) -> TimeCoupledGeometricHarmonicsModel:
-    """Fit time-coupled geometric harmonics for PCA lifting.
-
-    Builds a per-time kernel on intrinsic coordinates (embeddings) with a
-    bandwidth selected by the semigroup-error criterion and applies standard
-    GH lifting (weighted projection) at each time slice.
-    """
-    g_train = np.asarray(trajectory.embeddings, dtype=np.float64)
-    if g_train.ndim != 3:
-        raise ValueError('trajectory.embeddings must have shape (T, N, d_emb).')
-    T, N, _ = g_train.shape
-    if len(pca_fields) != T:
-        raise ValueError('pca_fields must have length matching trajectory.embeddings.')
-    if not (0.0 < delta < 1.0):
-        raise ValueError('delta must lie in (0, 1).')
-    if ridge < 0:
-        raise ValueError('ridge must be non-negative.')
-
-    A_ops = [np.asarray(op, dtype=np.float64) for op in trajectory.A_operators]
-    if len(A_ops) != T:
-        raise ValueError('trajectory.A_operators must have length T.')
-    for idx, A_t in enumerate(A_ops):
-        if A_t.shape != (N, N):
-            raise ValueError(f'A_operators[{idx}] must have shape (N, N).')
-
-    pca_list = [np.asarray(f, dtype=np.float64) for f in pca_fields]
-    for idx, F_t in enumerate(pca_list):
-        if F_t.ndim != 2 or F_t.shape[0] != N:
-            raise ValueError(f'pca_fields[{idx}] must have shape (N, D).')
-
-    psi_per_time: list[np.ndarray] = []
-    eigenvalues_per_time: list[np.ndarray] = []
-    coeffs_per_time: list[np.ndarray] = []
-    mean_fields: list[Optional[np.ndarray]] = []
-    weights_per_time: list[np.ndarray] = []
-    epsilon_star_per_time: list[float] = []
-    sigma_per_time: list[np.ndarray] = []
-
-    bandwidth_kwargs = semigroup_bandwidth_params or {}
-    for t in range(T):
-        eps_t = select_bandwidth_semigroup_error_intrinsic(g_train[t], **bandwidth_kwargs)
-        epsilon_star_per_time.append(float(eps_t))
-
-        distances2 = squareform(pdist(g_train[t], metric='sqeuclidean'))
-        kernel_t = np.exp(-distances2 / eps_t)
-        np.fill_diagonal(kernel_t, 0.0)
-        weights_t = kernel_t.sum(axis=1)
-        if np.any(weights_t <= 0):
-            raise ValueError(f'Kernel at time index {t} produced empty rows.')
-        weights_t = weights_t / np.sum(weights_t)
-
-        lambda_t_full, psi_t_full = np.linalg.eigh(kernel_t)
-        order = np.argsort(lambda_t_full)[::-1]
-        lambda_t_full = lambda_t_full[order]
-        psi_t_full = psi_t_full[:, order]
-
-        weighted_norms = np.sqrt((weights_t[:, None] * psi_t_full**2).sum(axis=0))
-        weighted_norms = np.maximum(weighted_norms, 1e-12)
-        psi_t_full = psi_t_full / weighted_norms[np.newaxis, :]
-        sigma_t_full = np.sqrt(np.maximum(lambda_t_full, 0.0))
-
-        lambda_abs = np.abs(lambda_t_full)
-        max_lambda = float(np.max(lambda_abs)) if lambda_abs.size else 0.0
-        if max_lambda <= 0:
-            raise ValueError(f'Non-positive spectrum at time index {t}.')
-        threshold = delta * max_lambda
-        keep = lambda_abs >= threshold
-        if not np.any(keep):
-            keep = lambda_abs == max_lambda
-
-        psi_t = psi_t_full[:, keep]
-        lambda_t = lambda_t_full[keep]
-        sigma_t = sigma_t_full[keep]
-
-        F_t = pca_list[t]
-        if center:
-            mean_t = np.average(F_t, axis=0, weights=weights_t)
-            F_centered = F_t - mean_t
-        else:
-            mean_t = None
-            F_centered = F_t
-        weighted_values = F_centered * weights_t[:, None]
-        coeffs_t = psi_t.T @ weighted_values
-
-        psi_per_time.append(psi_t)
-        eigenvalues_per_time.append(lambda_t)
-        sigma_per_time.append(sigma_t)
-        coeffs_per_time.append(coeffs_t)
-        mean_fields.append(mean_t)
-        weights_per_time.append(weights_t)
-
-    return TimeCoupledGeometricHarmonicsModel(
-        g_train=g_train,
-        A_operators=A_ops,
-        psi_per_time=psi_per_time,
-        eigenvalues_per_time=eigenvalues_per_time,
-        coeffs_per_time=coeffs_per_time,
-        mean_fields=mean_fields,
-        weights_per_time=weights_per_time,
-        epsilon_star_per_time=epsilon_star_per_time,
-        stationary_distributions=getattr(trajectory, 'stationary_distributions', None),
-        singular_values_per_time=sigma_per_time if sigma_per_time else None,
-        delta=delta,
-        ridge=ridge,
-    )
-
-
-def time_coupled_geometric_harmonics_lift(
-    query_coords_t: np.ndarray,
-    *,
-    model: TimeCoupledGeometricHarmonicsModel,
-    time_index: int,
-    epsilon_star: Optional[float] = None,
-) -> np.ndarray:
-    """Lift intrinsic coordinates at time_index to ambient PCA space."""
-    t = int(time_index)
-    if t < 0 or t >= len(model.psi_per_time):
-        raise IndexError('time_index is out of range for the TC-GH model.')
-
-    g_train_t = model.g_train[t]
-    psi_t = model.psi_per_time[t]
-    lambda_t = model.eigenvalues_per_time[t]
-    coeffs_t = model.coeffs_per_time[t]
-    mean_t = model.mean_fields[t]
-
-    eps_used = epsilon_star
-    if eps_used is None:
-        if model.epsilon_star_per_time is not None:
-            eps_used = model.epsilon_star_per_time[t]
-        else:
-            eps_used = select_bandwidth_semigroup_error_intrinsic(g_train_t)
-
-    Psi_star_t = time_coupled_nystrom_extension(
-        query_coords=query_coords_t,
-        reference_coords=g_train_t,
-        psi_t=psi_t,
-        lambda_t=lambda_t,
-        epsilon=float(eps_used),
-        ridge=model.ridge,
-    )
-    lifted = Psi_star_t @ coeffs_t
-    if mean_t is not None:
-        lifted = lifted + mean_t
-    return lifted
-
-
-def time_coupled_geometric_harmonics_diagnostics(
-    model: TimeCoupledGeometricHarmonicsModel,
-    pca_fields: Sequence[np.ndarray],
-) -> dict[str, list[float] | list[np.ndarray]]:
-    """Compute reconstruction diagnostics for a TC-GH model."""
-    if len(pca_fields) != len(model.psi_per_time):
-        raise ValueError('pca_fields length must match the number of time slices.')
-
-    mse_per_time: list[float] = []
-    rel_err_per_time: list[float] = []
-
-    for t, F_t in enumerate(pca_fields):
-        F_arr = np.asarray(F_t, dtype=np.float64)
-        recon_t = time_coupled_geometric_harmonics_lift(
-            model.g_train[t],
-            model=model,
-            time_index=t,
-            epsilon_star=model.epsilon_star_per_time[t]
-            if model.epsilon_star_per_time is not None
-            else None,
-        )
-        diff = recon_t - F_arr
-        mse_per_time.append(float(np.mean(diff**2)))
-        denom = np.linalg.norm(F_arr)
-        rel_err_per_time.append(float(np.linalg.norm(diff) / (denom + 1e-12)))
-
-    return {
-        'mse_per_time': mse_per_time,
-        'relative_error_per_time': rel_err_per_time,
-        'spectra_per_time': model.eigenvalues_per_time,
-    }
+# Geometric harmonics utilities are defined in diffmap.geometric_harmonics.
+# This module re-exports them via imports near the top of the file.

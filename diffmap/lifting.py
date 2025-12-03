@@ -5,12 +5,46 @@ from typing import Any, Optional
 
 import numpy as np
 
-from diffmap.diffusion_maps import (
-    ConvexHullInterpolator,
+from diffmap.diffusion_maps import ConvexHullInterpolator, TimeCoupledTrajectoryResult
+from diffmap.geometric_harmonics import (
     GeometricHarmonicsModel,
+    fit_geometric_harmonics,
     geometric_harmonics_lift,
     geometric_harmonics_lift_local,
 )
+from diffmap.geometric_harmonics_archive import (
+    TimeCoupledGeometricHarmonicsModel,
+    SpatioTemporalGeometricHarmonicsModel,
+    fit_time_coupled_geometric_harmonics,
+    fit_spatiotemporal_geometric_harmonics,
+    spatiotemporal_geometric_harmonics_lift,
+    time_coupled_geometric_harmonics_lift,
+)
+
+__all__ = [
+    "ConvexHullInterpolator",
+    "GeometricHarmonicsModel",
+    "TimeCoupledGeometricHarmonicsModel",
+    "SpatioTemporalGeometricHarmonicsModel",
+    "TimeCoupledTrajectoryResult",
+    "build_training_pairs",
+    "build_time_augmented_training_pairs",
+    "compute_time_local_kernel_matrix",
+    "fit_time_local_kernel_ridge_lift",
+    "predict_time_local_lift",
+    "lift_with_geometric_harmonics",
+    "lift_with_convex_hull",
+    "lift_with_time_local_kernel_ridge",
+    "geometric_harmonics_lift",
+    "geometric_harmonics_lift_local",
+    "fit_time_coupled_geometric_harmonics",
+    "fit_spatiotemporal_geometric_harmonics",
+    "time_coupled_geometric_harmonics_lift",
+    "spatiotemporal_geometric_harmonics_lift",
+    "compute_lift_metrics",
+    "print_metric_table",
+    "TimeLocalizedKernelRidgeLift",
+]
 
 
 def build_training_pairs(
@@ -367,11 +401,12 @@ def compute_lift_metrics(
     X_convex: np.ndarray,
     X_krr: Optional[np.ndarray] = None,
     X_tc_gh: Optional[np.ndarray] = None,
+    X_spatiotemporal_gh: Optional[np.ndarray] = None,
 ) -> dict[str, dict[str, Any]]:
     """
     Compute summary metrics comparing lifting strategies at the holdout time.
 
-    Optionally includes a time-coupled GH prediction when provided.
+    Optionally includes archived time-coupled GH or spatio-temporal GH predictions.
 
     Returns
     -------
@@ -379,13 +414,18 @@ def compute_lift_metrics(
         Nested dictionary of per-sample arrays and summary means.
     """
     metrics: dict[str, dict[str, Any]] = {}
-    for name, pred in (
+    preds = [
         ("gh", X_gh),
         ("gh_local", X_gh_local),
         ("convex", X_convex),
         ("krr_time_local", X_krr),
-        ("tc_gh", X_tc_gh),
-    ):
+    ]
+    if X_spatiotemporal_gh is not None:
+        preds.append(("st_gh", X_spatiotemporal_gh))
+    if X_tc_gh is not None:
+        preds.append(("tc_gh", X_tc_gh))
+
+    for name, pred in preds:
         if pred is None:
             continue
         errs = _compute_error_arrays(pred, X_true)
