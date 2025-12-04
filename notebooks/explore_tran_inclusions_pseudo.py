@@ -67,6 +67,7 @@ class LiftingConfig:
     holdout_time: float = 0.75
     gh_delta: float = 1e-3
     gh_ridge: float = 1e-6
+    gh_max_modes: Optional[int] = None
     use_time_coupled_gh: bool = True
     convex_k: int = 64
     convex_max_iter: int = 200
@@ -832,6 +833,7 @@ def fit_lifting_models(
                 pca_fields=[frame for frame in all_frames],
                 delta=config.gh_delta,
                 ridge=config.gh_ridge,
+                max_modes=config.gh_max_modes if hasattr(config, "gh_max_modes") else None,
                 center=True,
             )
     
