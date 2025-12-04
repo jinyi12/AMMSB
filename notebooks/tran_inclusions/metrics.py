@@ -39,6 +39,7 @@ def evaluate_interpolation_at_observed_times(
         times_arr,
         config,
         lifting_metadata,
+        training_interpolation=interpolation,
     )
 
     decoded_imgs = decode_pseudo_microstates(

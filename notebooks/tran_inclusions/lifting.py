@@ -2,16 +2,15 @@ from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 
-from diffmap.diffusion_maps import (
+from diffmap.continuous_gh import ContinuousGeometricHarmonics
+from diffmap.lifting import (
     ConvexHullInterpolator,
     TimeCoupledTrajectoryResult,
-    TimeCoupledGeometricHarmonicsModel,
-    fit_time_coupled_geometric_harmonics,
     build_training_pairs,
     build_time_augmented_training_pairs,
 )
 
-from .config import LiftingConfig, LiftingModels
+from .config import LiftingConfig, LiftingModels, LatentInterpolationResult
 
 
 def fit_lifting_models(
@@ -22,7 +21,8 @@ def fit_lifting_models(
     *,
     trajectory: Optional[TimeCoupledTrajectoryResult] = None,
 ) -> Tuple[LiftingModels, Dict[str, Any]]:
-    """Build training data, fit TC-GH (if requested), and a convex hull interpolator."""
+    """Build training data and fit convex + continuous GH lifting models."""
+    _ = trajectory  # retained for backward compatibility; continuous GH does not use it.
     macro_train, micro_train = build_training_pairs(
         tc_embeddings_time,
         all_frames,
@@ -45,28 +45,34 @@ def fit_lifting_models(
         else:
             config.preimage_time_window = time_span
 
-    tc_gh_model: Optional[TimeCoupledGeometricHarmonicsModel] = None
-    if config.use_time_coupled_gh:
-        if trajectory is None:
-            print("Time-coupled GH requested but no trajectory provided; skipping.")
-        else:
-            tc_gh_model = fit_time_coupled_geometric_harmonics(
-                trajectory=trajectory,
-                pca_fields=[frame for frame in all_frames],
-                delta=config.gh_delta,
-                ridge=config.gh_ridge,
-                center=True,
-            )
-
     chi = ConvexHullInterpolator(macro_states=macro_train, micro_states=micro_train)
 
-    models = LiftingModels(convex=chi, tc_gh_model=tc_gh_model)
+    cgh_model: Optional[ContinuousGeometricHarmonics] = None
+    if config.use_continuous_gh:
+        cgh_model = ContinuousGeometricHarmonics(
+            max_modes=config.gh_max_modes,
+            eigenvalue_delta=config.gh_delta,
+            energy_threshold=config.gh_energy_threshold,
+            ridge=config.gh_ridge,
+            semigroup_norm=config.gh_semigroup_norm,
+            epsilon_grid_size=config.gh_epsilon_grid_size,
+            epsilon_log_span=config.gh_epsilon_log_span,
+            semigroup_selection=config.gh_semigroup_selection,
+        )
+        cgh_model.fit(
+            times=times_arr,
+            latent_points=tc_embeddings_time,
+            ambient_points=all_frames,
+            bandwidth_candidates=config.gh_bandwidth_candidates,
+        )
+
+    models = LiftingModels(convex=chi, continuous_gh=cgh_model)
     metadata = {
-        'macro_train': macro_train,
-        'micro_train': micro_train,
-        'macro_train_coords': macro_train_coords,
-        'train_time_values': train_time_values,
-        'micro_train_states': micro_train_states
+        "macro_train": macro_train,
+        "micro_train": micro_train,
+        "macro_train_coords": macro_train_coords,
+        "train_time_values": train_time_values,
+        "micro_train_states": micro_train_states,
     }
     return models, metadata
 
@@ -80,15 +86,17 @@ def lift_pseudo_latents(
     times_arr: np.ndarray,
     config: LiftingConfig,
     lifting_metadata: Dict[str, Any],
+    *,
+    training_interpolation: Optional[LatentInterpolationResult] = None,
 ) -> Dict[str, np.ndarray]:
-    n_pseudo, n_samples, latent_dim = phi_pseudo.shape
+    """Lift latent pseudo-trajectories using convex hull and continuous GH."""
+    _ = tc_embeddings_time  # unused in the current lifting routines
+    n_pseudo, n_samples, _ = phi_pseudo.shape
     n_components = all_frames.shape[2]
 
-    macro_train = lifting_metadata.get('macro_train')
-    micro_train = lifting_metadata.get('micro_train')
-    macro_train_coords = lifting_metadata.get('macro_train_coords')
-    train_time_values = lifting_metadata.get('train_time_values')
-    micro_train_states = lifting_metadata.get('micro_train_states')
+    macro_train_coords = lifting_metadata.get("macro_train_coords")
+    train_time_values = lifting_metadata.get("train_time_values")
+    micro_train_states = lifting_metadata.get("micro_train_states")
 
     def _get_time_local_indices(target_time: float) -> Optional[np.ndarray]:
         if train_time_values is None:
@@ -116,8 +124,11 @@ def lift_pseudo_latents(
         return np.nonzero(mask)[0]
 
     X_convex = np.zeros((n_pseudo, n_samples, n_components))
-    tc_model = getattr(models, "tc_gh_model", None)
-    X_tc_gh = np.zeros_like(X_convex) if tc_model is not None else None
+    cgh_model = getattr(models, "continuous_gh", None)
+    X_cgh = np.zeros_like(X_convex) if cgh_model is not None else None
+
+    if cgh_model is not None and training_interpolation is None:
+        raise ValueError("training_interpolation is required for continuous GH lifting.")
 
     print("Lifting pseudo latents with batched time-local neighbour selection...")
 
@@ -128,13 +139,21 @@ def lift_pseudo_latents(
         macro_local = macro_train_coords[idx_local]
         micro_local = micro_train_states[idx_local]
 
-        X_convex[i] = models.convex.interpolate(phi_pseudo[i], macro_local, micro_local, k=config.convex_k, max_iter=config.convex_max_iter)
+        local_chi = ConvexHullInterpolator(macro_states=macro_local, micro_states=micro_local)
+        X_convex[i] = local_chi.batch_lift(
+            phi_pseudo[i],
+            k=config.convex_k,
+            max_iter=config.convex_max_iter,
+        )
 
-        if tc_model is not None:
-            tc_pred = tc_model.lift(phi_pseudo[i], times_arr, t_star, micro_local, macro_local)
-            X_tc_gh[i] = tc_pred
+        if cgh_model is not None and training_interpolation is not None:
+            X_cgh[i] = cgh_model.predict(
+                s=float(t_star),
+                g_query=phi_pseudo[i],
+                training_interpolation=training_interpolation,
+            )
 
-    out = {'convex': X_convex}
-    if X_tc_gh is not None:
-        out['tc_gh'] = X_tc_gh
+    out = {"convex": X_convex}
+    if X_cgh is not None:
+        out["cgh"] = X_cgh
     return out
