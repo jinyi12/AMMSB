@@ -63,18 +63,6 @@ def plot_field_comparisons(
     n_rows = len(sample_indices)
     n_cols = 1 + 2 * len(methods)  # truth + prediction + error for each method
 
-    if vmax_mode == "global":
-        vmin, vmax = _global_vrange([imgs_true] + [arr for _, arr in methods])
-        err_vmax = float(
-            np.max(
-                np.concatenate(
-                    [np.abs(arr - imgs_true).ravel() for _, arr in methods]
-                )
-            )
-        )
-    else:
-        vmin = vmax = err_vmax = None  # computed per-sample
-
     fig, axes = plt.subplots(
         n_rows,
         n_cols,
@@ -84,45 +72,58 @@ def plot_field_comparisons(
     if n_rows == 1:
         axes = np.expand_dims(axes, axis=0)
 
+    cmap_data = "viridis"
+    cmap_err = "inferno"
+
     for row, idx in enumerate(sample_indices):
-        if vmax_mode == "per_sample":
-            vmin, vmax = _global_vrange(
-                [imgs_true[idx : idx + 1]] + [arr[idx : idx + 1] for _, arr in methods]
-            )
-            err_vmax = float(
-                np.max(
-                    np.concatenate(
-                        [np.abs(arr[idx] - imgs_true[idx]).ravel() for _, arr in methods]
-                    )
+        # Always compute vmin/vmax per row as requested
+        vmin, vmax = _global_vrange(
+            [imgs_true[idx : idx + 1]] + [arr[idx : idx + 1] for _, arr in methods]
+        )
+        err_vmax = float(
+            np.max(
+                np.concatenate(
+                    [np.abs(arr[idx] - imgs_true[idx]).ravel() for _, arr in methods]
                 )
             )
+        )
+
         col = 0
+        
+        # 1. Truth
         ax = axes[row, col]
-        im = ax.imshow(imgs_true[idx], vmin=vmin, vmax=vmax)
+        im = ax.imshow(imgs_true[idx], vmin=vmin, vmax=vmax, cmap=cmap_data)
         ax.set_title(f"Truth (idx={idx})")
         ax.set_xticks([])
         ax.set_yticks([])
-        ax.figure.colorbar(im, ax=ax, fraction=0.046, pad=0.01)
         col += 1
 
-        for name, arr in methods:
+        # 2. Predictions
+        for i, (name, arr) in enumerate(methods):
             pred_img = arr[idx]
             rmse = float(np.sqrt(np.mean((pred_img - imgs_true[idx]) ** 2)))
 
             ax_pred = axes[row, col]
-            im_pred = ax_pred.imshow(pred_img, vmin=vmin, vmax=vmax)
+            im_pred = ax_pred.imshow(pred_img, vmin=vmin, vmax=vmax, cmap=cmap_data)
             ax_pred.set_title(f"{name} (RMSE={rmse:.2e})")
             ax_pred.set_xticks([])
             ax_pred.set_yticks([])
-            ax_pred.figure.colorbar(im_pred, ax=ax_pred, fraction=0.046, pad=0.01)
+            
+            if i == len(methods) - 1:
+                ax_pred.figure.colorbar(im_pred, ax=ax_pred, fraction=0.046, pad=0.01)
             col += 1
 
+        # 3. Errors
+        for i, (name, arr) in enumerate(methods):
+            pred_img = arr[idx]
             ax_err = axes[row, col]
-            im_err = ax_err.imshow(np.abs(pred_img - imgs_true[idx]), vmin=0.0, vmax=err_vmax)
+            im_err = ax_err.imshow(np.abs(pred_img - imgs_true[idx]), vmin=0.0, vmax=err_vmax, cmap=cmap_err)
             ax_err.set_title(f"{name} |error|")
             ax_err.set_xticks([])
             ax_err.set_yticks([])
-            ax_err.figure.colorbar(im_err, ax=ax_err, fraction=0.046, pad=0.01)
+            
+            if i == len(methods) - 1:
+                ax_err.figure.colorbar(im_err, ax=ax_err, fraction=0.046, pad=0.01)
             col += 1
 
     plt.suptitle("Holdout reconstruction comparison", y=1.02)

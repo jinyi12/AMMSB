@@ -22,6 +22,7 @@ def build_dense_latent_trajectories(
     tc_embeddings_time: np.ndarray,
     n_dense: int = 200,
     frechet_mode: Literal['global', 'triplet'] = 'triplet',
+    compute_global_basepoint: bool = True,
 ) -> LatentInterpolationResult:
     t_dense = np.linspace(times_train.min(), times_train.max(), n_dense)
     n_times, n_samples, latent_dim = tc_embeddings_time.shape
@@ -43,7 +44,7 @@ def build_dense_latent_trajectories(
     U_train_global = align_frames_procrustes(U_train_list_raw, U_global)
     tc_embeddings_time_aligned = tc_embeddings_time
 
-    barycenter_kwargs = dict(stepsize=1.0, max_it=200, tol=1e-5, verbosity=True)
+    barycenter_kwargs = dict(stepsize=1.0, max_it=200, tol=1e-5, verbosity=False)
     U_frechet, U_bary_iters = R_barycenter(
         points=U_train_global,
         retr=st_retr_orthographic,
@@ -54,11 +55,37 @@ def build_dense_latent_trajectories(
     U_train_frechet, frechet_rotations = align_frames_procrustes_with_rotations(
         U_train_list_raw, U_frechet
     )
-    tc_embeddings_time_aligned = apply_rotations_to_embeddings(
-        tc_embeddings_time, frechet_rotations
-    )
+    # Recompute the aligned embeddings to match the reconstruction logic: (U @ R) * Sigma
+    # We use the ORIGINAL U_train_list_raw (singular vectors) and the calculated rotations.
+    # We also need the singular values and stationary distributions to reconstruct fully.
+    
+    tc_embeddings_time_aligned_list = []
+    n_times_train = len(times_train)
+    
+    # Extract components from tc_result for the training knots
+    # Note: tc_result.left_singular_vectors is a list of U matrices
+    #       tc_result.singular_values is a list of sigma vectors
+    #       tc_result.stationary_distributions is a list of pi vectors
+    
+    for i in range(n_times_train):
+        # 1. Get the aligned basis for this knot: U_aligned = U_original @ R
+        # frechet_rotations[i] is the R that maps U_original[i] to the Frechet mean frame
+        U_orig = tc_result.left_singular_vectors[i]
+        R = frechet_rotations[i]
+        U_aligned = U_orig @ R
+        
+        # 2. Get Sigma and Pi
+        S = tc_result.singular_values[i]
+        Pi = tc_result.stationary_distributions[i]
+        
+        # 3. Reconstruct Embedding: Phi = (U_aligned * S) / sqrt(Pi)
+        # This matches exactly how 'reconstruct_embeddings' works for the dense spline
+        phi_aligned = (U_aligned * S[None, :]) / np.sqrt(Pi)[:, None]
+        
+        tc_embeddings_time_aligned_list.append(phi_aligned)
 
-    deltas_global = batch_stiefel_log(U_global, U_train_global, metric_alpha=1e-8, tau=1e-2)
+    tc_embeddings_time_aligned = np.stack(tc_embeddings_time_aligned_list, axis=0)
+
     deltas_fm = batch_stiefel_log(U_frechet, U_train_frechet, metric_alpha=1e-8, tau=1e-2)
 
     def interpolate_deltas(deltas: np.ndarray, base_point: np.ndarray, method: str = 'pchip'):
@@ -81,6 +108,15 @@ def build_dense_latent_trajectories(
         ]
         return deltas_dense, np.array(U_dense), pchip
 
+    # Interpolate global deltas to get dense U_global trajectory
+    phi_global_dense = None
+    pchip_delta_global = None
+    if compute_global_basepoint:
+        deltas_global = batch_stiefel_log(U_global, U_train_global, metric_alpha=1e-8, tau=1e-2)
+        deltas_global_dense, U_dense_global, pchip_delta_global = interpolate_deltas(
+            deltas_global, U_global, method='pchip'
+        )
+
     def interpolate_deltas_triplet(method: str = 'pchip'):
         if n_times < 3:
             deltas_dense_fallback, U_dense_fallback, pchip_fallback = interpolate_deltas(
@@ -101,8 +137,10 @@ def build_dense_latent_trajectories(
                 init=init_guess,
                 **barycenter_kwargs,
             )
-            U_window_aligned = align_frames_procrustes(U_window, U_triplet)
-            deltas_window = batch_stiefel_log(U_triplet, U_window_aligned, metric_alpha=1e-8, tau=1e-2)
+            # U_window is already aligned to the Global Fréchet Mean. 
+            # Do not re-align to the local triplet mean, or we will risk rotate the basis.
+            # U_window_aligned = align_frames_procrustes(U_window, U_triplet)
+            deltas_window = batch_stiefel_log(U_triplet, U_window, metric_alpha=1e-8, tau=1e-2)
             deltas_flat = deltas_window.reshape(deltas_window.shape[0], -1)
             if method == 'pchip':
                 interpolator = PchipInterpolator(t_window, deltas_flat, axis=0)
@@ -147,7 +185,6 @@ def build_dense_latent_trajectories(
             U_dense_list.append(U_star)
         return np.array(deltas_dense_list), np.array(U_dense_list), windows
 
-    pchip_delta_global = None
     pchip_delta_fm = None
     frechet_windows = None
     if frechet_mode == 'triplet':
@@ -193,7 +230,9 @@ def build_dense_latent_trajectories(
             phi_list.append((U * S[None, :]) / np.sqrt(Pi)[:, None])
         return np.array(phi_list)
 
-    phi_global_dense = reconstruct_embeddings(U_train_global, sigmas_dense, pis_dense)
+    if compute_global_basepoint:
+        phi_global_dense = reconstruct_embeddings(U_dense_global, sigmas_dense, pis_dense)
+    
     phi_frechet_dense = reconstruct_embeddings(U_dense_fm, sigmas_dense, pis_dense)
     phi_linear_dense = reconstruct_embeddings(U_dense_fm_linear, sigmas_linear, pis_linear)
 
@@ -243,10 +282,15 @@ def sample_latent_at_times(
         phi_dense = interpolation.phi_naive_dense
     elif method == 'global':
         phi_dense = interpolation.phi_global_dense
+        if phi_dense is None:
+            raise ValueError("Global basepoint interpolation was not computed.")
     elif method == 'frechet':
         phi_dense = interpolation.phi_frechet_dense
     else:
         raise ValueError(f"Unknown method {method}")
+
+    if phi_dense is None:
+        raise ValueError(f"Interpolation for method '{method}' is not available.")
 
     phi_pseudo = np.zeros((len(pseudo_times), phi_dense.shape[1], phi_dense.shape[2]))
     for i in range(phi_dense.shape[1]):

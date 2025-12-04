@@ -1,17 +1,27 @@
 from dataclasses import dataclass
-from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple, TYPE_CHECKING
 
 import numpy as np
 
-from diffmap.diffusion_maps import ConvexHullInterpolator, TimeCoupledGeometricHarmonicsModel
+from diffmap.lifting import ConvexHullInterpolator
+
+if TYPE_CHECKING:  # Avoid runtime dependency for optional component
+    from diffmap.continuous_gh import ContinuousGeometricHarmonics
 
 
 @dataclass
 class LiftingConfig:
     holdout_time: float = 0.75
-    gh_delta: float = 1e-3
+    gh_delta: float = 1e-3  # Eigenvalue cutoff (relative) for mode selection
     gh_ridge: float = 1e-6
-    use_time_coupled_gh: bool = True
+    gh_max_modes: Optional[int] = None
+    gh_energy_threshold: float = 0.999  # cumulative energy for mode selection
+    use_continuous_gh: bool = True
+    gh_bandwidth_candidates: Optional[np.ndarray] = None
+    gh_semigroup_norm: Literal["fro", "operator"] = "operator"
+    gh_semigroup_selection: Literal["global_min", "first_local_minimum"] = "first_local_minimum"
+    gh_epsilon_grid_size: int = 18
+    gh_epsilon_log_span: float = 2.0
     convex_k: int = 64
     convex_max_iter: int = 200
     preimage_time_window: Optional[float] = None
@@ -35,8 +45,8 @@ class PseudoDataConfig:
 @dataclass
 class LatentInterpolationResult:
     t_dense: np.ndarray
-    phi_global_dense: np.ndarray
     phi_frechet_dense: np.ndarray
+    phi_global_dense: Optional[np.ndarray] = None
     phi_linear_dense: Optional[np.ndarray] = None
     phi_naive_dense: Optional[np.ndarray] = None
     pchip_delta_global: Optional[Any] = None
@@ -53,5 +63,4 @@ class LatentInterpolationResult:
 @dataclass
 class LiftingModels:
     convex: ConvexHullInterpolator
-    tc_gh_model: Optional[TimeCoupledGeometricHarmonicsModel] = None
-
+    continuous_gh: Optional["ContinuousGeometricHarmonics"] = None

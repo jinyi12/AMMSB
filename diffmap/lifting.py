@@ -396,17 +396,18 @@ def _compute_error_arrays(pred: np.ndarray, truth: np.ndarray) -> dict[str, np.n
 
 def compute_lift_metrics(
     X_true: np.ndarray,
-    X_gh: np.ndarray,
+    X_gh: Optional[np.ndarray],
     X_gh_local: Optional[np.ndarray],
     X_convex: np.ndarray,
     X_krr: Optional[np.ndarray] = None,
     X_tc_gh: Optional[np.ndarray] = None,
     X_spatiotemporal_gh: Optional[np.ndarray] = None,
+    X_cgh: Optional[np.ndarray] = None,
 ) -> dict[str, dict[str, Any]]:
     """
     Compute summary metrics comparing lifting strategies at the holdout time.
 
-    Optionally includes archived time-coupled GH or spatio-temporal GH predictions.
+    Optionally includes archived time-coupled GH, spatio-temporal GH, or continuous GH predictions.
 
     Returns
     -------
@@ -419,6 +420,7 @@ def compute_lift_metrics(
         ("gh_local", X_gh_local),
         ("convex", X_convex),
         ("krr_time_local", X_krr),
+        ("cgh", X_cgh),
     ]
     if X_spatiotemporal_gh is not None:
         preds.append(("st_gh", X_spatiotemporal_gh))
