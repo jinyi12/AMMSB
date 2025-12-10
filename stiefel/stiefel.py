@@ -1,4 +1,9 @@
 import importlib
+import os
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
+from typing import Optional
+
 import numpy as np
 import cvxpy as cp
 from scipy.linalg import eigh
@@ -14,36 +19,66 @@ from jax import jit
 
 
 
-def stiefel_exp_batch(U0: np.ndarray, delta: np.ndarray, metric_alpha=0.0):
+def stiefel_exp_batch(
+    U0: np.ndarray,
+    delta: np.ndarray,
+    metric_alpha: float = 0.0,
+    workers: Optional[int] = None,
+    chunk_size: int = 8,
+):
+    """Evaluate multiple Stiefel exponentials that share the same base point.
+
+    Parameters
+    ----------
+    U0:
+        Reference base point on St(N, r) with shape ``(N, r)``.
+    delta:
+        Batch of tangent vectors with shape ``(batch_size, N, r)`` or a
+        single tangent vector ``(N, r)``.
+    metric_alpha:
+        Metric parameter passed through to :func:`Stiefel_Exp`.
+    workers:
+        Optional number of worker threads. ``None`` uses ``min(cpu_count, batch)``
+        and ``-1`` uses all available cores. Values ``<=1`` disable parallelism.
+    chunk_size:
+        Minimum batch size required before parallel execution is triggered.
+
+    Returns
+    -------
+    np.ndarray
+        Array of shape ``(batch_size, N, r)`` containing the exponential map
+        evaluations.
     """
-    Performs the Stiefel exponential of delta with respect to the reference base point U0.
-    Delta is a batch of tangent vectors on TuSt(N,r) \in R^{batch_size, N, r}.
 
-    Parameters:
-    U0: reference base point on St(N,r) \in R^{N, r}
-    delta: batch of tangent vectors on TuSt(N,r) \in R^{batch_size, N, r}
+    delta = np.asarray(delta)
+    if delta.ndim == 2:
+        delta = delta[None, ...]
 
-    Returns:
-    U: batch of points on St(N,r) \in R^{batch_size, N, r}
-    """
-    batch_size, N, r = delta.shape
-    U = np.zeros((batch_size, N, r))
+    batch_size = delta.shape[0]
+    if batch_size == 0:
+        return np.zeros((0,) + U0.shape, dtype=U0.dtype)
 
-    for i in range(batch_size):
-        # A = U0.conj().T @ delta[i]
-        # # thin qr-decomposition
-        # Q, R = qr(delta[i] - U0 @ A, mode='economic')
-        # # eigenvalue decomposition
-        # eig_vals, V = eig(np.block([[A, -R.conj().T], [R, np.zeros((r, r))]]))
-        # D = np.diag(eig_vals)
-        # MN = V @ expm(D) @ V.conj().T @ np.block([[np.eye(r)], [np.zeros((r, r))]])
-        # M = np.real(MN[:r, :])
-        # N = np.real(MN[r:, :])
-        # U[i] = U0 @ M + Q @ N
+    chunk_size = max(1, int(chunk_size))
 
-        U[i] = Stiefel_Exp(U0, delta[i], metric_alpha=metric_alpha)
+    if workers is None:
+        cpu_count = os.cpu_count() or 1
+        worker_count = min(cpu_count, batch_size)
+    elif workers == -1:
+        worker_count = os.cpu_count() or 1
+    else:
+        worker_count = max(1, min(int(workers), batch_size))
 
-    return U
+    use_parallel = worker_count > 1 and batch_size >= chunk_size
+
+    single = partial(Stiefel_Exp, U0, metric_alpha=metric_alpha)
+
+    if not use_parallel:
+        results = [single(delta[i]) for i in range(batch_size)]
+    else:
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            results = list(executor.map(single, delta))
+
+    return np.stack(results, axis=0)
 
 
 def batch_stiefel_log(U0, rob, tau, metric_alpha=0.0):

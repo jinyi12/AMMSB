@@ -38,6 +38,10 @@
 import numpy as np
 import scipy
 from scipy import linalg
+try:
+    from scipy.sparse.linalg import expm_multiply as _expm_multiply
+except ImportError:  # pragma: no cover - fallback for old SciPy
+    _expm_multiply = None
 from numpy import random
 import numba
 
@@ -89,14 +93,23 @@ def Stiefel_Exp(U0, Delta, metric_alpha=0.0):
                                 mode='economic',\
                                 pivoting=False,\
                                 check_finite=True)
+
+    def _block_expm_columns(L, head_block):
+        block_dtype = np.result_type(L.dtype, head_block.dtype)
+        basis = np.zeros((2*p, p), dtype=block_dtype)
+        basis[0:p,:] = head_block
+        if _expm_multiply is not None:
+            return _expm_multiply(L, basis)
+        full = scipy.linalg.expm(L)
+        return np.dot(full[:,0:p], head_block)
     if np.allclose(0.0, metric_alpha):
         # special case: alpha=0: canonical metric
         # build block matrix, matrix exponential
         upper = np.concatenate((A, -Re.transpose()), axis=1)
         lower = np.concatenate((Re, np.zeros((p,p), dtype=Re.dtype)), axis=1)
         L     = np.concatenate((upper, lower), axis=0)
-        MNe   = scipy.linalg.expm(L)
-        MNe   = MNe[:,0:p]
+        eye_block = np.eye(p, dtype=L.dtype)
+        MNe   = _block_expm_columns(L, eye_block)
     elif (abs(metric_alpha+1.0)> 1.0e-13):
         # case: alpha-metric 
         x  = 1.0/(metric_alpha +1.0)
@@ -105,15 +118,15 @@ def Stiefel_Exp(U0, Delta, metric_alpha=0.0):
         upper = np.concatenate((x*A, -Re.transpose()), axis=1)
         lower = np.concatenate((Re, np.zeros((p,p), dtype=Re.dtype)), axis=1)
         L     = np.concatenate((upper, lower), axis=0)
-        MNe   = scipy.linalg.expm(L)
         expA  = scipy.linalg.expm(y*A)
-        MNe   = np.dot(MNe[:,0:p]       , expA)
+        MNe   = _block_expm_columns(L, expA)
     else:
         print('Error in  Stiefel_Exp: wrong metric. Choose alpha != -1.')
         print('Returning U1=U0')
         MNe   = np.eye(2*p,p)
         
     # perform U1 = U0*M + Q*N
+    MNe = np.real_if_close(MNe, tol=1000)
     U1 = np.dot(U0,MNe[0:p,0:p]) +  np.dot(QE, MNe[p:2*p,0:p])
     return U1
 #------------------------------------------------------------------------------
