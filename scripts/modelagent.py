@@ -117,8 +117,11 @@ class SDE(torch.nn.Module):
         self.drift = ode_drift
         self.score = score
         self.input_size = input_size
-        if self.score is None:
-            raise ValueError('Score model required for SDE trajectory generation.')
+        self.score = score
+        self.input_size = input_size
+        # Allow None score for OT models (noisy reverse ODE)
+        # if self.score is None:
+        #     raise ValueError('Score model required for SDE trajectory generation.')
         self.sigma = float(sigma)
 
     def _concat_time(self, t, y):
@@ -134,11 +137,16 @@ class SDE(torch.nn.Module):
         y = y.view(-1, *self.input_size)
         physical_t = 1 - t
         # Evaluate models at physical time 1-s
+        # Evaluate models at physical time 1-s
         velocity = self.drift(y, t=physical_t).flatten(start_dim=1)  # v_{1-s}
-        score = self.score(y, t=physical_t).flatten(start_dim=1)    # s_{1-s} , the score is scaled
-
-        # f_s = -v_{1-s} + s_{1-s}, where s is the learned scaled score function
-        return -velocity + score
+        
+        if self.score is not None:
+            score = self.score(y, t=physical_t).flatten(start_dim=1)    # s_{1-s} , the score is scaled
+            # f_s = -v_{1-s} + s_{1-s}
+            return -velocity + score
+        else:
+            # f_s = -v_{1-s} (Noisy reverse ODE)
+            return -velocity
 
     ## Diffusion
     def g(self, t, y):
@@ -331,14 +339,15 @@ class BaseAgent(ABC):
         
         Returns:
             forward_traj: Forward ODE trajectories (if not generate_backward)
-            backward_traj: Backward SDE trajectories (if generate_backward and is_sb)
+            backward_traj: Backward SDE trajectories (if generate_backward)
         """
-        if generate_backward and not self.is_sb:
-            raise ValueError(
-                'Backward SDE trajectories require a Schrödinger Bridge setup with a learned '
-                'score model. The backward drift v_t - (σ²/2)∇log p_t requires the score function '
-                '∇log p_t for stochastic backward generation.'
-            )
+        # Relaxed check: Allow backward SDE for OT (non-SB) models as noisy reverse ODE
+        # if generate_backward and not self.is_sb:
+        #     raise ValueError(
+        #         'Backward SDE trajectories require a Schrödinger Bridge setup with a learned '
+        #         'score model. The backward drift v_t - (σ²/2)∇log p_t requires the score function '
+        #         '∇log p_t for stochastic backward generation.'
+        #     )
 
         # x0 is initial point for generating trajectory
         # x0 -> t0 if forward, x0 -> tT if backward

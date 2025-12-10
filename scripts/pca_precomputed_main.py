@@ -598,8 +598,13 @@ if __name__ == '__main__':
 
             ### Inference (Trajectory Generation)
             norm_x0 = norm_test_latents[0]
+            norm_xT = norm_test_latents[-1]
             
+            # Forward ODE
             ode_traj, _ = agent.traj_gen(norm_x0, generate_backward=False)
+            
+            # Backward SDE (Latent)
+            _, sde_traj_back = agent.traj_gen(norm_xT, generate_backward=True)
             
             ### Rescale Trajs to Latent Domain + Lift to PCA Coefficients
             ode_traj_latent = scaler.inverse_transform(ode_traj)
@@ -618,7 +623,22 @@ if __name__ == '__main__':
             ode_traj_coeff_at_zt = traj_coeff_for_lift[zt_indices]
             last_traj_coeff_for_lift = traj_coeff_for_lift
 
+            last_traj_coeff_for_lift = traj_coeff_for_lift
+
             ode_traj_at_zt = agent._get_traj_at_zt(ode_traj_latent, zt)
+            
+            ### Rescale Backward SDE Traj + Lift to PCA Coefficients
+            sde_traj_back_latent = scaler.inverse_transform(sde_traj_back)
+            
+            traj_latent_back_for_lift = agent._get_traj_at_zt(sde_traj_back_latent, lift_times)
+            traj_coeff_back_for_lift = lift_latent_trajectory(
+                traj_latent_back_for_lift,
+                tc_info['lifter'],
+                neighbor_k=args.tc_neighbor_k,
+                batch_size=args.tc_batch_lift,
+            )
+            sde_back_traj_coeff_at_zt = traj_coeff_back_for_lift[zt_indices]
+            sde_back_traj_at_zt = agent._get_traj_at_zt(sde_traj_back_latent, zt)
             
             # Save results
             np.save(f'{outdir}/ode_traj_epoch{i+1}.npy', ode_traj_latent)
@@ -708,6 +728,22 @@ if __name__ == '__main__':
                 ode_traj_coeff_at_zt, coeff_testdata, pca_info, zt,
                 latent_outdir, run, score=False,
                 prefix='latent_'
+            )
+            
+            print('Creating field reconstruction visualizations for latent backward SDE plots...')
+            # Visualizing the backward SDE (score=True usually, but here likely effectively ODE+noise)
+            # We treat it as "sde" for plotting label purposes
+            visualize_all_field_reconstructions(
+                sde_back_traj_coeff_at_zt, coeff_testdata, pca_info, zt,
+                latent_outdir, run, score=True,  # usage of 'score=True' labels it as SDE in plots
+                prefix='latent_backward_'
+            )
+            
+            # Also plot the backward SDE trajectory itself in latent space
+            res_plotter_latent.plot_all(
+                tc_info['latent_test'], sde_back_traj_at_zt,
+                flow_losses, ode_eval_losses_dict, # reuse losses just for plotting call structure
+                legend=True, score=True, pca_info=None
             )
 
         run.finish()

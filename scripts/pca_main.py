@@ -273,6 +273,11 @@ if __name__ == '__main__':
                     help='Weight applied to the flow-matching loss during optimization')
         parser.add_argument('--score_loss_weight', type=float, default=1.0,
                     help='Weight applied to the score-matching loss (SB only)')
+        parser.add_argument('--flow_param', type=str, default='velocity',
+                    choices=['velocity', 'x_pred'],
+                    help='Velocity parameterization (direct velocity or x-pred dynamic v-loss)')
+        parser.add_argument('--min_sigma_ratio', type=float, default=1e-4,
+                    help='Minimum |dot_sigma/sigma| clamp for x-pred flow loss')
         parser.add_argument('--zt', type=float, nargs='+')
         parser.add_argument('--hold_one_out', type=int, default=None)
         parser.add_argument('--rand_heldouts', action='store_true')
