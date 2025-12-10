@@ -111,6 +111,15 @@ class PairwiseSchrodingerBridgeConditionalFlowMatcher(PairwiseConditionalFlowMat
         tscaled = (t - a) / (b - a)
         return self.sigma * torch.sqrt(tscaled * (1 - tscaled))
 
+    def compute_sigma_t_ratio(self, t, a, b):
+        if self.use_miniflow_sigma_t:
+            tscaled = (t - a) / (b - a)
+            ratio = (1 - 2 * tscaled) / (2 * tscaled * (1 - tscaled) + 1e-8)
+            ratio *= 1 / (b - a)
+        else:
+            ratio = (1 - 2 * t) / (2 * t * (1 - t) + 1e-8)
+        return ratio
+
     ## overrides parent class impl
     def compute_conditional_flow(self, x0, x1, t, xt, tscaled, dt_hat_dt):
         mu_t = self.compute_mu_t(x0, x1, tscaled)
@@ -363,6 +372,16 @@ class MultiMarginalSchrodingerBridgeConditionalFlowMatcher(MultiMarginalConditio
 
         return self.sigma * torch.sqrt(tscaled * (1 - tscaled))
 
+    def compute_sigma_t_ratio(self, t, a, b):
+        if self.use_miniflow_sigma_t:
+            dtscaled_dt = 1 / (b - a)
+            tscaled = (t - a) * dtscaled_dt
+            ratio = (1 - 2 * tscaled) / (2 * tscaled * (1 - tscaled) + 1e-8)
+            ratio *= dtscaled_dt
+        else:
+            ratio = (1 - 2 * t) / (2 * t * (1 - t) + 1e-8)
+        return ratio
+
     ## overrides parent class impl
     def compute_conditional_flow(self, z, t, xt, a, b):
         ## return \frac{\sigma_t^\prime}{\sigma_t} (x - \mu_t) + \mu_t^\prime
@@ -421,6 +440,15 @@ class PairwisePairedSchrodingerBridgeConditionalFlowMatcher(PairwiseConditionalF
         tscaled = (t - a) / (b - a)
         return self.sigma * torch.sqrt(tscaled * (1 - tscaled))
 
+    def compute_sigma_t_ratio(self, t, a, b):
+        if self.use_miniflow_sigma_t:
+            tscaled = (t - a) / (b - a)
+            ratio = (1 - 2 * tscaled) / (2 * tscaled * (1 - tscaled) + 1e-8)
+            ratio *= 1 / (b - a)
+        else:
+            ratio = (1 - 2 * t) / (2 * t * (1 - t) + 1e-8)
+        return ratio
+
     def compute_conditional_flow(self, x0, x1, t, xt, tscaled, dt_hat_dt):
         mu_t = self.compute_mu_t(x0, x1, tscaled)
         mu_t_prime = (x1 - x0) * dt_hat_dt
@@ -477,6 +505,16 @@ class MultiMarginalPairedSchrodingerBridgeConditionalFlowMatcher(MultiMarginalCo
     def compute_sigma_t(self, t, a, b):
         tscaled = (t - a) / (b - a)
         return self.sigma * torch.sqrt(tscaled * (1 - tscaled))
+
+    def compute_sigma_t_ratio(self, t, a, b):
+        if self.use_miniflow_sigma_t:
+            dtscaled_dt = 1 / (b - a)
+            tscaled = (t - a) * dtscaled_dt
+            ratio = (1 - 2 * tscaled) / (2 * tscaled * (1 - tscaled) + 1e-8)
+            ratio *= dtscaled_dt
+        else:
+            ratio = (1 - 2 * t) / (2 * t * (1 - t) + 1e-8)
+        return ratio
 
     def compute_conditional_flow(self, z, t, xt, a, b):
         mu_t = self.compute_mu_t(z, t)
