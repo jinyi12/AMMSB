@@ -815,9 +815,12 @@ def visualize_all_field_reconstructions(
     covariance_time_points: Sequence[float] | None = None,
     variance_threshold: float = 0.999,
     max_dim_for_heatmap: int = 32,
+    prefix: str = "",
 ) -> None:
     """Entry point producing all field reconstruction diagnostics."""
     resolution = int(np.sqrt(int(pca_info["data_dim"])))
+
+    diffeq = "sde" if score else "ode"
 
     print(f"Reconstructing fields with resolution {resolution}x{resolution}...")
     fields = reconstruct_fields_from_coefficients(traj_coeffs, pca_info, resolution)
@@ -829,15 +832,25 @@ def visualize_all_field_reconstructions(
     ]
 
     print("Creating field visualizations...")
-    plot_field_snapshots(fields, zt, outdir, run, n_samples=5, score=score)
-    plot_field_evolution_gif(fields, zt, outdir, run, sample_idx=0, score=score, fps=5)
+    plot_field_snapshots(
+        fields, zt, outdir, run, n_samples=5, score=score,
+        filename_prefix=f"{prefix}field_snapshots_{diffeq}",
+    )
+    plot_field_evolution_gif(
+        fields, zt, outdir, run, sample_idx=0, score=score, fps=5,
+        filename_prefix=f"{prefix}field_evolution_{diffeq}_sample0",
+    )
     for sample_idx in (1, 2):
         if sample_idx < fields.shape[1]:
             plot_field_evolution_gif(
-                fields, zt, outdir, run, sample_idx=sample_idx, score=score, fps=5
+                fields, zt, outdir, run, sample_idx=sample_idx, score=score, fps=5,
+                filename_prefix=f"{prefix}field_evolution_{diffeq}_sample{sample_idx}",
             )
     if testdata_fields:
-        plot_field_statistics(fields, zt, testdata_fields, outdir, run, score=score)
+        plot_field_statistics(
+            fields, zt, testdata_fields, outdir, run, score=score,
+            filename_prefix=f"{prefix}field_statistics_{diffeq}",
+        )
         plot_sample_comparison_grid(
             testdata_fields,
             fields,
@@ -845,8 +858,12 @@ def visualize_all_field_reconstructions(
             outdir,
             run,
             score=score,
+            filename_prefix=f"{prefix}field_sample_comparison_{diffeq}",
         )
-    plot_spatial_correlation(fields, zt, outdir, run, score=score)
+    plot_spatial_correlation(
+        fields, zt, outdir, run, score=score,
+        filename_prefix=f"{prefix}spatial_correlation_{diffeq}",
+    )
 
     if covariance_targets and covariance_generations:
         if covariance_time_points is None:
@@ -862,6 +879,7 @@ def visualize_all_field_reconstructions(
                 outdir=outdir,
                 run=run,
                 score=score,
+                filename_prefix=f"{prefix}covariance_diagnostics_{diffeq}",
             )
             plot_covariance_heatmaps_comparison(
                 covariance_targets,
@@ -872,6 +890,7 @@ def visualize_all_field_reconstructions(
                 outdir=outdir,
                 run=run,
                 score=score,
+                filename_prefix=f"{prefix}truncated_covariance_{diffeq}",
             )
 
     print("Field visualizations complete!")

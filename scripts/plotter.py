@@ -21,8 +21,9 @@ except ImportError:
 
 
 class Plotter():
-    def __init__(self, run, args, outdir, d1=0, d2=1):
+    def __init__(self, run, args, outdir, d1=0, d2=1, wandb_prefix=None):
         self.run = run
+        self.wandb_prefix = f"{wandb_prefix}/" if wandb_prefix else ""
         self.zt = args.zt
         self.test_n = 200  ## number of samples from testdata
         self.ntrajs = args.plot_n_trajs  ## num of trajs to highlight
@@ -104,7 +105,7 @@ class Plotter():
             )
             self.run.log(
                 {
-                    f'evalplots/flow_loss' : img
+                    f'{self.wandb_prefix}evalplots/flow_loss' : img
                 }
             )
         else:
@@ -114,7 +115,7 @@ class Plotter():
             )
             self.run.log(
                 {
-                    f'evalplots/score_loss' : img
+                    f'{self.wandb_prefix}evalplots/score_loss' : img
                 }
             )
 
@@ -142,7 +143,7 @@ class Plotter():
             )
             self.run.log(
                 {
-                    f'evalplots/flow_loss_epochs' : img
+                    f'{self.wandb_prefix}evalplots/flow_loss_epochs' : img
                 }
             )
         else:
@@ -152,7 +153,7 @@ class Plotter():
             )
             self.run.log(
                 {
-                    f'evalplots/score_loss_epochs' : img
+                    f'{self.wandb_prefix}evalplots/score_loss_epochs' : img
                 }
             )
 
@@ -189,7 +190,7 @@ class Plotter():
         )
         self.run.log(
             {
-                f'evalplots/traj_loss_overlap_{diffeq}' : img
+                f'{self.wandb_prefix}evalplots/traj_loss_overlap_{diffeq}' : img
             }
         )
 
@@ -229,7 +230,7 @@ class Plotter():
         )
         self.run.log(
             {
-                f'evalplots/traj_loss_indiv_{diffeq}' : img
+                f'{self.wandb_prefix}evalplots/traj_loss_indiv_{diffeq}' : img
             }
         )
 
@@ -267,7 +268,7 @@ class Plotter():
             )
             self.run.log(
                 {
-                    f'evalplots/traj_loss_epochs_{diffeq}_t{m}' : img
+                    f'{self.wandb_prefix}evalplots/traj_loss_epochs_{diffeq}_t{m}' : img
                 }
             )
 
@@ -324,7 +325,7 @@ class Plotter():
         )
         self.run.log(
             {
-                f'visualizations/trajs_{diffeq}' : img
+                f'{self.wandb_prefix}visualizations/trajs_{diffeq}' : img
             }
         )
 
@@ -397,7 +398,7 @@ class Plotter():
         )
         self.run.log(
             {
-                f'visualizations/trajs_{diffeq}_gif' : gif
+                f'{self.wandb_prefix}visualizations/trajs_{diffeq}_gif' : gif
             }
         )
 
@@ -456,7 +457,7 @@ class Plotter():
         )
         self.run.log(
             {
-                f'visualizations/traj_from_samples_{diffeq}' : img
+                f'{self.wandb_prefix}visualizations/traj_from_samples_{diffeq}' : img
             }
         )
 
@@ -515,7 +516,7 @@ class Plotter():
         )
         self.run.log(
             {
-                f'visualizations/traj_timepoints_{diffeq}' : img
+                f'{self.wandb_prefix}visualizations/traj_timepoints_{diffeq}' : img
             }
         )
 
@@ -565,7 +566,7 @@ class Plotter():
         )
         self.run.log(
             {
-                f'visualizations/snapshots_{diffeq}' : img
+                f'{self.wandb_prefix}visualizations/snapshots_{diffeq}' : img
             }
         )
 
@@ -629,7 +630,7 @@ class Plotter():
         )
         self.run.log(
             {
-                f'visualizations/snapshots_{diffeq}_gif' : gif
+                f'{self.wandb_prefix}visualizations/snapshots_{diffeq}_gif' : gif
             }
         )
 
@@ -683,7 +684,7 @@ class Plotter():
         
         ## Field Reconstruction Plots (for PCA data)
         if pca_info is not None and HAS_FIELD_VIZ:
-            print(f'Creating {titlebase} field reconstruction visualizations...')
             visualize_all_field_reconstructions(
-                traj, data, pca_info, self.zt, self.outdir, self.run, score=score
+                traj, data, pca_info, self.zt, self.outdir, self.run, score=score,
+                prefix=self.wandb_prefix
             )
