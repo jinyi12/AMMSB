@@ -6,11 +6,15 @@ Optionally, enable a sampler built from Stiefel-interpolated dense trajectories.
 
 import sys
 import argparse
+import hashlib
+import json
+import pickle
 import numpy as np
 import torch
 from pathlib import Path
 from tqdm import tqdm
 import wandb
+from typing import Optional
 
 # Add notebooks directory to path to import tran_inclusions
 # Also add repo root to import mmsfm package
@@ -164,6 +168,78 @@ def load_pca_data(
     if return_times:
         outputs.append(np.array(marginal_times, dtype=float))
     return tuple(outputs)
+
+
+def _make_jsonable(value):
+    """Convert common numpy/Path types into JSON-serializable primitives."""
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, (np.floating, float)):
+        return float(value)
+    if isinstance(value, (np.integer, int)):
+        return int(value)
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, (list, tuple)):
+        return [_make_jsonable(v) for v in value]
+    return value
+
+
+def _normalize_meta(meta_dict: dict) -> dict:
+    return {k: _make_jsonable(v) for k, v in meta_dict.items()}
+
+
+def _meta_hash(meta_dict: dict) -> str:
+    normalized = _normalize_meta(meta_dict)
+    payload = json.dumps(normalized, sort_keys=True, separators=(',', ':'))
+    return hashlib.md5(payload.encode('utf-8')).hexdigest()
+
+
+def _array_checksum(arr) -> Optional[str]:
+    if arr is None:
+        return None
+    arr_np = np.asarray(arr)
+    return hashlib.md5(arr_np.tobytes()).hexdigest()
+
+
+def _load_cached_result(cache_path: Path, expected_meta: dict, label: str, *, refresh: bool = False):
+    """Attempt to load a cached payload; return None on mismatch or failure."""
+    if refresh:
+        print(f"Skipping {label} cache because refresh was requested.")
+        return None
+    if cache_path is None or not cache_path.exists():
+        return None
+    try:
+        with open(cache_path, "rb") as f:
+            payload = pickle.load(f)
+    except Exception as exc:
+        print(f"Failed to load cached {label} from {cache_path}: {exc}")
+        return None
+    if not isinstance(payload, dict) or 'meta' not in payload or 'data' not in payload:
+        print(f"Cache file at {cache_path} is malformed; recomputing {label}.")
+        return None
+    cached_meta = payload['meta']
+    if _meta_hash(cached_meta) != _meta_hash(expected_meta):
+        print(f"{label.capitalize()} cache metadata mismatch; recomputing.")
+        return None
+    print(f"Loaded cached {label} from {cache_path}")
+    return payload['data']
+
+
+def _save_cached_result(cache_path: Path, data, meta: dict, label: str):
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    normalized_meta = _normalize_meta(meta)
+    with open(cache_path, "wb") as f:
+        pickle.dump({'meta': normalized_meta, 'data': data}, f)
+    print(f"Saved {label} to cache: {cache_path}")
+
+
+def _resolve_cache_base(cache_dir: Optional[str], data_path: str) -> Path:
+    base = Path(cache_dir) if cache_dir is not None else (repo_root / "data" / "cache_pca_precomputed")
+    base = base.expanduser().resolve()
+    cache_base = base / Path(data_path).stem
+    cache_base.mkdir(parents=True, exist_ok=True)
+    return cache_base
 
 
 def prepare_timecoupled_latents(
@@ -350,7 +426,7 @@ if __name__ == '__main__':
         parser.add_argument('--hold_one_out', type=int, default=None)
         
         ### Time-coupled Diffusion Map Args ###
-        parser.add_argument('--tc_k', type=int, default=16,
+        parser.add_argument('--tc_k', type=int, default=80,
                             help='Number of diffusion coordinates to retain.')
         parser.add_argument('--tc_alpha', type=float, default=1.0,
                             help='Density normalisation exponent for diffusion maps.')
@@ -400,12 +476,30 @@ if __name__ == '__main__':
         parser.add_argument('--no_wandb', action='store_const', const='disabled',
                             default='online', dest='wandb_mode')
 
+        ### Cache Args ###
+        parser.add_argument('--cache_dir', type=str, default=None,
+                            help='Directory to cache time-coupled embeddings and interpolations '
+                                 '(defaults to data/cache_pca_precomputed/<data_stem>).')
+        parser.add_argument('--no_cache', action='store_true',
+                            help='Disable cache loading and saving for embeddings and interpolations.')
+        parser.add_argument('--refresh_cache', action='store_true',
+                            help='Force recomputation even if cache files are present.')
+
         ### Misc Args ###
         parser.add_argument('--outdir', '-o', type=str, default=None)
         parser.add_argument('--nogpu', action='store_true')
 
         args = parser.parse_args()
 
+        cache_enabled = not args.no_cache
+        cache_base = None
+        if cache_enabled:
+            cache_base = _resolve_cache_base(args.cache_dir, args.data_path)
+            print(f'Caching enabled. Base directory: {cache_base}')
+            if args.refresh_cache:
+                print('Cache refresh requested; existing cached artifacts will be ignored.')
+        else:
+            print('Caching disabled.')
 
         ## Set Up CUDA/CPU
         device = get_device(args.nogpu)
@@ -471,22 +565,56 @@ if __name__ == '__main__':
             marginal_times = marginal_times[zt_rem_idxs]
 
         ### Compute Time-Coupled Diffusion Map Embeddings
-        print('Computing time-coupled diffusion map embeddings...')
-        tc_info = prepare_timecoupled_latents(
-            full_marginals,
-            train_idx=train_idx,
-            test_idx=test_idx,
-            zt_rem_idxs=np.arange(len(full_marginals)),
-            times_raw=np.array(marginal_times, dtype=float),
-            tc_k=args.tc_k,
-            tc_alpha=args.tc_alpha,
-            tc_beta=args.tc_beta,
-            tc_epsilon_scales_min=args.tc_epsilon_scales_min,
-            tc_epsilon_scales_max=args.tc_epsilon_scales_max,
-            tc_epsilon_scales_num=args.tc_epsilon_scales_num,
-            tc_power_iter_tol=args.tc_power_iter_tol,
-            tc_power_iter_maxiter=args.tc_power_iter_maxiter,
-        )
+        tc_cache_meta = {
+            'version': 1,
+            'data_path': str(Path(args.data_path).resolve()),
+            'test_size': args.test_size,
+            'seed': args.seed,
+            'hold_one_out': args.hold_one_out,
+            'tc_k': args.tc_k,
+            'tc_alpha': args.tc_alpha,
+            'tc_beta': args.tc_beta,
+            'tc_epsilon_scales_min': args.tc_epsilon_scales_min,
+            'tc_epsilon_scales_max': args.tc_epsilon_scales_max,
+            'tc_epsilon_scales_num': args.tc_epsilon_scales_num,
+            'tc_power_iter_tol': args.tc_power_iter_tol,
+            'tc_power_iter_maxiter': args.tc_power_iter_maxiter,
+            'zt': np.round(zt, 8).tolist(),
+            'zt_rem_idxs': zt_rem_idxs.tolist(),
+            'marginal_times': np.round(np.asarray(marginal_times, dtype=float), 8).tolist() if marginal_times is not None else None,
+            'train_idx_checksum': _array_checksum(train_idx),
+            'test_idx_checksum': _array_checksum(test_idx),
+        }
+        tc_cache_path = cache_base / "tc_embeddings.pkl" if cache_base is not None else None
+        tc_info = None
+        if cache_enabled and tc_cache_path is not None:
+            tc_info = _load_cached_result(
+                tc_cache_path,
+                tc_cache_meta,
+                'time-coupled embeddings',
+                refresh=args.refresh_cache,
+            )
+        if tc_info is None:
+            print('Computing time-coupled diffusion map embeddings...')
+            tc_info = prepare_timecoupled_latents(
+                full_marginals,
+                train_idx=train_idx,
+                test_idx=test_idx,
+                zt_rem_idxs=np.arange(len(full_marginals)),
+                times_raw=np.array(marginal_times, dtype=float),
+                tc_k=args.tc_k,
+                tc_alpha=args.tc_alpha,
+                tc_beta=args.tc_beta,
+                tc_epsilon_scales_min=args.tc_epsilon_scales_min,
+                tc_epsilon_scales_max=args.tc_epsilon_scales_max,
+                tc_epsilon_scales_num=args.tc_epsilon_scales_num,
+                tc_power_iter_tol=args.tc_power_iter_tol,
+                tc_power_iter_maxiter=args.tc_power_iter_maxiter,
+            )
+            if cache_enabled and tc_cache_path is not None:
+                _save_cached_result(tc_cache_path, tc_info, tc_cache_meta, 'time-coupled embeddings')
+        else:
+            print('Using cached time-coupled diffusion map embeddings.')
         print('Time-coupled diffusion map epsilon summary:', tc_info['epsilons'])
 
         # Scale latent space once; default training uses the manifold directly.
@@ -506,17 +634,43 @@ if __name__ == '__main__':
         use_precomputed_sampler = args.agent_type == 'precomputed'
         sampler = None
         if use_precomputed_sampler:
-            print('Computing dense latent trajectories via Stiefel interpolation for sampler...')
-            interp_result = build_dense_latent_trajectories(
-                tc_info['traj_result'],
-                times_train=zt[zt_rem_idxs],
-                tc_embeddings_time=tc_info['latent_train_tensor'],
-                n_dense=args.n_dense,
-                frechet_mode=args.frechet_mode,
-                compute_global=True,
-                compute_triplet=(args.frechet_mode == 'triplet'),
-                compute_naive=False,
-            )
+            zt_train_times = zt[zt_rem_idxs]
+            interp_cache_meta = {
+                'version': 1,
+                'tc_cache_hash': _meta_hash(tc_cache_meta),
+                'n_dense': args.n_dense,
+                'frechet_mode': args.frechet_mode,
+                'times_train': np.round(zt_train_times, 8).tolist(),
+                'latent_train_shape': tuple(tc_info['latent_train_tensor'].shape),
+                'metric_alpha': 0.0,
+                'compute_global': True,
+                'compute_triplet': args.frechet_mode == 'triplet',
+            }
+            interp_cache_path = cache_base / "interpolation.pkl" if cache_base is not None else None
+            interp_result = None
+            if cache_enabled and interp_cache_path is not None:
+                interp_result = _load_cached_result(
+                    interp_cache_path,
+                    interp_cache_meta,
+                    'latent interpolation',
+                    refresh=args.refresh_cache,
+                )
+            if interp_result is None:
+                print('Computing dense latent trajectories via Stiefel interpolation for sampler...')
+                interp_result = build_dense_latent_trajectories(
+                    tc_info['traj_result'],
+                    times_train=zt_train_times,
+                    tc_embeddings_time=tc_info['latent_train_tensor'],
+                    n_dense=args.n_dense,
+                    frechet_mode=args.frechet_mode,
+                    compute_global=True,
+                    compute_triplet=(args.frechet_mode == 'triplet'),
+                    compute_naive=False,
+                )
+                if cache_enabled and interp_cache_path is not None:
+                    _save_cached_result(interp_cache_path, interp_result, interp_cache_meta, 'latent interpolation')
+            else:
+                print('Using cached dense latent trajectories for sampler.')
 
             if args.frechet_mode == 'triplet':
                 dense_trajs = interp_result.phi_frechet_triplet_dense
