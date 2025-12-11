@@ -757,8 +757,10 @@ if __name__ == '__main__':
             # Forward ODE
             ode_traj, _ = agent.traj_gen(norm_x0, generate_backward=False)
             
-            # Backward SDE (Latent)
-            _, sde_traj_back = agent.traj_gen(norm_xT, generate_backward=True)
+            # Backward SDE (Latent) - only if supported (OT does not support SDE)
+            sde_traj_back = None
+            if args.flowmatcher == 'sb':
+                _, sde_traj_back = agent.traj_gen(norm_xT, generate_backward=True)
             
             ### Rescale Trajs to Latent Domain + Lift to PCA Coefficients
             ode_traj_latent = scaler.inverse_transform(ode_traj)
@@ -782,17 +784,21 @@ if __name__ == '__main__':
             ode_traj_at_zt = agent._get_traj_at_zt(ode_traj_latent, zt)
             
             ### Rescale Backward SDE Traj + Lift to PCA Coefficients
-            sde_traj_back_latent = scaler.inverse_transform(sde_traj_back)
-            
-            traj_latent_back_for_lift = agent._get_traj_at_zt(sde_traj_back_latent, lift_times)
-            traj_coeff_back_for_lift = lift_latent_trajectory(
-                traj_latent_back_for_lift,
-                tc_info['lifter'],
-                neighbor_k=args.tc_neighbor_k,
-                batch_size=args.tc_batch_lift,
-            )
-            sde_back_traj_coeff_at_zt = traj_coeff_back_for_lift[zt_indices]
-            sde_back_traj_at_zt = agent._get_traj_at_zt(sde_traj_back_latent, zt)
+            if sde_traj_back is not None:
+                sde_traj_back_latent = scaler.inverse_transform(sde_traj_back)
+                
+                traj_latent_back_for_lift = agent._get_traj_at_zt(sde_traj_back_latent, lift_times)
+                traj_coeff_back_for_lift = lift_latent_trajectory(
+                    traj_latent_back_for_lift,
+                    tc_info['lifter'],
+                    neighbor_k=args.tc_neighbor_k,
+                    batch_size=args.tc_batch_lift,
+                )
+                sde_back_traj_coeff_at_zt = traj_coeff_back_for_lift[zt_indices]
+                sde_back_traj_at_zt = agent._get_traj_at_zt(sde_traj_back_latent, zt)
+            else:
+                sde_traj_back_latent = None
+                sde_back_traj_at_zt = None
             
             # Save results
             np.save(f'{outdir}/ode_traj_epoch{i+1}.npy', ode_traj_latent)
