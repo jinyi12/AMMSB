@@ -896,6 +896,66 @@ def visualize_all_field_reconstructions(
     print("Field visualizations complete!")
 
 
+def _evaluate_projected_field(
+    flow_model: Any,
+    x0: torch.Tensor,
+    xT: torch.Tensor,
+    t: float,
+    dims: tuple[int, ...],
+    n_grid: int,
+    pca_components: int = 2,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, Any]:
+    """Helper to evaluate flow field on a 2D PCA projected grid."""
+    from sklearn.decomposition import PCA
+
+    # Flatten samples for PCA
+    x0_flat = x0.view(x0.shape[0], -1).cpu().numpy()
+    xT_flat = xT.view(xT.shape[0], -1).cpu().numpy()
+    all_samples = np.vstack([x0_flat, xT_flat])
+
+    # Fit PCA
+    pca = PCA(n_components=pca_components)
+    pca.fit(all_samples)
+
+    # Project endpoints
+    x0_proj = pca.transform(x0_flat)
+    xT_proj = pca.transform(xT_flat)
+
+    # Create grid in PCA space
+    x_min, x_max = min(x0_proj[:, 0].min(), xT_proj[:, 0].min()), max(x0_proj[:, 0].max(), xT_proj[:, 0].max())
+    y_min, y_max = min(x0_proj[:, 1].min(), xT_proj[:, 1].min()), max(x0_proj[:, 1].max(), xT_proj[:, 1].max())
+
+    x_margin = (x_max - x_min) * 0.1
+    y_margin = (y_max - y_min) * 0.1
+
+    xx, yy = np.meshgrid(
+        np.linspace(x_min - x_margin, x_max + x_margin, n_grid),
+        np.linspace(y_min - y_margin, y_max + y_margin, n_grid)
+    )
+    grid_points_2d = np.c_[xx.ravel(), yy.ravel()]
+
+    # Inverse transform grid to high-dim space
+    grid_points_high = pca.inverse_transform(grid_points_2d)
+    grid_tensor = torch.from_numpy(grid_points_high).float().to(x0.device)
+    grid_tensor = grid_tensor.view(-1, *dims)
+
+    # Evaluate flow
+    t_tensor = torch.full((grid_tensor.shape[0],), t, device=grid_tensor.device, dtype=grid_tensor.dtype)
+    flow_model.eval()
+    with torch.no_grad():
+        velocities = flow_model(t_tensor, grid_tensor)
+
+    # Project velocities: (x + v)_proj - x_proj
+    # Note: velocities are vectors, so we need diff of projections
+    velocities_flat = velocities.view(velocities.shape[0], -1).cpu().numpy()
+    velocities_proj = pca.transform(grid_points_high + velocities_flat) - grid_points_2d
+
+    U = velocities_proj[:, 0].reshape(n_grid, n_grid)
+    V = velocities_proj[:, 1].reshape(n_grid, n_grid)
+
+    return xx, yy, U, V, x0_proj, xT_proj, pca
+
+
 def plot_vector_field_2d_projection(
     flow_model: Any,
     x0: torch.Tensor,
@@ -912,116 +972,52 @@ def plot_vector_field_2d_projection(
     wandb_key: str | None = None,
     close: bool = True,
 ) -> Figure | None:
-    """Visualize learned vector field via 2D PCA projection with quiver plot.
-    
-    Args:
-        flow_model: Trained flow model
-        x0: Starting distribution samples (N, C, H, W)
-        xT: Target distribution samples (N, C, H, W)
-        time_points: Time values to visualize
-        dims: Data dimensions
-        outdir: Output directory
-        run: Logging object
-        n_grid: Grid resolution for evaluation
-        pca_components: Number of PCA components (must be 2)
-        score: Whether this is score-based
-        filename_prefix: Optional filename prefix
-        wandb_key: Optional wandb key
-        close: Whether to close figure
-    
-    Returns:
-        Figure object if close=False, None otherwise
-    """
-    from sklearn.decomposition import PCA
-    
+    """Visualize learned vector field via 2D PCA projection with quiver plot."""
     format_for_paper()
-    
-    # Flatten samples for PCA
-    x0_flat = x0.view(x0.shape[0], -1).cpu().numpy()
-    xT_flat = xT.view(xT.shape[0], -1).cpu().numpy()
-    all_samples = np.vstack([x0_flat, xT_flat])
-    
-    # Fit PCA on combined data
-    pca = PCA(n_components=pca_components)
-    pca.fit(all_samples)
-    
-    # Project endpoints
-    x0_proj = pca.transform(x0_flat)
-    xT_proj = pca.transform(xT_flat)
-    
-    # Create grid in PCA space
-    x_min, x_max = min(x0_proj[:, 0].min(), xT_proj[:, 0].min()), max(x0_proj[:, 0].max(), xT_proj[:, 0].max())
-    y_min, y_max = min(x0_proj[:, 1].min(), xT_proj[:, 1].min()), max(x0_proj[:, 1].max(), xT_proj[:, 1].max())
-    
-    x_margin = (x_max - x_min) * 0.1
-    y_margin = (y_max - y_min) * 0.1
-    
-    xx, yy = np.meshgrid(
-        np.linspace(x_min - x_margin, x_max + x_margin, n_grid),
-        np.linspace(y_min - y_margin, y_max + y_margin, n_grid)
-    )
-    
-    grid_points_2d = np.c_[xx.ravel(), yy.ravel()]
-    
-    # Inverse transform to original space
-    grid_points_high = pca.inverse_transform(grid_points_2d)
-    grid_tensor = torch.from_numpy(grid_points_high).float().to(x0.device)
-    grid_tensor = grid_tensor.view(-1, *dims)
-    
+
     n_times = len(time_points)
     ncols = min(3, n_times)
     nrows = (n_times + ncols - 1) // ncols
-    
-    # Fit within letter paper dimensions
+
     col_width = min(6, 8.5 / max(ncols, 1))
     row_height = min(5, 10.5 / max(nrows, 1))
     fig, axes = plt.subplots(nrows, ncols, figsize=(col_width * ncols, row_height * nrows))
     if n_times == 1:
         axes = np.array([axes])
     axes = np.atleast_1d(axes).flatten()
-    
-    flow_model.eval()
-    with torch.no_grad():
-        for idx, t in enumerate(time_points):
-            ax = axes[idx]
-            
-            # Evaluate flow field at grid points
-            t_tensor = torch.full((grid_tensor.shape[0],), t, device=grid_tensor.device, dtype=grid_tensor.dtype)
-            velocities = flow_model(t_tensor, grid_tensor)
-            
-            # Project velocities to PCA space
-            velocities_flat = velocities.view(velocities.shape[0], -1).cpu().numpy()
-            velocities_proj = pca.transform(grid_points_high + velocities_flat) - grid_points_2d
-            
-            U = velocities_proj[:, 0].reshape(n_grid, n_grid)
-            V = velocities_proj[:, 1].reshape(n_grid, n_grid)
-            
-            # Quiver plot
-            ax.quiver(xx, yy, U, V, alpha=0.6, scale=None, scale_units='xy', angles='xy')
-            
-            # Overlay data points
-            ax.scatter(x0_proj[:, 0], x0_proj[:, 1], c='blue', s=30, alpha=0.6, label='Source', edgecolors='k', linewidths=0.5)
-            ax.scatter(xT_proj[:, 0], xT_proj[:, 1], c='red', s=30, alpha=0.6, label='Target', edgecolors='k', linewidths=0.5)
-            
-            ax.set_xlabel(f'PC1 ({pca.explained_variance_ratio_[0]:.1%} var)', fontsize=10)
-            ax.set_ylabel(f'PC2 ({pca.explained_variance_ratio_[1]:.1%} var)', fontsize=10)
-            ax.set_title(f't = {t:.2f}', fontsize=12)
-            ax.grid(True, alpha=0.3)
-            if idx == 0:
-                ax.legend(loc='best', fontsize=8)
-    
+
+    for idx, t in enumerate(time_points):
+        ax = axes[idx]
+        xx, yy, U, V, x0_proj, xT_proj, pca = _evaluate_projected_field(
+            flow_model, x0, xT, t, dims, n_grid, pca_components
+        )
+
+        # Quiver plot
+        ax.quiver(xx, yy, U, V, alpha=0.6, scale=None, scale_units='xy', angles='xy')
+
+        # Overlay data
+        ax.scatter(x0_proj[:, 0], x0_proj[:, 1], c='blue', s=30, alpha=0.6, label='Source', edgecolors='k', linewidths=0.5)
+        ax.scatter(xT_proj[:, 0], xT_proj[:, 1], c='red', s=30, alpha=0.6, label='Target', edgecolors='k', linewidths=0.5)
+
+        ax.set_xlabel(f'PC1 ({pca.explained_variance_ratio_[0]:.1%} var)', fontsize=10)
+        ax.set_ylabel(f'PC2 ({pca.explained_variance_ratio_[1]:.1%} var)', fontsize=10)
+        ax.set_title(f't = {t:.2f}', fontsize=12)
+        ax.grid(True, alpha=0.3)
+        if idx == 0:
+            ax.legend(loc='best', fontsize=8)
+
     for idx in range(n_times, len(axes)):
         axes[idx].set_visible(False)
-    
+
     diffeq = "sde" if score else "ode"
     fig.suptitle(f"Vector Field Projection (PCA 2D) - {diffeq.upper()}", fontsize=14, y=0.995)
     fig.tight_layout()
-    
+
     base_name = filename_prefix or f"vector_field_projection_{diffeq}"
     wandb_entry = wandb_key or f"visualizations/{base_name}"
     if outdir is not None:
         _save_and_log_figure(fig, os.path.join(outdir, base_name), run, wandb_entry)
-    
+
     if close:
         plt.close(fig)
         return None
@@ -1044,123 +1040,58 @@ def plot_vector_field_streamplot(
     wandb_key: str | None = None,
     close: bool = True,
 ) -> Figure | None:
-    """Visualize learned vector field via 2D PCA projection with streamplot.
-    
-    Args:
-        flow_model: Trained flow model
-        x0: Starting distribution samples (N, C, H, W)
-        xT: Target distribution samples (N, C, H, W)
-        time_points: Time values to visualize
-        dims: Data dimensions
-        outdir: Output directory
-        run: Logging object
-        n_grid: Grid resolution for evaluation
-        pca_components: Number of PCA components (must be 2)
-        score: Whether this is score-based
-        filename_prefix: Optional filename prefix
-        wandb_key: Optional wandb key
-        close: Whether to close figure
-    
-    Returns:
-        Figure object if close=False, None otherwise
-    """
-    from sklearn.decomposition import PCA
-    
+    """Visualize learned vector field via 2D PCA projection with streamplot."""
     format_for_paper()
-    
-    # Flatten samples for PCA
-    x0_flat = x0.view(x0.shape[0], -1).cpu().numpy()
-    xT_flat = xT.view(xT.shape[0], -1).cpu().numpy()
-    all_samples = np.vstack([x0_flat, xT_flat])
-    
-    # Fit PCA on combined data
-    pca = PCA(n_components=pca_components)
-    pca.fit(all_samples)
-    
-    # Project endpoints
-    x0_proj = pca.transform(x0_flat)
-    xT_proj = pca.transform(xT_flat)
-    
-    # Create grid in PCA space
-    x_min, x_max = min(x0_proj[:, 0].min(), xT_proj[:, 0].min()), max(x0_proj[:, 0].max(), xT_proj[:, 0].max())
-    y_min, y_max = min(x0_proj[:, 1].min(), xT_proj[:, 1].min()), max(x0_proj[:, 1].max(), xT_proj[:, 1].max())
-    
-    x_margin = (x_max - x_min) * 0.1
-    y_margin = (y_max - y_min) * 0.1
-    
-    xx, yy = np.meshgrid(
-        np.linspace(x_min - x_margin, x_max + x_margin, n_grid),
-        np.linspace(y_min - y_margin, y_max + y_margin, n_grid)
-    )
-    
-    grid_points_2d = np.c_[xx.ravel(), yy.ravel()]
-    
-    # Inverse transform to original space
-    grid_points_high = pca.inverse_transform(grid_points_2d)
-    grid_tensor = torch.from_numpy(grid_points_high).float().to(x0.device)
-    grid_tensor = grid_tensor.view(-1, *dims)
-    
+
     n_times = len(time_points)
     ncols = min(3, n_times)
     nrows = (n_times + ncols - 1) // ncols
-    
-    # Fit within letter paper dimensions
+
     col_width = min(6, 8.5 / max(ncols, 1))
     row_height = min(5, 10.5 / max(nrows, 1))
     fig, axes = plt.subplots(nrows, ncols, figsize=(col_width * ncols, row_height * nrows))
     if n_times == 1:
         axes = np.array([axes])
     axes = np.atleast_1d(axes).flatten()
-    
-    flow_model.eval()
-    with torch.no_grad():
-        for idx, t in enumerate(time_points):
-            ax = axes[idx]
-            
-            # Evaluate flow field at grid points
-            t_tensor = torch.full((grid_tensor.shape[0],), t, device=grid_tensor.device, dtype=grid_tensor.dtype)
-            velocities = flow_model(t_tensor, grid_tensor)
-            
-            # Project velocities to PCA space
-            velocities_flat = velocities.view(velocities.shape[0], -1).cpu().numpy()
-            velocities_proj = pca.transform(grid_points_high + velocities_flat) - grid_points_2d
-            
-            U = velocities_proj[:, 0].reshape(n_grid, n_grid)
-            V = velocities_proj[:, 1].reshape(n_grid, n_grid)
-            
-            # Compute velocity magnitude for color
-            speed = np.sqrt(U**2 + V**2)
-            
-            # Streamplot
-            strm = ax.streamplot(xx, yy, U, V, color=speed, cmap='viridis', 
-                                linewidth=1.5, density=1.5, arrowsize=1.2, arrowstyle='->')
+
+    for idx, t in enumerate(time_points):
+        ax = axes[idx]
+        xx, yy, U, V, x0_proj, xT_proj, pca = _evaluate_projected_field(
+            flow_model, x0, xT, t, dims, n_grid, pca_components
+        )
+
+        speed = np.sqrt(U**2 + V**2)
+        strm = ax.streamplot(
+            xx, yy, U, V, color=speed, cmap='viridis',
+            linewidth=1.5, density=1.5, arrowsize=1.2, arrowstyle='->'
+        )
+        if idx == len(time_points) - 1:
             plt.colorbar(strm.lines, ax=ax, label='Velocity Magnitude', fraction=0.046, pad=0.04)
-            
-            # Overlay data points
-            ax.scatter(x0_proj[:, 0], x0_proj[:, 1], c='cyan', s=40, alpha=0.8, 
-                      label='Source', edgecolors='black', linewidths=1, marker='o')
-            ax.scatter(xT_proj[:, 0], xT_proj[:, 1], c='magenta', s=40, alpha=0.8, 
-                      label='Target', edgecolors='black', linewidths=1, marker='s')
-            
-            ax.set_xlabel(f'PC1 ({pca.explained_variance_ratio_[0]:.1%} var)', fontsize=10)
-            ax.set_ylabel(f'PC2 ({pca.explained_variance_ratio_[1]:.1%} var)', fontsize=10)
-            ax.set_title(f't = {t:.2f}', fontsize=12)
-            ax.grid(True, alpha=0.3)
-            if idx == 0:
-                ax.legend(loc='best', fontsize=8)
-    
+
+        ax.scatter(x0_proj[:, 0], x0_proj[:, 1], c='cyan', s=40, alpha=0.8,
+                   label='Source', edgecolors='black', linewidths=1, marker='o')
+        ax.scatter(xT_proj[:, 0], xT_proj[:, 1], c='magenta', s=40, alpha=0.8,
+                   label='Target', edgecolors='black', linewidths=1, marker='s')
+
+        ax.set_xlabel(f'PC1 ({pca.explained_variance_ratio_[0]:.1%} var)', fontsize=10)
+        ax.set_ylabel(f'PC2 ({pca.explained_variance_ratio_[1]:.1%} var)', fontsize=10)
+        ax.set_title(f't = {t:.2f}', fontsize=12)
+        ax.grid(True, alpha=0.3)
+        if idx == 0:
+            ax.legend(loc='best', fontsize=8)
+
     for idx in range(n_times, len(axes)):
         axes[idx].set_visible(False)
-    
+
     diffeq = "sde" if score else "ode"
     fig.suptitle(f"Vector Field Streamlines (PCA 2D) - {diffeq.upper()}", fontsize=14, y=0.995)
     fig.tight_layout()
-    
+
     base_name = filename_prefix or f"vector_field_streamplot_{diffeq}"
     wandb_entry = wandb_key or f"visualizations/{base_name}"
     if outdir is not None:
         _save_and_log_figure(fig, os.path.join(outdir, base_name), run, wandb_entry)
-    
+
     if close:
         plt.close(fig)
         return None
