@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import importlib
 import os
 from concurrent.futures import ThreadPoolExecutor
@@ -5,17 +7,16 @@ from functools import partial
 from typing import Optional
 
 import numpy as np
-import cvxpy as cp
+try:
+    import cvxpy as cp  # type: ignore
+except ModuleNotFoundError:  # optional dependency
+    cp = None
 from scipy.linalg import eigh
 from numpy.typing import NDArray
 from scipy.linalg import svd, logm, expm, qr, eig, expm
 from scipy.stats import gamma
 from .Stiefel_Aux import *
 from .Stiefel_Exp_Log import Stiefel_Exp, Stiefel_Log
-import jax.numpy as jnp
-import jax
-from jax import random
-from jax import jit
 
 
 
@@ -122,6 +123,8 @@ def calc_concen_param(rob: NDArray, Deltas):
     Deltas: array of tangent vectors (matrices) on TuSt(N,r) \in R^{Nxr}
 
     """
+    if cp is None:
+        raise ModuleNotFoundError("cvxpy is required for calc_concen_param; install cvxpy to use this function.")
     num_models = len(rob) - 1
     X = np.reshape(Deltas[:num_models, :, :], (num_models, -1))
     H = X @ X.T
@@ -170,6 +173,8 @@ def gen_tangent_samples(N_samples: int, beta: cp.Variable, X: NDArray, seed: int
     tangential_samples: array of tangent samples (matrices) on TuSt(N,r) \in R^{Nxr}
 
     """
+    if cp is None:
+        raise ModuleNotFoundError("cvxpy is required for gen_tangent_samples; install cvxpy to use this function.")
 
     np.random.seed(seed)
 

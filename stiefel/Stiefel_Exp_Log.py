@@ -43,10 +43,28 @@ try:
 except ImportError:  # pragma: no cover - fallback for old SciPy
     _expm_multiply = None
 from numpy import random
-import numba
+try:
+    import numba  # type: ignore
+except ModuleNotFoundError:  # optional dependency
+    class _NoNumba:
+        class config:  # noqa: D401 - mimic numba.config
+            NUMBA_NUM_THREADS = 2
+
+        @staticmethod
+        def set_num_threads(*args, **kwargs):  # noqa: ANN002,ANN003 - compatibility
+            return None
+
+        @staticmethod
+        def jit(*args, **kwargs):  # noqa: ANN002,ANN003 - compatibility
+            def decorator(fn):
+                return fn
+
+            return decorator
+
+    numba = _NoNumba()  # type: ignore
 
 # set numba threads to half of the available cores
-numba.set_num_threads(numba.config.NUMBA_NUM_THREADS//2)
+numba.set_num_threads(max(int(getattr(numba.config, "NUMBA_NUM_THREADS", 2)) // 2, 1))
 
 #prog_path = '/home/zimmermann/Documents/ScientificAndSVN/RZ_SDU/Papers_IMADA/Manifold_Ops/Manifold_Ops_Python/'
 #sys.path.append(prog_path + 'Stiefel_Aux/')
@@ -569,8 +587,8 @@ def Stiefel_Pf_invRet(U0, U1):
     # solve MX + XM = -2*eye(p)
     
     X = scipy.linalg.solve_sylvester(M, M.T, (-2)*np.eye(p,p))
-    print('check syl solve')
-    print(np.allclose(M.dot(X) + X.dot(M.T), (-2)*np.eye(p,p)))
+    # (Optional) sanity check:
+    # np.allclose(M.dot(X) + X.dot(M.T), (-2)*np.eye(p,p))
     
     Delta = U1.dot(X) - U0
         
@@ -605,7 +623,7 @@ def Stiefel_Pf_invRet(U0, U1):
 # \/
 #******************************************************************************
 
-do_tests = 1
+do_tests = 0
 if do_tests:
     
     # set dimensions
@@ -683,9 +701,6 @@ if do_tests:
         print('NORM TEST2:', scipy.linalg.norm(U1-EXP1, 1))
         print('NORM TEST3:', scipy.linalg.norm(U1-EXP3, 1))
 # End: if do_tests
-
-
-
 
 
 
