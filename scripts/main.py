@@ -68,6 +68,15 @@ def main():
                         help='Weight applied to the flow loss during training')
     parser.add_argument('--score_loss_weight', type=float, default=1.0,
                         help='Weight applied to the score loss (SB only)')
+    parser.add_argument('--flow_param', type=str, default='velocity',
+                        choices=['velocity', 'x_pred'],
+                        help='Velocity parameterization (direct velocity or mean-path x-pred).')
+    parser.add_argument('--xpred_ratio_clip', type=float, default=None,
+                        help='Optional symmetric clamp on |dot_sigma/sigma| used inside mean-path x-pred->velocity conversion.')
+    parser.add_argument('--xpred_dt', type=float, default=1e-3,
+                        help='Deprecated (ignored): mean-path x-pred uses autograd ∂_t x̂.')
+    parser.add_argument('--min_sigma_ratio', type=float, default=1e-4,
+                        help='Minimum |dot_sigma/sigma| clamp for x-pred flow loss')
     parser.add_argument('--zt', type=float, nargs='+')
     parser.add_argument('--hold_one_out', type=int, default=None)
     parser.add_argument('--rand_heldouts', action='store_true')
@@ -215,7 +224,9 @@ def main():
     else:
         raise ValueError(f'Somehow got invalid scaler_type {scaler_type}.')
     normdata = scaler.fit_transform(data)
-    norm_x0 = scaler.transform(testdata)[0]
+    norm_testdata = scaler.transform(testdata)
+    norm_x0 = norm_testdata[0]
+    norm_xT = norm_testdata[-1] if is_sb else None
 
     ### Set Up Agent
     if agent_type == 'mm':  # currently not implemented
@@ -270,7 +281,12 @@ def main():
             score_losses[i] = score_losses_i  # type: ignore
 
         ### Inference (Trajectory Generation)
-        ode_traj, sde_traj = agent.traj_gen(norm_x0)
+        ode_traj, _ = agent.traj_gen(norm_x0, generate_backward=False)
+
+        if is_sb:
+            _, sde_traj = agent.traj_gen(norm_xT, generate_backward=True)
+        else:
+            sde_traj = None
 
         ### Rescale Trajs to Original Domain
         ode_traj = scaler.inverse_transform(ode_traj)
