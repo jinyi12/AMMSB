@@ -4,7 +4,7 @@ import numpy as np
 from scipy.interpolate import PchipInterpolator, interp1d
 
 from diffmap.diffusion_maps import _orient_svd, evaluate_coordinate_splines, fit_coordinate_splines
-from stiefel.stiefel import batch_stiefel_log, Stiefel_Exp
+from stiefel.stiefel import batch_stiefel_log, Stiefel_Exp, stiefel_exp_batch
 from stiefel.barycenter import R_barycenter
 from stiefel.projection_retraction import st_inv_retr_orthographic, st_retr_orthographic
 
@@ -22,9 +22,30 @@ def build_dense_latent_trajectories(
     tc_embeddings_time: np.ndarray,
     n_dense: int = 200,
     frechet_mode: Literal['global', 'triplet'] = 'triplet',
-    compute_global_basepoint: bool = True,
+    compute_global_basepoint: bool = False,
+    metric_alpha: float = 0.0,
+    compute_global: bool = False,
+    compute_triplet: bool = False,
+    compute_naive: bool = True,
+    stiefel_workers: Optional[int] = None,
+    stiefel_chunk_size: int = 8,
 ) -> LatentInterpolationResult:
-    t_dense = np.linspace(times_train.min(), times_train.max(), n_dense)
+    # Auto-enable flags based on mode if not explicitly set
+    if frechet_mode == 'global':
+        compute_global = True
+    # elif frechet_mode == 'triplet':
+    #     compute_triplet = True
+    
+    # If explicit flags are passed, they override/augment the mode-based selection
+    # (e.g. if user passed compute_global=True, we respect it regardless of mode)
+
+    # Create dense time grid that INCLUDES marginal times exactly as knots.
+    # This ensures PCHIP and Stiefel interpolation satisfy knot constraints:
+    # at marginal times, interpolated values equal original values exactly.
+    # This is critical for consistency between pretraining (at marginals) and
+    # fine-tuning (on dense trajectory) in downstream autoencoder training.
+    t_dense_base = np.linspace(times_train.min(), times_train.max(), n_dense)
+    t_dense = np.sort(np.unique(np.concatenate([t_dense_base, times_train])))
     n_times, n_samples, latent_dim = tc_embeddings_time.shape
 
     A_concatenated = np.concatenate([tc_result.A_operators[i] for i in range(len(tc_result.A_operators))], axis=1)
@@ -44,7 +65,7 @@ def build_dense_latent_trajectories(
     U_train_global = align_frames_procrustes(U_train_list_raw, U_global)
     tc_embeddings_time_aligned = tc_embeddings_time
 
-    barycenter_kwargs = dict(stepsize=1.0, max_it=200, tol=1e-5, verbosity=False)
+    barycenter_kwargs = dict(stepsize=1.0, max_it=200, tol=1e-3, verbosity=False)
     U_frechet, U_bary_iters = R_barycenter(
         points=U_train_global,
         retr=st_retr_orthographic,
@@ -86,9 +107,15 @@ def build_dense_latent_trajectories(
 
     tc_embeddings_time_aligned = np.stack(tc_embeddings_time_aligned_list, axis=0)
 
-    deltas_fm = batch_stiefel_log(U_frechet, U_train_frechet, metric_alpha=1e-8, tau=1e-2)
+    deltas_fm = batch_stiefel_log(U_frechet, U_train_frechet, metric_alpha=metric_alpha, tau=1e-2)
 
-    def interpolate_deltas(deltas: np.ndarray, base_point: np.ndarray, method: str = 'pchip'):
+    def interpolate_deltas(
+        deltas: np.ndarray,
+        base_point: np.ndarray,
+        method: str = 'pchip',
+        workers: Optional[int] = stiefel_workers,
+        chunk_size: int = stiefel_chunk_size,
+    ):
         deltas_flat = deltas.reshape(deltas.shape[0], -1)
         if method == 'pchip':
             pchip = PchipInterpolator(times_train, deltas_flat, axis=0)
@@ -102,22 +129,29 @@ def build_dense_latent_trajectories(
         else:
             raise ValueError("method must be 'pchip' or 'linear'")
         deltas_dense = deltas_dense_flat.reshape(len(t_dense), *base_point.shape)
-        U_dense = [
-            Stiefel_Exp(U0=base_point, Delta=d, metric_alpha=1e-8)
-            for d in deltas_dense
-        ]
-        return deltas_dense, np.array(U_dense), pchip
+        U_dense = stiefel_exp_batch(
+            base_point,
+            deltas_dense,
+            metric_alpha=metric_alpha,
+            workers=workers,
+            chunk_size=chunk_size,
+        )
+        return deltas_dense, U_dense, pchip
 
     # Interpolate global deltas to get dense U_global trajectory
     phi_global_dense = None
     pchip_delta_global = None
     if compute_global_basepoint:
-        deltas_global = batch_stiefel_log(U_global, U_train_global, metric_alpha=1e-8, tau=1e-2)
+        deltas_global = batch_stiefel_log(U_global, U_train_global, metric_alpha=metric_alpha, tau=1e-2)
         deltas_global_dense, U_dense_global, pchip_delta_global = interpolate_deltas(
             deltas_global, U_global, method='pchip'
         )
 
-    def interpolate_deltas_triplet(method: str = 'pchip'):
+    def interpolate_deltas_triplet(
+        method: str = 'pchip',
+        workers: Optional[int] = stiefel_workers,
+        chunk_size: int = stiefel_chunk_size,
+    ):
         if n_times < 3:
             deltas_dense_fallback, U_dense_fallback, pchip_fallback = interpolate_deltas(
                 deltas_fm, U_frechet, method=method
@@ -140,7 +174,7 @@ def build_dense_latent_trajectories(
             # U_window is already aligned to the Global Fréchet Mean. 
             # Do not re-align to the local triplet mean, or we will risk rotate the basis.
             # U_window_aligned = align_frames_procrustes(U_window, U_triplet)
-            deltas_window = batch_stiefel_log(U_triplet, U_window, metric_alpha=1e-8, tau=1e-2)
+            deltas_window = batch_stiefel_log(U_triplet, U_window, metric_alpha=metric_alpha, tau=1e-2)
             deltas_flat = deltas_window.reshape(deltas_window.shape[0], -1)
             if method == 'pchip':
                 interpolator = PchipInterpolator(t_window, deltas_flat, axis=0)
@@ -165,35 +199,82 @@ def build_dense_latent_trajectories(
                 }
             )
 
-        def _select_window(t_star: float):
-            tol = 1e-12
-            for window in windows:
-                if (window['t_min'] - tol) <= t_star <= (window['t_max'] + tol):
-                    return window
-            return windows[-1]
+        tol = 1e-12
+        bounds = np.array([(w['t_min'], w['t_max']) for w in windows])
 
-        deltas_dense_list = []
-        U_dense_list = []
-        for t_star in t_dense:
-            window = _select_window(float(t_star))
+        def _select_window_index(t_star: float) -> int:
+            for idx, (t_min, t_max) in enumerate(bounds):
+                if (t_min - tol) <= t_star <= (t_max + tol):
+                    return idx
+            return len(windows) - 1
+
+        window_indices = np.array([
+            _select_window_index(float(t_star)) for t_star in t_dense
+        ], dtype=int)
+
+        deltas_dense = np.zeros((len(t_dense),) + U_frechet.shape, dtype=U_frechet.dtype)
+        U_dense = np.zeros_like(deltas_dense)
+
+        for idx, window in enumerate(windows):
+            mask = window_indices == idx
+            if not np.any(mask):
+                continue
             base_point = window['base_point']
             interpolator = window['interpolator']
-            delta_flat = interpolator(t_star)
-            delta = delta_flat.reshape(base_point.shape)
-            U_star = Stiefel_Exp(U0=base_point, Delta=delta, metric_alpha=1e-8)
-            deltas_dense_list.append(delta)
-            U_dense_list.append(U_star)
-        return np.array(deltas_dense_list), np.array(U_dense_list), windows
+            t_eval = t_dense[mask]
+            delta_flat = interpolator(t_eval)
+            delta_block = delta_flat.reshape(len(t_eval), *base_point.shape)
+            deltas_dense[mask] = delta_block
+            U_dense[mask] = stiefel_exp_batch(
+                base_point,
+                delta_block,
+                metric_alpha=metric_alpha,
+                workers=workers,
+                chunk_size=chunk_size,
+            )
+
+        return deltas_dense, U_dense, windows
 
     pchip_delta_fm = None
     frechet_windows = None
+    
+    # Placeholders for results
+    deltas_fm_dense_triplet = None
+    U_dense_fm_triplet = None
+    deltas_fm_dense_global = None
+    U_dense_fm_global = None
+    
+    # Compute requested interpolations
+    if compute_triplet:
+        deltas_fm_dense_triplet, U_dense_fm_triplet, frechet_windows = interpolate_deltas_triplet(method='pchip')
+        # We also compute linear for triplet if it's the main mode, but for now let's just stick to pchip for the dense trajectories
+        # The original code computed linear as well. Let's keep it if possible, but maybe just for the main mode?
+        # For simplicity, let's compute linear only if it's the main mode or if we want to be thorough.
+        # The return type only has one phi_linear_dense. Let's assume linear is coupled with the main mode.
+        
+    if compute_global:
+        deltas_fm_dense_global, U_dense_fm_global, pchip_delta_fm = interpolate_deltas(deltas_fm, U_frechet, method='pchip')
+
+
+    # Determine which one is the "main" one for backward compatibility
     if frechet_mode == 'triplet':
-        deltas_fm_dense, U_dense_fm, frechet_windows = interpolate_deltas_triplet(method='pchip')
-        deltas_fm_linear, U_dense_fm_linear, _ = interpolate_deltas_triplet(method='linear')
-        pchip_delta_fm = frechet_windows
+        if not compute_triplet:
+             # Should not happen due to auto-enable logic
+             raise ValueError("frechet_mode is triplet but compute_triplet is False")
+        U_dense_fm = U_dense_fm_triplet
+        # Compute linear for triplet
+        _, U_dense_fm_linear, _ = interpolate_deltas_triplet(method='linear')
     elif frechet_mode == 'global':
-        deltas_fm_dense, U_dense_fm, pchip_delta_fm = interpolate_deltas(deltas_fm, U_frechet, method='pchip')
-        deltas_fm_linear, U_dense_fm_linear, _ = interpolate_deltas(deltas_fm, U_frechet, method='linear')
+        if not compute_global:
+             # If compute_global was explicitly disabled but mode is global, we must enable it effectively or error.
+             # But here we rely on the flags.
+             if deltas_fm_dense_global is None: 
+                # Recalculate if it was skipped above
+                 deltas_fm_dense_global, U_dense_fm_global, pchip_delta_fm = interpolate_deltas(deltas_fm, U_frechet, method='pchip')
+
+        U_dense_fm = U_dense_fm_global
+        # Compute linear for global
+        _, U_dense_fm_linear, _ = interpolate_deltas(deltas_fm, U_frechet, method='linear')
     else:
         raise ValueError("frechet_mode must be 'global' or 'triplet'")
 
@@ -233,32 +314,46 @@ def build_dense_latent_trajectories(
     if compute_global_basepoint:
         phi_global_dense = reconstruct_embeddings(U_dense_global, sigmas_dense, pis_dense)
     
+    # Reconstruct specific versions
+    phi_frechet_triplet_dense = None
+    if U_dense_fm_triplet is not None:
+        phi_frechet_triplet_dense = reconstruct_embeddings(U_dense_fm_triplet, sigmas_dense, pis_dense)
+        
+    phi_frechet_global_dense = None
+    if U_dense_fm_global is not None:
+        phi_frechet_global_dense = reconstruct_embeddings(U_dense_fm_global, sigmas_dense, pis_dense)
+
+    # Main return value
     phi_frechet_dense = reconstruct_embeddings(U_dense_fm, sigmas_dense, pis_dense)
     phi_linear_dense = reconstruct_embeddings(U_dense_fm_linear, sigmas_linear, pis_linear)
 
-    sample_splines = []
-    for sample_idx in range(n_samples):
-        coords_sample = tc_embeddings_time_aligned[:, sample_idx, :]
-        splines = fit_coordinate_splines(
-            coords_sample,
-            times_train,
-            spline_type='pchip',
-            window_mode='triplet',
-        )
-        sample_splines.append(splines)
+    phi_naive_dense = None
+    if compute_naive:
+        sample_splines = []
+        for sample_idx in range(n_samples):
+            coords_sample = tc_embeddings_time_aligned[:, sample_idx, :]
+            splines = fit_coordinate_splines(
+                coords_sample,
+                times_train,
+                spline_type='pchip',
+                window_mode='triplet',
+            )
+            sample_splines.append(splines)
 
-    phi_naive_dense = np.stack([
-        np.vstack([
-            evaluate_coordinate_splines(splines, t).ravel()
-            for t in t_dense
-        ])
-        for splines in sample_splines
-    ], axis=1)
+        phi_naive_dense = np.stack([
+            np.vstack([
+                evaluate_coordinate_splines(splines, t).ravel()
+                for t in t_dense
+            ])
+            for splines in sample_splines
+        ], axis=1)
 
     return LatentInterpolationResult(
         t_dense=t_dense,
         phi_global_dense=phi_global_dense,
         phi_frechet_dense=phi_frechet_dense,
+        phi_frechet_global_dense=phi_frechet_global_dense,
+        phi_frechet_triplet_dense=phi_frechet_triplet_dense,
         phi_linear_dense=phi_linear_dense,
         phi_naive_dense=phi_naive_dense,
         pchip_delta_global=pchip_delta_global,
@@ -267,6 +362,7 @@ def build_dense_latent_trajectories(
         pchip_pi=pchip_pi,
         U_global=U_global,
         U_frechet=U_frechet,
+        frechet_rotations=frechet_rotations,
         frechet_mode=frechet_mode,
         frechet_windows=frechet_windows,
         tc_embeddings_aligned=tc_embeddings_time_aligned,
