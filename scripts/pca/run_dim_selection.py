@@ -71,7 +71,7 @@ def main():
     parser.add_argument(
         "--max_eigenvectors",
         type=int,
-        default=32,
+        default=128,
         help="Cap on the number of eigenvectors tested by LLR",
     )
     parser.add_argument(
