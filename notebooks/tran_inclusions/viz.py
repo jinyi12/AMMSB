@@ -135,13 +135,22 @@ def plot_latent_trajectories_comparison(
     interpolation_global: Optional[LatentInterpolationResult] = None,
 ):
     t_dense = interpolation_triplet.t_dense
-    phi_frechet_triplet = interpolation_triplet.phi_frechet_dense
+    
+    # Try to get specific triplet interpolation, fallback to generic if not available
+    phi_frechet_triplet = getattr(interpolation_triplet, 'phi_frechet_triplet_dense', None)
+    if phi_frechet_triplet is None:
+        phi_frechet_triplet = interpolation_triplet.phi_frechet_dense
+
     phi_linear_triplet = getattr(interpolation_triplet, 'phi_linear_dense', None)
     phi_naive = interpolation_triplet.phi_naive_dense
+    
     phi_frechet_global = None
     phi_linear_global = None
     if interpolation_global is not None:
-        phi_frechet_global = interpolation_global.phi_frechet_dense
+        # Try to get specific global interpolation, fallback to generic
+        phi_frechet_global = getattr(interpolation_global, 'phi_frechet_global_dense', None)
+        if phi_frechet_global is None:
+            phi_frechet_global = interpolation_global.phi_frechet_dense
         phi_linear_global = getattr(interpolation_global, 'phi_linear_dense', None)
     
     for sample_idx in sample_indices:
