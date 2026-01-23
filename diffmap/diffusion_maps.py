@@ -59,6 +59,7 @@ from scipy.interpolate import CubicSpline, PchipInterpolator, interp1d
 from scipy.spatial import cKDTree
 from scipy.spatial.distance import cdist, pdist, squareform
 from scipy.sparse.linalg import eigsh as scipy_eigsh
+from sklearn.cluster import KMeans
 from sklearn.decomposition import TruncatedSVD
 from sklearn.neighbors import KernelDensity
 import scipy
@@ -84,7 +85,7 @@ else:  # pragma: no cover - optional path when CuPy is installed.
 
 import jax
 import jax.numpy as jnp
-from jaxtyping import Array, Float
+# from jaxtyping import Array, Float
 
 from .distance import CuPyDistanceMixin, JAXDistanceMixin
 from .kernels import exponential_kernel
@@ -113,6 +114,7 @@ from .geometric_harmonics_archive import (
 
 
 DEFAULT_ALPHA: float = 1.0  # Renormalization exponent.
+DEFAULT_EPSILON_SCALING: float = 4.0  # Kernel denominator scaling.
 
 
 def _ensure_cupy() -> None:
@@ -570,10 +572,12 @@ def compute_semigroup_error(
     beta: float = -0.2,
     density_bandwidth: Optional[float] = None,
     norm: str = 'operator',
-    epsilon_scaling: float = 4.0,
+    epsilon_scaling: float = DEFAULT_EPSILON_SCALING,
 ) -> float:
     """
-    Return the semigroup error SGE(ε) = ||A_ε^2 - A_{2ε}|| for a snapshot.
+    Return the semigroup error SGE(ε) = ||P_ε^2 - P_{2ε}|| for a snapshot,
+    where P_ε is the α-normalised row-stochastic Markov operator built from
+    the Gaussian kernel on the snapshot.
     
     Optimized to use the Lanczos algorithm (eigsh) for operator norm computation.
     """
@@ -589,7 +593,7 @@ def compute_semigroup_error(
     if norm not in ('operator', 'fro'):
         raise ValueError("norm must be 'operator' or 'fro'.")
 
-    # 1. Construct Operator at t = epsilon
+    # 1. Construct Markov operator at t = epsilon
     P_eps, _, _ = _time_slice_markov(
         points_t,
         epsilon=epsilon,
@@ -599,9 +603,8 @@ def compute_semigroup_error(
         density_bandwidth=density_bandwidth,
         epsilon_scaling=epsilon_scaling,
     )
-    A_eps, _ = normalize_markov_operator(P_eps, symmetrize=True)
 
-    # 2. Construct Operator at t = 2 * epsilon
+    # 2. Construct Markov operator at t = 2 * epsilon
     P_2eps, _, _ = _time_slice_markov(
         points_t,
         epsilon=2.0 * epsilon,
@@ -611,44 +614,32 @@ def compute_semigroup_error(
         density_bandwidth=density_bandwidth,
         epsilon_scaling=epsilon_scaling,
     )
-    A_2eps, _ = normalize_markov_operator(P_2eps, symmetrize=True)
 
-    # 3. Compute Difference: (A_eps)^2 - A_2eps
-    # Note: A_eps is symmetric, but product A_eps @ A_eps might drift slightly 
-    # from symmetry due to float precision.
-    diff = A_eps @ A_eps - A_2eps
-    
-    # Enforce symmetry explicitly to ensure eigenvalues are real
-    diff = 0.5 * (diff + diff.T)
+    # 3. Compute Difference: P_eps^2 - P_2eps
+    diff = P_eps @ P_eps - P_2eps
 
     # 4. Compute Norm
     if norm == 'fro':
         return float(np.linalg.norm(diff, ord='fro'))
 
-    # Optimization for 'operator' norm (Spectral Norm)
-    # The operator norm of a symmetric matrix is the largest absolute eigenvalue.
-    
-    # Hybrid dispatch:
-    # For small N, dense solver (eigvalsh) is faster due to low overhead.
-    # For large N, iterative solver (eigsh) is significantly faster.
+    # Optimization for 'operator' norm (spectral norm):
+    # ||diff||_2 = sqrt(λ_max(diff^T diff)).
+    # Hybrid dispatch: dense SVD for small matrices, Lanczos on diff^T diff for large.
     THRESH_SIZE = 50 
     
     if n_samples < THRESH_SIZE:
-        # Use dense solver for small matrices
-        evals = np.linalg.eigvalsh(diff)
-        return float(np.max(np.abs(evals)))
+        return float(np.linalg.norm(diff, ord=2))
     else:
-        # Use Lanczos algorithm for large matrices
-        # k=1: find only 1 eigenvalue
-        # which='LM': find the Largest Magnitude
+        gram = diff.T @ diff
+        gram = 0.5 * (gram + gram.T)  # enforce symmetry for numerical stability
         evals = scipy.sparse.linalg.eigsh(
-            diff, 
-            k=1, 
-            which='LM', 
+            gram,
+            k=1,
+            which='LM',
             return_eigenvectors=False,
-            tol=1e-6
+            tol=1e-6,
         )
-        return float(np.abs(evals[0]))
+        return float(np.sqrt(max(evals[0], 0.0)))
 
 
 def select_optimal_bandwidth(
@@ -660,7 +651,7 @@ def select_optimal_bandwidth(
     beta: float = -0.2,
     density_bandwidth: Optional[float] = None,
     norm: str = 'operator',
-    epsilon_scaling: float = 4.0,
+    epsilon_scaling: float = DEFAULT_EPSILON_SCALING,
     selection: Literal['global_min', 'first_local_minimum'] = 'global_min',
     return_all: bool = False,
 ) -> Union[tuple[float, float], tuple[float, float, np.ndarray, np.ndarray]]:
@@ -1003,22 +994,44 @@ class ConvexHullInterpolator:
 
     macro_states: np.ndarray
     micro_states: np.ndarray
-    macro_tree: cKDTree
-    micro_tree: cKDTree
+    macro_tree: cKDTree | list[cKDTree]
+    micro_tree: cKDTree | list[cKDTree]
+    is_time_coupled: bool = False
 
     def __init__(self, macro_states: np.ndarray, micro_states: np.ndarray) -> None:
         macro_states = np.asarray(macro_states, dtype=np.float64)
         micro_states = np.asarray(micro_states, dtype=np.float64)
-        if macro_states.ndim != 2:
-            raise ValueError('macro_states must be a 2D array.')
-        if micro_states.ndim != 2:
-            raise ValueError('micro_states must be a 2D array.')
-        if macro_states.shape[0] != micro_states.shape[0]:
-            raise ValueError('macro_states and micro_states must share samples.')
-        self.macro_states = macro_states
-        self.micro_states = micro_states
-        self.macro_tree = cKDTree(macro_states)
-        self.micro_tree = cKDTree(micro_states)
+        
+        # Check for time-coupled input (T, N, D)
+        if macro_states.ndim == 3 and micro_states.ndim == 3:
+            if macro_states.shape[0] != micro_states.shape[0]:
+                raise ValueError('macro_states and micro_states must share time dimension.')
+            if macro_states.shape[1] != micro_states.shape[1]:
+                raise ValueError('macro_states and micro_states must share sample dimension.')
+            
+            self.is_time_coupled = True
+            self.time_len = macro_states.shape[0]
+            
+            # Flatten for storage but keep structure accessible
+            # Actually, keeping as 3D is better for indexing
+            self.macro_states = macro_states
+            self.micro_states = micro_states
+            
+            # Build trees for each time slice
+            self.macro_tree = [cKDTree(m) for m in macro_states]
+            self.micro_tree = [cKDTree(m) for m in micro_states]
+            
+        elif macro_states.ndim == 2 and micro_states.ndim == 2:
+            if macro_states.shape[0] != micro_states.shape[0]:
+                raise ValueError('macro_states and micro_states must share samples.')
+            
+            self.is_time_coupled = False
+            self.macro_states = macro_states
+            self.micro_states = micro_states
+            self.macro_tree = cKDTree(macro_states)
+            self.micro_tree = cKDTree(micro_states)
+        else:
+            raise ValueError('macro_states and micro_states must be both 2D or both 3D.')
 
     def lift(
         self,
@@ -1026,20 +1039,47 @@ class ConvexHullInterpolator:
         *,
         k: int = 64,
         max_iter: int = 200,
+        time_idx: int | None = None,
     ) -> tuple[np.ndarray, dict[str, Any]]:
         """Lift a macrostate into coefficient space via convex combination."""
         phi_target = np.asarray(phi_target, dtype=np.float64)
-        if phi_target.ndim != 1 or phi_target.shape[0] != self.macro_states.shape[1]:
+        
+        # Handle time-local query if applicable
+        if self.is_time_coupled and time_idx is not None:
+            if time_idx < 0 or time_idx >= self.time_len:
+                raise ValueError(f'time_idx {time_idx} out of bounds.')
+            
+            tree = self.macro_tree[time_idx]
+            ref_macros = self.macro_states[time_idx]
+            ref_micros = self.micro_states[time_idx]
+        else:
+            # Fallback to flattened or 2D behavior
+            if self.is_time_coupled:
+                 # If time_idx not provided but data is time-coupled, 
+                 # we strictly can't easily query "all" without flattening.
+                 # For now, let's assume if user doesn't provide time_idx for 3D data, 
+                 # they made a mistake or we should support it by flattening on demand?
+                 # Let's flatten on demand for compatibility but warn?
+                 # Actually, let's just error to enforce correctness as requested.
+                 if time_idx is None:
+                     raise ValueError("Must provide time_idx for time-coupled lifter.")
+            
+            tree = self.macro_tree
+            ref_macros = self.macro_states
+            ref_micros = self.micro_states
+
+        if phi_target.ndim != 1 or phi_target.shape[0] != ref_macros.shape[-1]:
             raise ValueError('phi_target must be 1D with compatible dimension.')
-        distances, indices = self.macro_tree.query(phi_target, k=min(k, self.macro_states.shape[0]))
+            
+        distances, indices = tree.query(phi_target, k=min(k, ref_macros.shape[0]))
         indices = np.atleast_1d(indices)
-        neighbor_macros = self.macro_states[indices]
+        neighbor_macros = ref_macros[indices]
         weights = _simplex_least_squares(
             neighbor_macros,
             phi_target,
             max_iter=max_iter,
         )
-        lifted = weights @ self.micro_states[indices]
+        lifted = weights @ ref_micros[indices]
         metadata = {
             'indices': indices,
             'weights': weights,
@@ -1054,27 +1094,95 @@ class ConvexHullInterpolator:
         k: int = 64,
         max_iter: int = 200,
         batch_size: int = 1024,
+        time_indices: np.ndarray | None = None,
     ) -> np.ndarray:
-        """Lift many macrostates in batches."""
+        """Lift many macrostates in batches, optionally time-constrained."""
         phi_targets = np.asarray(phi_targets, dtype=np.float64)
+        
+        if self.is_time_coupled:
+            # If 3D input (T, N, D), assume it maps 1-to-1 with time steps if time_indices not given?
+            # Or if phi_targets is (T, N, D), we interpret dim 0 as time.
+            if phi_targets.ndim == 3:
+                # (T, N, D) case
+                T, N, D = phi_targets.shape
+                if T != self.time_len:
+                     raise ValueError('Batch size (time dim) mismatch.')
+                
+                # Reshape for output
+                lifted = np.zeros((T, N, self.micro_states.shape[-1]), dtype=np.float64)
+                
+                # Iterate over time slices
+                for t in range(T):
+                    # Lift this slice using specific time tree
+                    # Recursively call batch_lift for 2D slice with time_index fixed? 
+                    # No, implemented inline for efficiency
+                    chunk = phi_targets[t]
+                    t_lifted = self._batch_lift_2d(chunk, k, max_iter, batch_size, time_idx=t)
+                    lifted[t] = t_lifted
+                return lifted
+            
+            elif phi_targets.ndim == 2:
+                 # (N_total, D) case - must provide time_indices
+                 if time_indices is None:
+                     raise ValueError("Must provide time_indices corresponding to phi_targets for time-coupled lifter.")
+                 
+                 time_indices = np.asarray(time_indices)
+                 if time_indices.shape[0] != phi_targets.shape[0]:
+                     raise ValueError("time_indices length mismatch.")
+                 
+                 # Group by time index for efficiency
+                 lifted = np.zeros((phi_targets.shape[0], self.micro_states.shape[-1]), dtype=np.float64)
+                 
+                 unique_times = np.unique(time_indices)
+                 for t in unique_times:
+                     mask = (time_indices == t)
+                     chunk = phi_targets[mask]
+                     t_lifted = self._batch_lift_2d(chunk, k, max_iter, batch_size, time_idx=t)
+                     lifted[mask] = t_lifted
+                 return lifted
+                 
+        # Legacy 2D behavior
         if phi_targets.ndim != 2 or phi_targets.shape[1] != self.macro_states.shape[1]:
             raise ValueError('phi_targets must be (num_points, macro_dim).')
+            
+        return self._batch_lift_2d(phi_targets, k, max_iter, batch_size, time_idx=None)
+
+    def _batch_lift_2d(
+        self, 
+        phi_targets: np.ndarray, 
+        k: int, 
+        max_iter: int, 
+        batch_size: int,
+        time_idx: int | None = None
+    ) -> np.ndarray:
+        """Internal helper for 2D batch lifting."""
+        
+        if self.is_time_coupled and time_idx is not None:
+            tree = self.macro_tree[time_idx]
+            ref_macros = self.macro_states[time_idx]
+            ref_micros = self.micro_states[time_idx]
+        else:
+            tree = self.macro_tree
+            ref_macros = self.macro_states
+            ref_micros = self.micro_states
+            
         num_points = phi_targets.shape[0]
-        lifted = np.zeros((num_points, self.micro_states.shape[1]), dtype=np.float64)
+        lifted = np.zeros((num_points, ref_micros.shape[-1]), dtype=np.float64)
+        
         for start in range(0, num_points, batch_size):
             stop = min(start + batch_size, num_points)
             chunk = phi_targets[start:stop]
-            distances, indices = self.macro_tree.query(
-                chunk, k=min(k, self.macro_states.shape[0])
+            distances, indices = tree.query(
+                chunk, k=min(k, ref_macros.shape[0])
             )
             for row in range(chunk.shape[0]):
                 idx = np.atleast_1d(indices[row])
                 weights = _simplex_least_squares(
-                    self.macro_states[idx],
+                    ref_macros[idx],
                     chunk[row],
                     max_iter=max_iter,
                 )
-                lifted[start + row] = weights @ self.micro_states[idx]
+                lifted[start + row] = weights @ ref_micros[idx]
         return lifted
 
     def restrict(
@@ -1460,15 +1568,31 @@ def _estimate_kde_density(
 
 
 def _row_normalize_kernel(kernel: np.ndarray, alpha: float) -> np.ndarray:
-    """Apply α-normalisation followed by row-stochastic normalisation."""
+    """Apply α-normalisation followed by row-stochastic normalisation.
+    
+    Added safeguards to prevent numerical overflow when degrees are very small.
+    """
     if alpha < 0 or alpha > 1:
         raise ValueError('alpha must lie in [0, 1].')
     degrees = kernel.sum(axis=1)
+    
+    # Check for extremely small or zero degrees that would cause overflow
+    min_degree = degrees.min()
+    if min_degree <= 1e-10:
+        raise ValueError(
+            f'Kernel produced near-zero-degree nodes (min={min_degree:.2e}); '
+            f'bandwidth may be too small. Increase epsilon or adjust candidate range.'
+        )
+    
     if np.any(degrees <= 0):
         raise ValueError('Kernel produced zero-degree nodes; adjust bandwidths.')
+    
     if alpha > 0:
-        weights = np.power(degrees, -alpha)
+        # Clip degrees to avoid overflow in power operation
+        degrees_clipped = np.maximum(degrees, 1e-12)
+        weights = np.power(degrees_clipped, -alpha)
         kernel = (weights[:, None] * kernel) * weights[None, :]
+    
     row_sums = kernel.sum(axis=1, keepdims=True)
     if np.any(row_sums <= 0):
         raise ValueError('Row normalisation failed; kernel has empty rows.')
@@ -1483,7 +1607,7 @@ def _time_slice_markov(
     variable_bandwidth: bool = False,
     beta: float = -0.2,
     density_bandwidth: Optional[float] = None,
-    epsilon_scaling: float = 4.0,
+    epsilon_scaling: float = DEFAULT_EPSILON_SCALING,
 ) -> tuple[np.ndarray, float, Optional[float]]:
     """Return a single time-slice diffusion operator using Coifman–Lafon α-normalisation.
 
@@ -1591,41 +1715,322 @@ def build_markov_operators(
     return P_list, A_list, pi_list, eps_used, density_used
 
 
+def _select_llr_kernel_scale_semigroup(
+    predictors: np.ndarray,
+    *,
+    scales: Optional[Sequence[float]],
+    alpha: float,
+    selection: Literal['global_min', 'first_local_minimum'],
+    sample_size: Optional[int],
+    rng_seed: Optional[int],
+    epsilon_scaling: float,
+    norm: Literal['operator', 'fro'],
+) -> float:
+    """Select the LLR kernel denominator via the semigroup error criterion.
+
+    This follows the Dsilva et al. (2018) approach for selecting a bandwidth
+    that is appropriate for the local linear regression in eigenspace. The
+    semigroup test identifies ε such that the Markov operator built from
+    K(x,y) = exp(-||x-y||² / (epsilon_scaling * ε)) satisfies P_ε² ≈ P_{2ε}.
+
+    The returned value is the full kernel denominator (epsilon_scaling * ε_opt),
+    to be used directly in: weights = exp(-||Δ||² / kernel_scale).
+
+    If all candidate epsilons yield invalid kernels (e.g., zero-degree rows),
+    fall back to the base median bandwidth with scale 1.0.
+    """
+    predictors = np.asarray(predictors, dtype=np.float64)
+    n = predictors.shape[0]
+    if n < 2:
+        return 1.0
+    if alpha < 0.0 or alpha > 1.0:
+        raise ValueError('alpha must lie in [0, 1].')
+    if selection not in ('global_min', 'first_local_minimum'):
+        raise ValueError("selection must be 'global_min' or 'first_local_minimum'.")
+    if norm not in ('operator', 'fro'):
+        raise ValueError("norm must be 'operator' or 'fro'.")
+    if epsilon_scaling <= 0:
+        raise ValueError('epsilon_scaling must be positive.')
+
+    if scales is None:
+        scales_arr = np.geomspace(0.01, 0.2, num=32)
+    else:
+        scales_arr = np.asarray(scales, dtype=np.float64).ravel()
+    if scales_arr.size == 0 or np.any(scales_arr <= 0):
+        raise ValueError('scales must contain positive values.')
+
+    pairwise = pdist(predictors, metric='sqeuclidean')
+    positive = pairwise[pairwise > 0]
+    base_eps = float(np.median(positive)) if positive.size else 1.0
+    if base_eps <= 0:
+        base_eps = 1.0
+    candidates = base_eps * scales_arr
+    candidates = candidates[candidates > 0]
+    if candidates.size == 0:
+        return 1.0
+
+    sample = predictors
+    if sample_size is not None:
+        sample_size = int(sample_size)
+        if sample_size < 2:
+            raise ValueError('sample_size must be at least two when provided.')
+        if n > sample_size:
+            rng = np.random.default_rng(rng_seed)
+            subset = rng.choice(n, size=sample_size, replace=False)
+            sample = predictors[subset]
+
+    eps_candidates: list[float] = []
+    sge_candidates: list[float] = []
+    for eps in candidates:
+        try:
+            sge = compute_semigroup_error(
+                sample,
+                float(eps),
+                alpha=alpha,
+                norm=norm,
+                epsilon_scaling=epsilon_scaling,
+            )
+        except ValueError as exc:
+            msg = str(exc).lower()
+            if 'zero-degree' in msg or 'empty rows' in msg:
+                continue
+            raise
+        if not np.isfinite(sge):
+            continue
+        eps_candidates.append(float(eps))
+        sge_candidates.append(float(sge))
+
+    if not eps_candidates:
+        return float(epsilon_scaling * base_eps)
+
+    eps_array = np.asarray(eps_candidates, dtype=np.float64)
+    sge_array = np.asarray(sge_candidates, dtype=np.float64)
+    if selection == 'first_local_minimum':
+        local_idx = _first_local_minimum_index(sge_array)
+        if local_idx is not None:
+            return float(epsilon_scaling * eps_array[local_idx])
+    best_idx = int(np.argmin(sge_array))
+    return float(epsilon_scaling * eps_array[best_idx])
+
+
+def _compute_llr_kernel_scales_semigroup(
+    eigenvectors: np.ndarray,
+    *,
+    max_k: int,
+    scales: Sequence[float],
+    alpha: float,
+    selection: Literal['global_min', 'first_local_minimum'],
+    sample_size: Optional[int],
+    rng_seed: Optional[int],
+    epsilon_scaling: float,
+    norm: Literal['operator', 'fro'],
+    max_searches: Optional[int],
+    interpolation: Literal['log_linear', 'log_pchip'],
+) -> np.ndarray:
+    """Compute semigroup-selected kernel scales for k=1..max_k with optional interpolation."""
+    if max_k < 1:
+        return np.empty(0, dtype=np.float64)
+
+    if max_searches is None:
+        search_count = max_k
+    else:
+        search_count = int(max_searches)
+        if search_count < 1:
+            raise ValueError('llr_semigroup_max_searches must be positive when provided.')
+        search_count = min(search_count, max_k)
+
+    dims = np.arange(1, max_k + 1)
+    if search_count == max_k:
+        scales_out = np.empty(max_k, dtype=np.float64)
+        for idx, k in enumerate(dims):
+            scales_out[idx] = _select_llr_kernel_scale_semigroup(
+                eigenvectors[:, :k],
+                scales=scales,
+                alpha=alpha,
+                selection=selection,
+                sample_size=sample_size,
+                rng_seed=rng_seed,
+                epsilon_scaling=epsilon_scaling,
+                norm=norm,
+            )
+        return scales_out
+
+    if search_count == 1:
+        anchor_dims = np.array([max_k], dtype=int)
+    else:
+        anchor_dims = np.unique(np.linspace(1, max_k, num=search_count, dtype=int))
+        if anchor_dims.size < 2:
+            anchor_dims = np.array([1, max_k], dtype=int)
+
+    anchor_scales = np.empty(anchor_dims.size, dtype=np.float64)
+    for idx, k in enumerate(anchor_dims):
+        anchor_scales[idx] = _select_llr_kernel_scale_semigroup(
+            eigenvectors[:, :k],
+            scales=scales,
+            alpha=alpha,
+            selection=selection,
+            sample_size=sample_size,
+            rng_seed=rng_seed,
+            epsilon_scaling=epsilon_scaling,
+            norm=norm,
+        )
+
+    if anchor_dims.size == 1:
+        return np.full(max_k, anchor_scales[0], dtype=np.float64)
+
+    log_anchor_dims = np.log(anchor_dims.astype(np.float64))
+    log_anchor_scales = np.log(anchor_scales)
+    log_dims = np.log(dims.astype(np.float64))
+
+    if interpolation == 'log_pchip' and anchor_dims.size >= 3:
+        interpolator = PchipInterpolator(
+            log_anchor_dims,
+            log_anchor_scales,
+            extrapolate=True,
+        )
+        log_scales = interpolator(log_dims)
+    else:
+        interpolator = interp1d(
+            log_anchor_dims,
+            log_anchor_scales,
+            kind='linear',
+            fill_value='extrapolate',
+            assume_sorted=True,
+        )
+        log_scales = interpolator(log_dims)
+
+    return np.exp(log_scales).astype(np.float64)
+
+
 def _local_linear_regression_residual(
     predictors: np.ndarray,
     target: np.ndarray,
     *,
     bandwidth: Optional[float],
+    kernel_scale: Optional[float] = None,
     ridge: float,
+    neighbors: Optional[int] = None,
 ) -> float:
-    """Return the LLR leave-one-out error for ``target ~ predictors``."""
+    """Return the LLR leave-one-out error for ``target ~ predictors``.
+
+    Implements the local linear regression diagnostic from Dsilva et al. (2018)
+    for identifying non-harmonic (unique) diffusion eigenvectors.
+
+    The residual is computed as r = ||φ - φ̂|| / ||φ|| where φ̂ is the local
+    linear prediction of the target eigenvector from the preceding eigenvectors.
+    
+    Note: This ratio can exceed 1.0 when predictions are poor (e.g., when the
+    local regression predicts values anti-correlated with the target). This
+    occurs when the regression's R² < 0, meaning the model performs worse than
+    predicting zero. Values > 1 still correctly indicate "unique" directions.
+
+    Parameters
+    ----------
+    predictors : np.ndarray
+        The predictor eigenvectors φ_1, ..., φ_{k-1} of shape (n_samples, k-1).
+    target : np.ndarray  
+        The target eigenvector φ_k to predict, of shape (n_samples,).
+    bandwidth : float, optional
+        Kernel width h for Gaussian weights exp(-||Δ||² / h²).
+    kernel_scale : float, optional
+        Full kernel denominator for exp(-||Δ||² / scale). Takes precedence
+        over bandwidth. When using semigroup selection, this should be the
+        value returned by _select_llr_kernel_scale_semigroup (i.e., 4ε).
+    ridge : float
+        Ridge regularization for the weighted least squares solve.
+    neighbors : int, optional
+        Number of nearest neighbors to use. If None, uses all points.
+
+    Returns
+    -------
+    float
+        Normalized leave-one-out residual. Values near 0 indicate the target
+        is well-predicted by the predictors (harmonic). High values (including
+        values > 1.0 when predictions are anti-correlated with the target)
+        indicate the target represents a unique/independent direction.
+        
+        Note: Unlike the original Dsilva et al. (2018) formulation which uses
+        the squared ratio (variance fraction), this implementation returns the
+        norm ratio. Both can exceed 1.0 when R² < 0, i.e., when the local
+        linear prediction is worse than predicting zero.
+    """
     predictors = np.asarray(predictors, dtype=np.float64)
     target = np.asarray(target, dtype=np.float64).ravel()
     n, d = predictors.shape
     if n < 3 or d == 0:
         return 1.0
 
-    if bandwidth is None:
-        pairwise = squareform(pdist(predictors, metric='euclidean'))
-        median = np.median(pairwise[pairwise > 0])
-        bandwidth = median / 3.0 if median > 0 else 1.0
-    bandwidth = float(max(bandwidth, 1e-12))
+    if neighbors is not None:
+        neighbors = int(neighbors)
+        if neighbors < 1:
+            raise ValueError('neighbors must be positive when provided.')
+        neighbors = min(neighbors, n - 1)
+    use_knn = neighbors is not None and neighbors < (n - 1)
+
+    tree = None
+    knn_dists = None
+    knn_idx = None
+    if use_knn:
+        tree = cKDTree(predictors)
+        k = min(neighbors + 1, n)
+        knn_dists, knn_idx = tree.query(predictors, k=k)
+        if k == 1:  # pragma: no cover - defensive guard for very small n.
+            knn_dists = knn_dists[:, None]
+            knn_idx = knn_idx[:, None]
+
+    if kernel_scale is not None:
+        kernel_scale = float(kernel_scale)
+        if kernel_scale <= 0:
+            raise ValueError('kernel_scale must be positive when provided.')
+    else:
+        if bandwidth is None:
+            if use_knn:
+                neighbor_dists = knn_dists[:, 1:].ravel()
+                positive = neighbor_dists[neighbor_dists > 0]
+                median = np.median(positive) if positive.size else 0.0
+            else:
+                pairwise = pdist(predictors, metric='euclidean')
+                positive = pairwise[pairwise > 0]
+                median = np.median(positive) if positive.size else 0.0
+            bandwidth = median / 3.0 if median > 0 else 1.0
+        bandwidth = float(max(bandwidth, 1e-12))
+        kernel_scale = bandwidth**2
     ridge = float(max(ridge, 0.0))
 
     design = np.hstack([np.ones((n, 1)), predictors])
     predictions = np.zeros(n, dtype=np.float64)
 
     for i in range(n):
-        diff = predictors - predictors[i]
-        sq_dist = np.sum(diff * diff, axis=1)
-        weights = np.exp(-sq_dist / (bandwidth**2))
-        weights[i] = 0.0
-        if np.sum(weights) <= 1e-12:
-            predictions[i] = 0.0
-            continue
-        sqrt_w = np.sqrt(weights)[:, None]
-        Aw = design * sqrt_w
-        yw = target[:, None] * sqrt_w
+        if use_knn:
+            neigh_idx = knn_idx[i]
+            neigh_dists = knn_dists[i]
+            if neigh_idx.ndim == 0:
+                neigh_idx = np.array([neigh_idx])
+                neigh_dists = np.array([neigh_dists])
+            mask = neigh_idx != i
+            neigh_idx = neigh_idx[mask]
+            neigh_dists = neigh_dists[mask]
+            if neigh_idx.size == 0:
+                predictions[i] = 0.0
+                continue
+            weights = np.exp(-(neigh_dists**2) / kernel_scale)
+            if np.sum(weights) <= 1e-12:
+                predictions[i] = 0.0
+                continue
+            sqrt_w = np.sqrt(weights)[:, None]
+            Aw = design[neigh_idx] * sqrt_w
+            yw = target[neigh_idx, None] * sqrt_w
+        else:
+            diff = predictors - predictors[i]
+            sq_dist = np.sum(diff * diff, axis=1)
+            weights = np.exp(-sq_dist / kernel_scale)
+            weights[i] = 0.0
+            if np.sum(weights) <= 1e-12:
+                predictions[i] = 0.0
+                continue
+            sqrt_w = np.sqrt(weights)[:, None]
+            Aw = design * sqrt_w
+            yw = target[:, None] * sqrt_w
         gram = Aw.T @ Aw
         gram.flat[:: gram.shape[0] + 1] += ridge
         rhs = Aw.T @ yw
@@ -1646,43 +2051,252 @@ def select_non_harmonic_coordinates(
     eigenvalues: np.ndarray,
     diffusion_coords: np.ndarray,
     *,
-    residual_threshold: float = 1e-1,
+    residual_threshold: Optional[float] = 1e-1,
     min_coordinates: int = 2,
     llr_bandwidth: Optional[float] = None,
+    llr_kernel_scale: Optional[float] = None,
     llr_ridge: float = 1e-8,
+    llr_bandwidth_strategy: Literal['median', 'semigroup'] = 'semigroup',
+    llr_semigroup_scales: Optional[Sequence[float]] = None,
+    llr_semigroup_selection: Literal['global_min', 'first_local_minimum'] = 'first_local_minimum',
+    llr_semigroup_alpha: float = DEFAULT_ALPHA,
+    llr_semigroup_sample_size: Optional[int] = 1024,
+    llr_semigroup_rng_seed: Optional[int] = 0,
+    llr_semigroup_epsilon_scaling: float = DEFAULT_EPSILON_SCALING,
+    llr_semigroup_norm: Literal['operator', 'fro'] = 'operator',
+    llr_semigroup_max_searches: Optional[int] = None,
+    llr_semigroup_interpolation: Literal['log_linear', 'log_pchip'] = 'log_pchip',
+    selection: Literal['auto', 'kmeans', 'gap', 'threshold'] = 'auto',
+    max_eigenvectors: Optional[int] = None,
+    llr_neighbors: Optional[int] = None,
+    coords_are_eigenvectors: bool = False,
+    kmeans_random_state: Optional[int] = 0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Identify intrinsic coordinates using the Dsilva et al. LLR diagnostic.
 
     Each diffusion eigenvector φ_k is regressed locally onto the preceding
     eigenvectors (φ_1, …, φ_{k-1}) using kernel-weighted least squares. The
-    normalized leave-one-out error r_k serves as the test statistic: components
-    with r_k above ``residual_threshold`` are deemed unique eigendirections.
+    normalized leave-one-out error r_k serves as the test statistic for
+    determining whether φ_k represents a new eigendirection. Residuals are split
+    into unique vs harmonic directions using ``selection``; if
+    ``max_eigenvectors`` is set, residuals beyond that index are left as NaN.
+
+    Two Kernel Scales (per Dsilva et al. 2018)
+    ------------------------------------------
+    The method involves two distinct kernel bandwidths:
+
+    1. **Diffusion map kernel (ε₁)**: Used in ambient space to build the Markov
+       operator and compute eigenvectors. This is selected externally before
+       calling this function.
+
+    2. **LLR regression kernel (ε₂)**: Used in eigenspace to weight the local
+       linear regression. This is controlled by the parameters below.
+
+    By default (``llr_bandwidth_strategy='semigroup'``), ε₂ is selected
+    independently via the semigroup error criterion applied to the eigenspace.
+    This is appropriate when the eigenspace geometry differs from the ambient
+    space.
+    To amortize the cost while retaining the semigroup criterion, set
+    ``llr_semigroup_max_searches`` to evaluate a subset of k values and
+    interpolate the remaining kernel scales in log-space.
+
+    To use the *same* scale as the diffusion map (ε₂ = ε₁), pass
+    ``llr_kernel_scale = epsilon_scaling * epsilon`` where epsilon is the
+    diffusion map bandwidth. This ties the two scales together.
+
+    Parameters
+    ----------
+    eigenvalues : np.ndarray
+        Eigenvalues of the diffusion operator.
+    diffusion_coords : np.ndarray
+        Diffusion coordinates (eigenvectors scaled by eigenvalues).
+    llr_kernel_scale : float, optional
+        Full kernel denominator for the LLR Gaussian weights:
+        exp(-||Δφ||² / llr_kernel_scale). Overrides automatic selection.
+        To match the diffusion map, use ``4 * epsilon_diffusion``.
+    llr_bandwidth_strategy : {'median', 'semigroup'}
+        How to select ε₂ when llr_kernel_scale is not provided.
+        'semigroup' (default) uses the semigroup error on the eigenspace.
+    llr_semigroup_max_searches : int, optional
+        Cap the number of semigroup searches across k. When set and smaller than
+        the number of evaluated eigendimensions, scales are computed at evenly
+        spaced anchor k values and interpolated in log-space.
+    llr_semigroup_interpolation : {'log_linear', 'log_pchip'}
+        Interpolation method used when llr_semigroup_max_searches reduces searches.
     """
     eigenvalues = np.asarray(eigenvalues)
     coords = np.asarray(diffusion_coords)
     if coords.ndim != 2:
         raise ValueError('diffusion_coords must be a 2D array.')
+    if coords.shape[1] == 0:
+        raise ValueError('diffusion_coords must have at least one column.')
     if eigenvalues.ndim != 1 or eigenvalues.shape[0] != coords.shape[1]:
         raise ValueError('eigenvalues must align with diffusion coordinate columns.')
-    if residual_threshold <= 0 or residual_threshold >= 1.0:
-        raise ValueError('residual_threshold must lie in (0, 1).')
     if min_coordinates < 1:
         raise ValueError('min_coordinates must be positive.')
+    if residual_threshold is not None and residual_threshold <= 0:
+        raise ValueError('residual_threshold must be positive.')
+    if llr_bandwidth is not None and llr_bandwidth <= 0:
+        raise ValueError('llr_bandwidth must be positive when provided.')
+    if llr_kernel_scale is not None and llr_kernel_scale <= 0:
+        raise ValueError('llr_kernel_scale must be positive when provided.')
+    if llr_kernel_scale is not None and llr_bandwidth is not None:
+        raise ValueError('Provide only one of llr_bandwidth or llr_kernel_scale.')
+    if max_eigenvectors is not None:
+        max_eigenvectors = int(max_eigenvectors)
+        if max_eigenvectors < 1:
+            raise ValueError('max_eigenvectors must be positive when provided.')
 
-    safe_vals = np.where(np.abs(eigenvalues) < 1e-12, 1e-12, eigenvalues)
-    eigenvectors = coords / safe_vals[np.newaxis, :]
+    selection_mode = selection.lower()
+    if selection_mode not in {'auto', 'kmeans', 'gap', 'threshold'}:
+        raise ValueError("selection must be 'auto', 'kmeans', 'gap', or 'threshold'.")
+    if selection_mode == 'threshold' and residual_threshold is None:
+        raise ValueError('residual_threshold is required for selection="threshold".')
 
-    residuals = np.ones(eigenvectors.shape[1], dtype=np.float64)
-    for k in range(1, eigenvectors.shape[1]):
+    llr_bandwidth_mode = llr_bandwidth_strategy.lower()
+    if llr_bandwidth_mode not in {'median', 'semigroup'}:
+        raise ValueError("llr_bandwidth_strategy must be 'median' or 'semigroup'.")
+
+    use_semigroup_bandwidth = (
+        llr_kernel_scale is None and llr_bandwidth is None and llr_bandwidth_mode == 'semigroup'
+    )
+    if use_semigroup_bandwidth:
+        if llr_semigroup_alpha < 0.0 or llr_semigroup_alpha > 1.0:
+            raise ValueError('llr_semigroup_alpha must lie in [0, 1].')
+        if llr_semigroup_selection not in ('global_min', 'first_local_minimum'):
+            raise ValueError(
+                "llr_semigroup_selection must be 'global_min' or 'first_local_minimum'."
+            )
+        if llr_semigroup_norm not in ('operator', 'fro'):
+            raise ValueError("llr_semigroup_norm must be 'operator' or 'fro'.")
+        if llr_semigroup_epsilon_scaling <= 0:
+            raise ValueError('llr_semigroup_epsilon_scaling must be positive.')
+        if llr_semigroup_sample_size is not None and llr_semigroup_sample_size < 2:
+            raise ValueError('llr_semigroup_sample_size must be at least two when provided.')
+        if llr_semigroup_max_searches is not None:
+            llr_semigroup_max_searches = int(llr_semigroup_max_searches)
+            if llr_semigroup_max_searches < 1:
+                raise ValueError(
+                    'llr_semigroup_max_searches must be positive when provided.'
+                )
+        llr_semigroup_interp_mode = llr_semigroup_interpolation.lower()
+        if llr_semigroup_interp_mode not in {'log_linear', 'log_pchip'}:
+            raise ValueError(
+                "llr_semigroup_interpolation must be 'log_linear' or 'log_pchip'."
+            )
+
+        if llr_semigroup_scales is None:
+            semigroup_scales = np.geomspace(0.01, 0.2, num=32)
+        else:
+            semigroup_scales = np.asarray(llr_semigroup_scales, dtype=np.float64).ravel()
+        if semigroup_scales.size == 0 or np.any(semigroup_scales <= 0):
+            raise ValueError('llr_semigroup_scales must contain positive values.')
+    else:
+        semigroup_scales = None
+
+    max_cols = coords.shape[1]
+    max_eigs = max_cols if max_eigenvectors is None else min(max_eigenvectors, max_cols)
+    min_coordinates = min(min_coordinates, max_eigs)
+
+    if coords_are_eigenvectors:
+        eigenvectors = coords
+    else:
+        safe_vals = np.where(np.abs(eigenvalues) < 1e-12, 1e-12, eigenvalues)
+        eigenvectors = coords / safe_vals[np.newaxis, :]
+
+    semigroup_kernel_scales = None
+    if use_semigroup_bandwidth:
+        max_k = max_eigs - 1
+        if max_k > 0:
+            semigroup_kernel_scales = _compute_llr_kernel_scales_semigroup(
+                eigenvectors,
+                max_k=max_k,
+                scales=semigroup_scales,
+                alpha=llr_semigroup_alpha,
+                selection=llr_semigroup_selection,
+                sample_size=llr_semigroup_sample_size,
+                rng_seed=llr_semigroup_rng_seed,
+                epsilon_scaling=llr_semigroup_epsilon_scaling,
+                norm=llr_semigroup_norm,
+                max_searches=llr_semigroup_max_searches,
+                interpolation=llr_semigroup_interp_mode,
+            )
+
+    residuals = np.full(max_cols, np.nan, dtype=np.float64)
+    residuals[0] = 1.0
+    for k in range(1, max_eigs):
         predictors = eigenvectors[:, :k]
         target = eigenvectors[:, k]
+        kernel_scale = llr_kernel_scale
+        if kernel_scale is None and llr_bandwidth is not None:
+            kernel_scale = float(llr_bandwidth) ** 2
+        if kernel_scale is None and use_semigroup_bandwidth:
+            if semigroup_kernel_scales is not None:
+                kernel_scale = float(semigroup_kernel_scales[k - 1])
+            else:
+                kernel_scale = _select_llr_kernel_scale_semigroup(
+                    predictors,
+                    scales=semigroup_scales,
+                    alpha=llr_semigroup_alpha,
+                    selection=llr_semigroup_selection,
+                    sample_size=llr_semigroup_sample_size,
+                    rng_seed=llr_semigroup_rng_seed,
+                    epsilon_scaling=llr_semigroup_epsilon_scaling,
+                    norm=llr_semigroup_norm,
+                )
         residuals[k] = _local_linear_regression_residual(
-            predictors, target, bandwidth=llr_bandwidth, ridge=llr_ridge
+            predictors,
+            target,
+            bandwidth=None,
+            kernel_scale=kernel_scale,
+            ridge=llr_ridge,
+            neighbors=llr_neighbors,
         )
 
-    mask = residuals >= residual_threshold
+    mask = np.zeros(max_cols, dtype=bool)
+    mask[0] = True
+    residuals_sub = residuals[1:max_eigs]
+
+    if residuals_sub.size > 0:
+        spread = float(np.nanmax(residuals_sub) - np.nanmin(residuals_sub))
+        if selection_mode == 'auto':
+            selection_mode = 'kmeans' if spread > 1e-6 else 'threshold'
+        if selection_mode == 'kmeans':
+            if residuals_sub.size < 2 or spread <= 1e-6:
+                mask_sub = np.ones_like(residuals_sub, dtype=bool)
+            else:
+                kmeans = KMeans(
+                    n_clusters=2,
+                    n_init='auto',
+                    random_state=kmeans_random_state,
+                )
+                labels = kmeans.fit_predict(residuals_sub.reshape(-1, 1))
+                means = np.array(
+                    [residuals_sub[labels == idx].mean() for idx in range(2)]
+                )
+                mask_sub = labels == int(np.argmax(means))
+        elif selection_mode == 'gap':
+            if residuals_sub.size < 2:
+                mask_sub = np.ones_like(residuals_sub, dtype=bool)
+            else:
+                order = np.argsort(residuals_sub)[::-1]
+                sorted_resid = residuals_sub[order]
+                gaps = sorted_resid[:-1] - sorted_resid[1:]
+                gap_idx = int(np.argmax(gaps))
+                cutoff = 0.5 * (sorted_resid[gap_idx] + sorted_resid[gap_idx + 1])
+                mask_sub = residuals_sub >= cutoff
+        else:
+            if residual_threshold is None:
+                raise ValueError(
+                    'residual_threshold is required for selection="threshold".'
+                )
+            mask_sub = residuals_sub >= residual_threshold
+        mask[1:max_eigs] = mask_sub
+
     if mask.sum() < min_coordinates:
-        top_idx = np.argsort(residuals)[::-1][:min_coordinates]
+        scores = residuals[:max_eigs].copy()
+        scores[~np.isfinite(scores)] = -np.inf
+        top_idx = np.argsort(scores)[::-1][:min_coordinates]
         mask[top_idx] = True
 
     intrinsic = coords[:, mask]
