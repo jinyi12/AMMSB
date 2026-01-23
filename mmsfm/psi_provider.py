@@ -7,7 +7,7 @@ from typing import Literal, Optional, Tuple, Union
 import numpy as np
 import torch
 
-PsiSampleMode = Literal["nearest", "linear"]
+PsiSampleMode = Literal["nearest", "linear", "interpolation"]
 
 
 def _as_1d_float_tensor(values: Union[np.ndarray, torch.Tensor], *, device=None) -> torch.Tensor:
@@ -150,7 +150,7 @@ class PsiProvider:
             idx = self.quantize(t_tensor)
             psi = self.psi_dense[idx]
             return psi[0] if scalar else psi
-        if mode_eff == "linear":
+        if mode_eff in {"linear", "interpolation"}:
             idx0, idx1, w = self._bracket(t_tensor)
             psi0 = self.psi_dense[idx0]
             psi1 = self.psi_dense[idx1]
@@ -191,4 +191,3 @@ class PsiProvider:
             raise ValueError(f"Cache at {cache_path} missing embeddings fields {tried}.")
 
         return cls(t_dense, psi_dense, mode=mode, device=device, dtype=dtype)
-
