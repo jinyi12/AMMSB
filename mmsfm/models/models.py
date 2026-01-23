@@ -12,7 +12,7 @@ class MLP(nn.Module):
     def __init__(self, dim, out_dim=None, w=64, depth=2, time_varying=False):
         super().__init__()
         self.time_varying = time_varying
-        self.act = nn.SELU()
+        self.act = nn.SiLU()
         if out_dim is None:
             out_dim = dim
         _layers = [nn.Linear(dim + (1 if time_varying else 0), w),
@@ -23,8 +23,15 @@ class MLP(nn.Module):
         _layers.append(nn.Linear(w, out_dim))
         self.net = nn.Sequential(*_layers)
 
-    def forward(self, xt):
-        return self.net(xt)
+    def forward(self, x: torch.Tensor, t: Optional[torch.Tensor] = None) -> torch.Tensor:
+        if self.time_varying and t is not None:
+            if t.ndim == 0:
+                t = t.expand(x.shape[0])
+            t_vec = t.view(-1)
+            if t_vec.numel() == 1 and x.shape[0] != 1:
+                t_vec = t_vec.expand(x.shape[0])
+            x = torch.cat([x, t_vec[:, None]], dim=-1)
+        return self.net(x)
 
 
 class ResidualBlock(nn.Module):
@@ -56,16 +63,24 @@ class ResNet(nn.Module):
 
         input_dim = dim + (1 if time_varying else 0)
         self.input_layer = nn.Linear(input_dim, w)
-        self.input_act = nn.SELU()
+        self.input_act = nn.SiLU()
         self.blocks = nn.ModuleList(
-            [ResidualBlock(w, activation_cls=nn.SELU) for _ in range(depth)]
+            [ResidualBlock(w, activation_cls=nn.SiLU) for _ in range(depth)]
         )
         self.output_layer = nn.Linear(w, out_dim)
         nn.init.zeros_(self.output_layer.weight)
         nn.init.zeros_(self.output_layer.bias)
 
-    def forward(self, xt):
-        h = self.input_act(self.input_layer(xt))
+    def forward(self, x: torch.Tensor, t: Optional[torch.Tensor] = None) -> torch.Tensor:
+        if self.time_varying and t is not None:
+            if t.ndim == 0:
+                t = t.expand(x.shape[0])
+            t_vec = t.view(-1)
+            if t_vec.numel() == 1 and x.shape[0] != 1:
+                t_vec = t_vec.expand(x.shape[0])
+            x = torch.cat([x, t_vec[:, None]], dim=-1)
+
+        h = self.input_act(self.input_layer(x))
         for block in self.blocks:
             h = block(h)
         return self.output_layer(h)
@@ -79,9 +94,14 @@ class TimeEmbedding(nn.Module):
             nn.Linear(emb_dim, emb_dim),
         )
 
-    def forward(self, s):  # s: (B, ...) , take last dim as time
-        s = s[..., -1:]  # take last dim as time
-        s = s.view(-1, 1)  # flatten to (B, 1)
+    def forward(self, s):  # s: (B, ...) or scalar
+        if s.ndim == 0:
+            s = s.unsqueeze(0).unsqueeze(0)  # (1, 1)
+        elif s.ndim == 1:
+            s = s.unsqueeze(1)  # (B, 1)
+        else:
+            s = s[..., -1:]  # take last dim as time
+            s = s.view(-1, 1)  # flatten to (B, 1)
         return self.mlp(s)
 
     
@@ -89,7 +109,7 @@ class FiLMLayer(nn.Module):
     def __init__(self, dim_h, dim_t):
         super().__init__()
         self.fc = nn.Linear(dim_h, dim_h)
-        self.act = nn.SELU()
+        self.act = nn.SiLU()
         self.to_gamma_beta = nn.Linear(dim_t, 2 * dim_h)
 
     def forward(self, h, t_emb):
@@ -111,7 +131,7 @@ class TimeFiLMMLP(nn.Module):
         # x: (B, dim_x), t: (B, 1)
         t_emb = self.time_emb(t)      # (B, t_dim)
         h = self.in_fc(x)
-        h = torch.nn.functional.selu(h)
+        h = torch.nn.functional.silu(h)
         for layer in self.layers:
             h = layer(h, t_emb)
         return self.out_fc(h)
@@ -199,6 +219,9 @@ class TimeConditionedMLP(nn.Module):
             if t is None:
                 raise ValueError('Time input t is required when time_varying=True.')
             t_emb = self.time_emb(t)
+            # Broadcast t_emb if it's a scalar/single time for a batch of inputs
+            if t_emb.shape[0] == 1 and x.shape[0] != 1:
+                t_emb = t_emb.expand(x.shape[0], -1)
             x = torch.cat([x, t_emb], dim=-1)
         return self.net(x)
 
