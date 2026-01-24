@@ -18,17 +18,14 @@ from mmsfm.models import MLP, ResNet, TimeFiLMMLP
 from mmsfm.multimarginal_cfm import (
     PairwiseExactOptimalTransportConditionalFlowMatcher,
     PairwiseSchrodingerBridgeConditionalFlowMatcher,
-    MultiMarginalExactOptimalTransportConditionalFlowMatcher,
-    MultiMarginalSchrodingerBridgeConditionalFlowMatcher,
-    PairwisePairedExactOTConditionalFlowMatcher,
-    PairwisePairedSchrodingerBridgeConditionalFlowMatcher,
     MultiMarginalPairedExactOTConditionalFlowMatcher,
     MultiMarginalPairedSchrodingerBridgeConditionalFlowMatcher
 )
 from mmsfm.precomputed_cfm import PrecomputedConditionalFlowMatcher
 from mmsfm.flow_objectives import (
     VelocityPredictionObjective,
-    XPredictionDynamicVObjective,
+    XPredictionVelocityMSEObjective,
+    MeanPathXPredictionVelocityMSEObjective,
 )
 
 from utils import (
@@ -115,13 +112,13 @@ class SDE(torch.nn.Module):
     def __init__(self, ode_drift, score, input_size, sigma=1.0):
         super().__init__()
         self.drift = ode_drift
+        if score is None:
+            raise ValueError(
+                'Score model required for backward SDE trajectory generation. '
+                'Use a Schrödinger Bridge flow matcher (flowmatcher="sb") so the score is trained.'
+            )
         self.score = score
         self.input_size = input_size
-        self.score = score
-        self.input_size = input_size
-        # Allow None score for OT models (noisy reverse ODE)
-        # if self.score is None:
-        #     raise ValueError('Score model required for SDE trajectory generation.')
         self.sigma = float(sigma)
 
     def _concat_time(self, t, y):
@@ -175,7 +172,17 @@ class BaseAgent(ABC):
         self.flow_loss_weight = float(getattr(args, 'flow_loss_weight', 1.0))
         self.score_loss_weight = float(getattr(args, 'score_loss_weight', 1.0))
         self.flow_param = getattr(args, 'flow_param', 'velocity')
+        if self.flow_param == 'x_pred_v_mse':
+            self.flow_param = 'x_pred'
         self.min_sigma_ratio = float(getattr(args, 'min_sigma_ratio', 1e-4))
+        self.xpred_ratio_clip = getattr(args, 'xpred_ratio_clip', None)
+        if self.xpred_ratio_clip is not None:
+            self.xpred_ratio_clip = float(self.xpred_ratio_clip)
+        self.precomputed_ratio_max = float(getattr(args, 'precomputed_ratio_max', 100.0))
+        self.precomputed_t_clip_eps = float(getattr(args, 'precomputed_t_clip_eps', 1e-4))
+        # Backwards/CLI compatibility: mean-path x-pred now uses autograd ∂_t x̂, so
+        # any finite-difference step size is ignored.
+        self.xpred_dt = float(getattr(args, 'xpred_dt', 1e-3))
         self.n_steps = args.n_steps
         self.n_infer = args.n_infer
         self.t_infer = args.t_infer
@@ -263,9 +270,24 @@ class BaseAgent(ABC):
         if self.flow_param == 'x_pred':
             if not hasattr(self.FM, 'compute_sigma_t_ratio'):
                 raise ValueError('x_pred flow_param requires a flow matcher that exposes compute_sigma_t_ratio.')
-            return XPredictionDynamicVObjective(
+            ratio_clip = getattr(self, 'xpred_ratio_clip', None)
+            return MeanPathXPredictionVelocityMSEObjective(
                 self._sigma_ratio,
                 min_ratio=self.min_sigma_ratio,
+                ratio_clip=ratio_clip,
+            )
+
+        # Simpler x-prediction -> velocity mapping without the explicit time-derivative term.
+        # This matches the common Gaussian-path relation v = (dot_sigma/sigma) (x_t - x_hat)
+        # and avoids the potentially high-variance autograd JVP for \partial_t x_hat.
+        if self.flow_param == 'x_pred_simple':
+            if not hasattr(self.FM, 'compute_sigma_t_ratio'):
+                raise ValueError('x_pred_simple flow_param requires a flow matcher that exposes compute_sigma_t_ratio.')
+            ratio_clip = getattr(self, 'xpred_ratio_clip', None)
+            return XPredictionVelocityMSEObjective(
+                self._sigma_ratio,
+                min_ratio=self.min_sigma_ratio,
+                ratio_clip=ratio_clip,
             )
 
         raise ValueError(f'Unsupported flow_param={self.flow_param}')
@@ -284,8 +306,12 @@ class BaseAgent(ABC):
         elif getattr(self.FM, 'use_miniflow_sigma_t', False):
             a, b = self._infer_interval_bounds(t)
         else:
-            a = torch.zeros_like(t)
-            b = torch.ones_like(t)
+            if hasattr(self.FM, 't0') and hasattr(self.FM, 't1'):
+                a = torch.full_like(t, float(self.FM.t0))
+                b = torch.full_like(t, float(self.FM.t1))
+            else:
+                a = torch.zeros_like(t)
+                b = torch.ones_like(t)
         return self.FM.compute_sigma_t_ratio(t, a, b)
 
     def _compute_flow_loss(
@@ -324,125 +350,114 @@ class BaseAgent(ABC):
     @timer_func
     def traj_gen(self, x0, generate_backward=False, forward_stochastic=None):
         """
-        Generate trajectories using asymmetric bridge.
-        
-        Forward: deterministic ODE dX_t = v_t(X_t) dt (or stochastic SB SDE when enabled)
-        Backward: stochastic SDE dX_t = [v_t - (σ²/2)∇log p_t] dt + σ dW_t
-        
-        Args:
-            x0: Initial conditions (forward) or terminal conditions (backward)
-            generate_backward: If True, generate backward SDE trajectories from x0
-                             If False, generate forward ODE trajectories from x0
-            forward_stochastic: Overrides default forward behavior. When None, SB agents
-                                 run stochastic forward sampling and OT agents remain
-                                 deterministic.
-        
-        Returns:
-            forward_traj: Forward ODE trajectories (if not generate_backward)
-            backward_traj: Backward SDE trajectories (if generate_backward)
-        """
-        # Relaxed check: Allow backward SDE for OT (non-SB) models as noisy reverse ODE
-        # if generate_backward and not self.is_sb:
-        #     raise ValueError(
-        #         'Backward SDE trajectories require a Schrödinger Bridge setup with a learned '
-        #         'score model. The backward drift v_t - (σ²/2)∇log p_t requires the score function '
-        #         '∇log p_t for stochastic backward generation.'
-        #     )
+        Generate trajectories under asymmetric dynamics.
 
-        # x0 is initial point for generating trajectory
-        # x0 -> t0 if forward, x0 -> tT if backward
-        x0 = (
-            torch.from_numpy(x0[:self.n_infer])
-            .float()
-            .to(self.device)
-        )
+        Forward: deterministic ODE dX_t = v_t(X_t) dt
+        Backward (SB only): stochastic SDE dX_t = [v_t - (σ²/2)∇log p_t] dt + σ dW_t
+
+        Args:
+            x0: Initial (forward) or terminal (backward) conditions; only the first
+                n_infer points are used.
+            generate_backward: If True, run backward SDE sampling (requires SB/score).
+            forward_stochastic: Optional override to run forward SDE sampling; defaults
+                to False to respect deterministic forward dynamics.
+
+        Returns:
+            forward_traj: Forward ODE trajectories when generate_backward=False.
+            backward_traj: Backward SDE trajectories when generate_backward=True.
+        """
+        forward_stochastic = bool(forward_stochastic) if forward_stochastic is not None else False
+
+        x0 = torch.from_numpy(x0[:self.n_infer]).float().to(self.device)
         t_span = torch.linspace(0, 1, self.t_infer)
 
-        if forward_stochastic is None:
-            forward_stochastic = self.is_sb
-
-
-        if not generate_backward:
-            if forward_stochastic:
-                sde_drift = self.velocity_model
-                input_size = (self.dim,)
-
-                # NOTE: We allow running Forward SDE on non-SB models (like OT)
-                # This treats the learned velocity field v_t as the drift of a Brownian motion:
-                # dX_t = v_t(X_t) dt + sigma dW_t
-                
-                sde = ForwardSDE(
-                    sde_drift,
-                    input_size=input_size,
-                    sigma=self.sigma
-                ).to(self.device)
-
-                print('Solving forward SDE and computing trajectories...')
-                with torch.no_grad():
-                    forward_traj = torchsde.sdeint(
-                        sde,
-                        x0,
-                        ts=t_span.to(self.device)
-                    ).cpu().numpy()  # type: ignore[arg-type]
-
-                return forward_traj, None
-
-            class _ODEWrapper(torch.nn.Module):
-                """Wraps model(x, t=...) to torchdyn f(t, x) signature."""
-                def __init__(self, model):
-                    super().__init__()
-                    self.model = model
-
-                def forward(self, t, x, args=None):
-                    # torchdyn passes args=<...>; accept it for compatibility even if unused
-                    del args
-                    return self.model(x, t=t)
-
-            solver = 'euler' if self.is_sb else 'dopri5'
-            node = NeuralODE(
-                _ODEWrapper(self.velocity_model),
-                solver=solver,
-                sensitivity='adjoint',
-                atol=1e-4,
-                rtol=1e-4
-            )
-
-            print('Solving forward ODE and computing trajectories...')
-            with torch.no_grad():
-                forward_traj = node.trajectory(
-                    x0,
-                    t_span=t_span
-                ).cpu().numpy()
-
-            return forward_traj, None
-        
-        else:
-            # Backward SDE: stochastic trajectory
-            solver = 'euler'
-            sde = SDE(
-                self.velocity_model,
-                self.score_model,
-                input_size=(self.dim,),
-                sigma=self.sigma
-            ).to(self.device)
-
-            print('Solving backward SDE and computing trajectories...')
-            with torch.no_grad():
-                backward_traj = torchsde.sdeint(
-                    sde,
-                    x0,
-                    ts=t_span.to(self.device)
-                ).cpu().numpy()  # type: ignore
-
-            #! Important: The SDE integrator runs from solver time s=0→1, which maps to
-            # physical time t=1→0 (backward). So backward_traj[0] is at t=1 (coarse)
-            # and backward_traj[-1] is at t=0 (fine).
-            # We must flip to match forward convention: traj[0]<->t=0, traj[-1]<->t=1.
-            # This ensures correct evaluation against testdata[i] which is ordered by
-            # increasing time (testdata[0]=t0, testdata[-1]=tT).
-            backward_traj = np.flip(backward_traj, axis=0).copy()
-            
+        if generate_backward:
+            self._validate_backward_support()
+            backward_traj = self._solve_backward_sde(x0, t_span)
             return None, backward_traj
+
+        if forward_stochastic:
+            if not self.is_sb:
+                raise ValueError(
+                    'Stochastic forward sampling is only supported for Schrödinger Bridge '
+                    'runs (flowmatcher="sb").'
+                )
+            forward_traj = self._solve_forward_sde(x0, t_span)
+        else:
+            forward_traj = self._solve_forward_ode(x0, t_span)
+
+        return forward_traj, None
+
+    def _validate_backward_support(self):
+        """Ensure backward SDE sampling is configured correctly."""
+        if not self.is_sb:
+            raise ValueError(
+                'Backward SDE generation requires a Schrödinger Bridge setup. '
+                'Set flowmatcher="sb" to train a score model.'
+            )
+        if self.score_model is None:
+            raise ValueError('Score model missing; cannot run backward SDE generation.')
+
+    def _solve_forward_sde(self, x0, t_span):
+        sde = ForwardSDE(self.velocity_model, input_size=(self.dim,), sigma=self.sigma).to(self.device)
+        print('Solving forward SDE and computing trajectories...')
+        with torch.no_grad():
+            forward_traj = torchsde.sdeint(
+                sde,
+                x0,
+                ts=t_span.to(self.device)
+            ).cpu().numpy()  # type: ignore[arg-type]
+        return forward_traj
+
+    def _solve_forward_ode(self, x0, t_span):
+        class _ODEWrapper(torch.nn.Module):
+            """Wraps model(x, t=...) to torchdyn f(t, x) signature."""
+            def __init__(self, model):
+                super().__init__()
+                self.model = model
+
+            def forward(self, t, x, args=None):
+                # torchdyn passes args=<...>; accept it for compatibility even if unused
+                del args
+                return self.model(x, t=t)
+
+        solver = 'euler' if self.is_sb else 'dopri5'
+        node = NeuralODE(
+            _ODEWrapper(self.velocity_model),
+            solver=solver,
+            sensitivity='adjoint',
+            atol=1e-4,
+            rtol=1e-4
+        )
+
+        print('Solving forward ODE and computing trajectories...')
+        with torch.no_grad():
+            forward_traj = node.trajectory(
+                x0,
+                t_span=t_span
+            ).cpu().numpy()
+        return forward_traj
+
+    def _solve_backward_sde(self, xT, t_span):
+        """Backward sampling with stochastic SDE; requires trained score model."""
+        sde = SDE(
+            self.velocity_model,
+            self.score_model,
+            input_size=(self.dim,),
+            sigma=self.sigma
+        ).to(self.device)
+
+        print('Solving backward SDE and computing trajectories...')
+        with torch.no_grad():
+            backward_traj = torchsde.sdeint(
+                sde,
+                xT,
+                ts=t_span.to(self.device)
+            ).cpu().numpy()  # type: ignore
+
+        # Flip solver time s∈[0,1] (maps to physical t∈[1,0]) to match forward convention
+        backward_traj = np.flip(backward_traj, axis=0).copy()
+        return backward_traj
 
     def _get_traj_at_zt(self, traj, zt):
         ## gets closest points in inferred trajectory to true timepoints zt
@@ -490,11 +505,24 @@ class BaseAgent(ABC):
         W_sqeuclid_reg = np.zeros(m)
         MMD_G = np.zeros(m)
         MMD_M = np.zeros(m)
+        rel_l2 = np.full(m, np.nan, dtype=float)
 
         print('Computing Evaluation Losses...')
         for i in tqdm(range(m)):
             u_i = testdata[i]
             v_i = traj_at_zt[i]
+
+            # Relative L2 error (paired samples) in the current evaluation space.
+            # Defined as ||v - u||_2 / (||u||_2 + eps), using Frobenius norms.
+            u_arr = np.asarray(u_i)
+            v_arr = np.asarray(v_i)
+            if u_arr.ndim == 2 and v_arr.ndim == 2 and u_arr.shape[1] == v_arr.shape[1]:
+                k = min(u_arr.shape[0], v_arr.shape[0])
+                if k > 0:
+                    u_sub = u_arr[:k]
+                    v_sub = v_arr[:k]
+                    denom = np.linalg.norm(u_sub.ravel()) + 1e-12
+                    rel_l2[i] = float(np.linalg.norm((v_sub - u_sub).ravel()) / denom)
 
             M = ot.dist(u_i, v_i, metric='euclidean')
             M2 = ot.dist(u_i, v_i, metric='sqeuclidean')
@@ -518,7 +546,8 @@ class BaseAgent(ABC):
             'W_sqeuclid': W_sqeuclid,
             'W_sqeuclid_reg': W_sqeuclid_reg,
             'MMD_G': MMD_G,
-            'MMD_M': MMD_M
+            'MMD_M': MMD_M,
+            'rel_l2': rel_l2,
         }
 
         return eval_losses_dict
@@ -550,26 +579,41 @@ class PrecomputedTrajectoryAgent(BaseAgent):
     Agent that trains directly on precomputed dense trajectories by sampling
     interpolated positions and finite-difference velocities.
     """
-    def __init__(self, args, sampler, device='cpu'):
-        if getattr(args, 'flowmatcher', None) == 'sb':
-            raise ValueError('PrecomputedTrajectoryAgent only supports OT flow matching.')
-
+    def __init__(self, args, sampler, zt_rem_idxs=None, device='cpu'):
         self.sampler = sampler
-        zt_rem_idxs = np.arange(len(args.zt), dtype=int)
+        if zt_rem_idxs is None:
+            zt_rem_idxs = np.arange(len(args.zt), dtype=int)
         super().__init__(args, zt_rem_idxs, self.sampler.dim, device=device)
 
     ###### SET UP METHODS ######
     def _build_FM(self):
-        return PrecomputedConditionalFlowMatcher(self.sampler)
+        window_mode = 'interval'
+        if getattr(self.args, 'frechet_mode', None) == 'triplet':
+            window_mode = 'triplet'
+        return PrecomputedConditionalFlowMatcher(
+            self.sampler,
+            sigma=self.sigma,
+            diff_ref=self.diff_ref,
+            schedule_times=self.zt,
+            window_mode=window_mode,
+            ratio_min=self.min_sigma_ratio,
+            ratio_max=self.precomputed_ratio_max,
+            t_clip_eps=self.precomputed_t_clip_eps
+        )
 
     def _get_batch(self, X=None, return_noise=False):
-        del X, return_noise
-        t, xt, ut = self.FM.sample_location_and_conditional_flow(self.batch_size)  # type: ignore
+        del X
+        outputs = self.FM.sample_location_and_conditional_flow(self.batch_size, return_noise=return_noise)  # type: ignore
+        if return_noise:
+            t, xt, ut, eps, ab = outputs
+            noises = torch.from_numpy(eps).float().to(self.device)
+        else:
+            t, xt, ut, ab = outputs
+            noises = None
         t = torch.from_numpy(t).float().to(self.device)
         xt = torch.from_numpy(xt).float().to(self.device)
         ut = torch.from_numpy(ut).float().to(self.device)
-        noises = None
-        ab = None
+        ab = torch.from_numpy(ab).float().to(self.device)
         return t, xt, ut, noises, ab
 
     def _get_batch_rand_heldout(self, X=None, return_noise=False):
@@ -579,6 +623,7 @@ class PrecomputedTrajectoryAgent(BaseAgent):
     ######    TRAINING    ######
     def _train(self, X=None, pbar=None):
         flow_losses = np.zeros(self.n_steps)
+        score_losses = np.zeros(self.n_steps) if self.is_sb else None
 
         print('Training...')
 
@@ -589,12 +634,100 @@ class PrecomputedTrajectoryAgent(BaseAgent):
 
         for i in range(self.n_steps):
             self.optimizer.zero_grad()
-            t, xt, ut, _, _ = self.batch_fn(X, return_noise=False)
-            flow_mse, _ = self._compute_flow_loss(t, xt, ut, ab=None)
+            t, xt, ut, eps, ab = self.batch_fn(X, return_noise=self.is_sb)
+            flow_mse, flow_metrics = self._compute_flow_loss(t, xt, ut, ab=ab)
             flow_losses[i] = flow_mse.item()
             loss = self.flow_loss_weight * flow_mse
 
+            # SB diagnostics: characterize time sampling and Gaussian-path scaling.
+            # These are critical when using x_pred objectives, since sigma_ratio can
+            # be heavy-tailed near endpoints even for small sigma.
+            if self.is_sb and (i % 200 == 0):
+                with torch.no_grad():
+                    # Sample times for this batch (in [t0, t1]).
+                    t_flat = t.view(-1)
+                    # Use the same sigma schedule as the FM when possible.
+                    if hasattr(self.FM, 'compute_sigma_t') and hasattr(self.FM, 'compute_sigma_t_ratio'):
+                        a = ab[:, 0]
+                        b = ab[:, 1]
+                        sigma_t = self.FM.compute_sigma_t(t_flat, a, b)
+                        sigma_ratio = self.FM.compute_sigma_t_ratio(t_flat, a, b)
+                        dot_sigma = sigma_t * sigma_ratio
+                        # Log robust stats (means can be misleading under heavy tails).
+                        self.run.log({
+                            'debug/t_min': t_flat.min().item(),
+                            'debug/t_mean': t_flat.mean().item(),
+                            'debug/t_max': t_flat.max().item(),
+                            'debug/sigma_t_med': sigma_t.median().item(),
+                            'debug/sigma_t_p95': torch.quantile(sigma_t, 0.95).item(),
+                            'debug/abs_sigma_ratio_med': sigma_ratio.abs().median().item(),
+                            'debug/abs_sigma_ratio_p95': torch.quantile(sigma_ratio.abs(), 0.95).item(),
+                            'debug/abs_sigma_ratio_p99': torch.quantile(sigma_ratio.abs(), 0.99).item(),
+                            'debug/abs_dot_sigma_med': dot_sigma.abs().median().item(),
+                            'debug/abs_dot_sigma_p95': torch.quantile(dot_sigma.abs(), 0.95).item(),
+                            'debug/abs_dot_sigma_p99': torch.quantile(dot_sigma.abs(), 0.99).item(),
+                        }, commit=False)  # type: ignore
+
+                    # eps should be ~N(0,1) per-dim; report RMS to confirm.
+                    if eps is not None:
+                        eps_rms = torch.sqrt(torch.mean(eps ** 2)).item()
+                        self.run.log({'debug/eps_rms': eps_rms}, commit=False)  # type: ignore
+
+            # Diagnostics for x-pred variants: help debug large loss scale.
+            if self.flow_param == 'x_pred' and isinstance(flow_metrics, dict):
+                with torch.no_grad():
+                    ratio = flow_metrics.get('sigma_ratio', None)
+                    x_target = flow_metrics.get('x_pred_target', None)
+                    x_weight = flow_metrics.get('x_pred_weight', None)
+                    v_pred = flow_metrics.get('pred_velocity', None)
+
+                    # Only log occasionally to keep wandb light.
+                    if ratio is not None and (i % 200 == 0):
+                        ratio_flat = ratio.view(-1)
+                        self.run.log({
+                            'debug/sigma_ratio_mean': ratio_flat.mean().item(),
+                            'debug/sigma_ratio_min': ratio_flat.min().item(),
+                            'debug/sigma_ratio_max': ratio_flat.max().item(),
+                        }, commit=False)  # type: ignore
+
+                    if x_target is not None and (i % 200 == 0):
+                        self.run.log({
+                            'debug/xpred_target_rms': torch.sqrt(torch.mean(x_target ** 2)).item(),
+                        }, commit=False)  # type: ignore
+
+                    if x_weight is not None and (i % 200 == 0):
+                        self.run.log({
+                            'debug/xpred_weight_mean': torch.mean(x_weight).item(),
+                        }, commit=False)  # type: ignore
+
+                    if v_pred is not None and (i % 200 == 0):
+                        v_mse = torch.mean((v_pred - ut) ** 2)
+                        self.run.log({
+                            'debug/velocity_mse_from_xpred': v_mse.item(),
+                            'debug/flow_loss_raw': flow_mse.item(),
+                        }, commit=False)  # type: ignore
+
+                    # Recompute velocity field directly via the agent's velocity wrapper
+                    # to detect any mismatch between logged metrics and the actual loss.
+                    if (i % 200 == 0):
+                        v_wrapped = self.velocity_model(xt, t=t, ab=ab)
+                        v_mse_wrapped = torch.mean((v_wrapped - ut) ** 2)
+                        self.run.log({
+                            'debug/velocity_mse_wrapped': v_mse_wrapped.item(),
+                        }, commit=False)  # type: ignore
+
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            if self.is_sb:
+                lambda_t = self.FM.compute_lambda(t, ab=ab)
+                st = self.score_model(xt, t=t)  # type: ignore
+                score_mse = torch.mean((lambda_t[:, None] * st + eps) ** 2)  # type: ignore[arg-type]
+                score_losses[i] = score_mse.item()  # type: ignore[index]
+                loss = loss + self.score_loss_weight * score_mse
+
+                self.run.log(  # type: ignore
+                    {'train/score_loss' : score_losses[i]},  # type: ignore[index]
+                    commit=False
+                )
 
             self.run.log(  # type: ignore
                 {
@@ -612,7 +745,7 @@ class PrecomputedTrajectoryAgent(BaseAgent):
         if maybe_close:
             pbar.close()
 
-        return flow_losses, None
+        return flow_losses, score_losses
     ############################
 
 
@@ -886,6 +1019,7 @@ class TripletAgent(BaseAgent):
         xts = []
         uts = []
         noises = [] if return_noise else None
+        need_ab = return_noise or (self.flow_param == 'x_pred')
         
         # Assuming all marginals have the same number of samples N
         N_samples = X[0].shape[0]
@@ -915,12 +1049,13 @@ class TripletAgent(BaseAgent):
         ut = torch.cat(uts)
         if return_noise:
             noises = torch.cat(noises)  # type: ignore
-            ab = torch.Tensor(t.shape[0], 2)
+        if need_ab:
+            ab = torch.empty(t.shape[0], 2)
             for k in range(len(X) - 2):
                 k1 = k + 1
                 k2 = k + 2
-                curr_ab = torch.Tensor(self.zt[[k, k2]])
-                ab[self.batch_size*k : self.batch_size*k1] = curr_ab
+                curr_ab = torch.as_tensor(self.zt[[k, k2]], dtype=torch.float32)
+                ab[self.batch_size * k : self.batch_size * k1] = curr_ab
             ab = ab.to(self.device)
         else:
             ab = None
@@ -936,6 +1071,7 @@ class TripletAgent(BaseAgent):
         xts = []
         uts = []
         noises = [] if return_noise else None
+        need_ab = return_noise or (self.flow_param == 'x_pred')
         
         # Assuming all marginals have the same number of samples N
         N_samples = X[0].shape[0]
@@ -965,12 +1101,13 @@ class TripletAgent(BaseAgent):
         ut = torch.cat(uts)
         if return_noise:
             noises = torch.cat(noises)  # type: ignore
-            ab = torch.Tensor(t.shape[0], 2)
+        if need_ab:
+            ab = torch.empty(t.shape[0], 2)
             for k in range(len(X) - 3):
                 k1 = k + 1
                 k2 = k + 2
-                curr_ab = torch.Tensor(rem_zts[[k, k2]])
-                ab[self.batch_size*k : self.batch_size*k1] = curr_ab
+                curr_ab = torch.as_tensor(rem_zts[[k, k2]], dtype=torch.float32)
+                ab[self.batch_size * k : self.batch_size * k1] = curr_ab
             ab = ab.to(self.device)
         else:
             ab = None
@@ -1046,194 +1183,6 @@ class TripletAgent(BaseAgent):
     ############################
 
 
-## TODO
-## Implement MM Agent which can handle any valid K
-class MultiMarginalAgent(BaseAgent):
-    def __init__(self, args, zt_rem_idxs, dim, K, device='cpu'):
-        self.t_sampler = args.t_sampler
-        self.spline = args.spline
-        self.monotonic = args.monotonic
-        super().__init__(args, zt_rem_idxs, dim, device=device)
-        self.K = K
-        self.ztdiff = np.diff(self.zt)
-        self.n_windows = self.zt.shape[0] - self.K + 1
-
-    def _build_FM(self):
-        #! Use PAIRED flow matchers.
-        if not self.is_sb:    ## OT
-            FM = MultiMarginalPairedExactOTConditionalFlowMatcher(
-                sigma=self.sigma, spline=self.spline, monotonic=self.monotonic,
-                t_sampler=self.t_sampler, device=self.device
-            )
-        else:            ## SB
-            FM = MultiMarginalPairedSchrodingerBridgeConditionalFlowMatcher(
-                sigma=self.sigma, spline=self.spline, monotonic=self.monotonic,
-                t_sampler=self.t_sampler, diff_ref=self.diff_ref,
-                device=self.device
-            )
-        return FM
-
-    def _get_batch(self, X, return_noise=False):
-        ts = []
-        xts = []
-        uts = []
-        noises = [] if return_noise else None
-        
-        # Assuming all marginals have the same number of samples N
-        N_samples = X[0].shape[0]
-
-        for t_idx, k in enumerate(range(self.n_windows)):
-            z = torch.zeros(self.K, self.batch_size, self.dim)
-            
-            # FIX: Sample indices ONCE and reuse to preserve natural pairing
-            indices = np.random.randint(N_samples, size=self.batch_size)
-            
-            for z_idx, i in enumerate(range(k, k+self.K)):
-                # Use the SAME indices for all time points in the window
-                z[z_idx] = torch.from_numpy(
-                    X[i][indices]
-                ).float()
-            z = z.to(self.device)
-
-            t, xt, ut, *eps = self.FM.sample_location_and_conditional_flow(
-                z, self.zt[k:k+self.K], return_noise=return_noise
-            )
-
-            ts.append(t)
-            xts.append(xt)
-            uts.append(ut)
-            if return_noise:
-                noises.append(eps[0])  # type: ignore
-
-        t = torch.cat(ts)
-        xt = torch.cat(xts)
-        ut = torch.cat(uts)
-        if return_noise:
-            noises = torch.cat(noises)  # type: ignore
-            ab = torch.Tensor(t.shape[0], 2)
-            for k in range(self.n_windows):
-                kend = k + self.K - 1
-                i = self.batch_size * k
-                j = self.batch_size * (k + 1)
-                curr_ab = torch.Tensor(self.zt[[k, kend]])
-                ab[i:j] = curr_ab
-            ab = ab.to(self.device)
-        else:
-            ab = None
-
-        return t, xt, ut, noises, ab
-
-    def _get_batch_rand_heldout(self, X, return_noise=False):
-        t_heldout = np.random.randint(1, len(X) - 1)  # heldout idx
-        rem_margs = np.delete(np.arange(len(X), dtype=int), t_heldout)  # list of remaining idxs
-        rem_zts = self.zt[rem_margs]
-
-        ts = []
-        xts = []
-        uts = []
-        noises = [] if return_noise else None
-        
-        # Assuming all marginals have the same number of samples N
-        N_samples = X[0].shape[0]
-        
-        for k in range(len(X) - 3):
-            z = torch.zeros(3, self.batch_size, self.dim)
-            
-            # FIX: Sample indices ONCE and reuse to preserve natural pairing
-            indices = np.random.randint(N_samples, size=self.batch_size)
-            
-            for z_idx, i in enumerate(range(k, k+3)):
-                m = rem_margs[i]
-                # Use the SAME indices for all time points
-                z[z_idx] = torch.from_numpy(
-                    X[m][indices]
-                ).float()
-            z = z.to(self.device)
-
-            t, xt, ut, *eps = self.FM.sample_location_and_conditional_flow(
-                z, rem_zts[k:k+3], return_noise=return_noise
-            )
-
-            ts.append(t)
-            xts.append(xt)
-            uts.append(ut)
-            if return_noise:
-                noises.append(eps[0])  # type: ignore
-
-        t = torch.cat(ts)
-        xt = torch.cat(xts)
-        ut = torch.cat(uts)
-        if return_noise:
-            noises = torch.cat(noises)  # type: ignore
-            ab = torch.Tensor(t.shape[0], 2)
-            for k in range(len(X) - 3):
-                k1 = k + 1
-                k2 = k + 2
-                curr_ab = torch.Tensor(rem_zts[[k, k2]])
-                ab[self.batch_size*k : self.batch_size*k1] = curr_ab
-            ab = ab.to(self.device)
-        else:
-            ab = None
-
-        return t, xt, ut, noises, ab
-    ############################
-
-    ######    TRAINING    ######
-    def _train(self, X, pbar=None):
-        flow_losses = np.zeros(self.n_steps)
-        score_losses = np.zeros(self.n_steps) if self.is_sb else None
-
-        maybe_close = False
-        if pbar is None:
-            maybe_close = True
-            pbar = tqdm(total=self.n_steps)
-
-        print('Training...')
-        for i in range(self.n_steps):
-            self.optimizer.zero_grad()
-            ## eps, ab is None if OT, float if SB
-            t, xt, ut, eps, ab = self.batch_fn(X, return_noise=self.is_sb)
-            flow_mse, _ = self._compute_flow_loss(t, xt, ut, ab=ab)
-            flow_losses[i] = flow_mse.item()
-            loss = self.flow_loss_weight * flow_mse
-
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-            if self.is_sb:
-                torch.nn.utils.clip_grad_norm_(self.score_model.parameters(), max_norm=1.0)
-                lambda_t = self.FM.compute_lambda(t, ab)
-                ## check that all lambda_t values are valid (no nans and no infs)
-                assert not torch.any(torch.isnan(lambda_t) | torch.isinf(lambda_t))
-                # st = self.score_model(xt_t)  # type: ignore
-                st = self.score_model(xt, t = t)  # type: ignore
-                score_mse = torch.mean((lambda_t[:, None] * st + eps) ** 2)
-                score_losses[i] = score_mse.item()  # type: ignore
-                loss = loss + self.score_loss_weight * score_mse
-
-                self.run.log(  # type: ignore
-                    {'train/score_loss' : score_losses[i]},  # type: ignore
-                    commit=False
-                )
-
-            total_loss_value = loss.item()
-            self.run.log(  # type: ignore
-                {
-                    'train/flow_loss' : flow_losses[i],
-                    'train/total_loss' : total_loss_value,
-                    'n_steps'   : self.step_counter
-                }
-            )  ## commit loss to wandb servers
-
-            loss.backward()
-            self.optimizer.step()
-            self.step_counter += 1
-            pbar.update(1)
-
-        if maybe_close:
-            pbar.close()
-
-        return flow_losses, score_losses
-    ############################
-########################################################################
 ########################################################################
 
 def build_agent(agent_type, args, zt_rem_idxs, dim, *extra_args, device='cpu'):
@@ -1248,11 +1197,7 @@ def build_agent(agent_type, args, zt_rem_idxs, dim, *extra_args, device='cpu'):
         if not extra_args:
             raise ValueError('Precomputed agent requires a trajectory sampler.')
         sampler = extra_args[0]
-        return PrecomputedTrajectoryAgent(args, sampler, device=device)
-    elif agent_type == 'mm':
-        raise NotImplementedError (f'{agent_type} currently not implemented. Please use pairwise or triplet.')
-        agent_class = MultiMarginalAgent
-        args_to_pass = extra_args
+        return PrecomputedTrajectoryAgent(args, sampler, zt_rem_idxs=zt_rem_idxs, device=device)
     else:
         ## you should never see this
         raise NotImplementedError (f'{agent_type} not implemented')
