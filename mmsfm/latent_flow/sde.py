@@ -80,6 +80,11 @@ class BackwardLatentSDE(nn.Module):
         """
         # Map solver time to physical time
         t = 1.0 - s
+        # Avoid evaluating exactly at endpoints (important for x_pred wrappers with
+        # denominators like (t_end - t)).
+        eps = float(getattr(self.schedule, "t_clip_eps", 0.0))
+        if eps > 0.0:
+            t = torch.clamp(t, min=eps, max=1.0 - eps)
         if t.dim() == 0:
             t_batch = t.expand(y.shape[0])
         else:
@@ -98,4 +103,7 @@ class BackwardLatentSDE(nn.Module):
     def g(self, s: Tensor, y: Tensor) -> Tensor:
         """Diffusion (diagonal entries): g(t) = sigma(t) * I with t = 1 - s."""
         t = 1.0 - s
+        eps = float(getattr(self.schedule, "t_clip_eps", 0.0))
+        if eps > 0.0:
+            t = torch.clamp(t, min=eps, max=1.0 - eps)
         return self.schedule.g_diag(t, y)

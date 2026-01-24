@@ -2,7 +2,6 @@
 import numpy as np
 import torch
 import ot
-from MIOFlow.losses import MMD_loss
 
 def evaluate_trajectories(
     traj: np.ndarray,        # (T_out, N, D)
@@ -76,6 +75,12 @@ def evaluate_trajectories(
 def compute_mmd_gaussian(u: np.ndarray, v: np.ndarray, n_samples: int = 500) -> float:
     """Compute MMD with Gaussian kernel."""
 
+    try:
+        from MIOFlow.losses import MMD_loss  # type: ignore
+    except Exception as exc:  # pragma: no cover
+        raise ImportError(
+            "compute_mmd_gaussian requires MIOFlow (and its optional dependencies) to be importable."
+        ) from exc
 
     mmd_fn = MMD_loss()
     k = min(n_samples, u.shape[0], v.shape[0])

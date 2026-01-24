@@ -1,12 +1,14 @@
 
 from pathlib import Path
 from typing import Optional, Literal
+import math
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
+from torch.optim.lr_scheduler import LambdaLR
 from tqdm import tqdm
 import torchsde
 from torchdyn.core import NeuralODE
@@ -39,6 +41,10 @@ class LatentFlowAgent:
         flow_weight: Weight for flow MSE loss.
         score_weight: Weight for score MSE loss.
         device: Torch device.
+
+    Note:
+        This implementation uses direct velocity prediction. The experimental
+        x-prediction formulation has been archived due to stability issues.
     """
 
     def __init__(
@@ -48,6 +54,11 @@ class LatentFlowAgent:
         hidden_dims: list[int],
         time_dim: int = 32,
         lr: float = 1e-3,
+        lr_scheduler: str = "cosine",
+        lr_warmup_epochs: int = 5,
+        lr_min_factor: float = 0.01,
+        lr_gamma: float = 0.95,
+        lr_step_epochs: int = 10,
         flow_weight: float = 1.0,
         score_weight: float = 1.0,
         score_mode: Literal["pointwise", "trajectory"] = "pointwise",
@@ -61,6 +72,7 @@ class LatentFlowAgent:
         ode_steps: Optional[int] = None,
         ode_rtol: float = 1e-4,
         ode_atol: float = 1e-4,
+        backward_sde_solver: Literal["torchsde", "euler_physical"] = "torchsde",
         use_ema: bool = False,
         ema_decay: float = 0.999,
         device: str = "cpu",
@@ -83,8 +95,9 @@ class LatentFlowAgent:
         self.ode_steps = ode_steps
         self.ode_rtol = float(ode_rtol)
         self.ode_atol = float(ode_atol)
+        self.backward_sde_solver: Literal["torchsde", "euler_physical"] = backward_sde_solver
 
-        # Build velocity model
+        # Build velocity model.
         self.velocity_model = TimeFiLMMLP(
             dim_x=latent_dim,
             dim_out=latent_dim,
@@ -131,6 +144,15 @@ class LatentFlowAgent:
             weight_decay=1e-4,
             precondition_frequency=10
         )
+
+        # Learning rate scheduler configuration (built lazily in train())
+        self.lr_scheduler_type = lr_scheduler
+        self.lr_warmup_epochs = int(lr_warmup_epochs)
+        self.lr_min_factor = float(lr_min_factor)
+        self.lr_gamma = float(lr_gamma)
+        self.lr_step_epochs = int(lr_step_epochs)
+        self.lr_scheduler: Optional[LambdaLR] = None
+        self._initial_lr = float(lr)
 
         # Exponential Moving Average for stability
         self.use_ema = use_ema
@@ -639,6 +661,63 @@ class LatentFlowAgent:
         
         return y0, y1, t0, t1
 
+    def _build_lr_scheduler(self, epochs: int, steps_per_epoch: int) -> Optional[LambdaLR]:
+        """Build a learning rate scheduler based on configuration.
+
+        The scheduler operates per-epoch (stepped once at the end of each epoch).
+        """
+        if self.lr_scheduler_type == "none":
+            return None
+
+        warmup_epochs = min(self.lr_warmup_epochs, epochs)
+        main_epochs = max(1, epochs - warmup_epochs)
+
+        def warmup_lambda(epoch: int) -> float:
+            """Linear warmup from lr_min_factor to 1.0."""
+            if warmup_epochs <= 0:
+                return 1.0
+            return self.lr_min_factor + (1.0 - self.lr_min_factor) * min(epoch / warmup_epochs, 1.0)
+
+        def cosine_lambda(epoch: int) -> float:
+            """Cosine annealing after warmup."""
+            if epoch < warmup_epochs:
+                return warmup_lambda(epoch)
+            progress = (epoch - warmup_epochs) / main_epochs
+            return self.lr_min_factor + 0.5 * (1.0 - self.lr_min_factor) * (1.0 + math.cos(math.pi * progress))
+
+        def linear_lambda(epoch: int) -> float:
+            """Linear decay after warmup."""
+            if epoch < warmup_epochs:
+                return warmup_lambda(epoch)
+            progress = (epoch - warmup_epochs) / main_epochs
+            return self.lr_min_factor + (1.0 - self.lr_min_factor) * (1.0 - progress)
+
+        def exponential_lambda(epoch: int) -> float:
+            """Exponential decay after warmup."""
+            if epoch < warmup_epochs:
+                return warmup_lambda(epoch)
+            return self.lr_gamma ** (epoch - warmup_epochs)
+
+        def step_lambda(epoch: int) -> float:
+            """Step decay after warmup."""
+            if epoch < warmup_epochs:
+                return warmup_lambda(epoch)
+            steps = (epoch - warmup_epochs) // self.lr_step_epochs
+            return max(self.lr_min_factor, self.lr_gamma ** steps)
+
+        if self.lr_scheduler_type == "cosine":
+            scheduler = LambdaLR(self.optimizer, lr_lambda=cosine_lambda)
+        elif self.lr_scheduler_type == "linear":
+            scheduler = LambdaLR(self.optimizer, lr_lambda=linear_lambda)
+        elif self.lr_scheduler_type == "exponential":
+            scheduler = LambdaLR(self.optimizer, lr_lambda=exponential_lambda)
+        elif self.lr_scheduler_type == "step":
+            scheduler = LambdaLR(self.optimizer, lr_lambda=step_lambda)
+        else:
+            raise ValueError(f"Unknown lr_scheduler: {self.lr_scheduler_type}")
+
+        return scheduler
+
     def train(
         self,
         epochs: int,
@@ -666,6 +745,13 @@ class LatentFlowAgent:
         total_steps = epochs * steps_per_epoch
         flow_losses = np.zeros(total_steps)
         score_losses = np.zeros(total_steps)
+
+        # Build learning rate scheduler
+        self.lr_scheduler = self._build_lr_scheduler(epochs, steps_per_epoch)
+        if self.lr_scheduler is not None:
+            print(f"LR scheduler: {self.lr_scheduler_type} (warmup={self.lr_warmup_epochs} epochs, min_factor={self.lr_min_factor})")
+        else:
+            print("LR scheduler: none (constant learning rate)")
 
         print("Training latent flow model...")
 
@@ -723,6 +809,17 @@ class LatentFlowAgent:
                     postfix["stab"] = f"{losses.get('stability_loss', 0.0):.4f}"
                 pbar.set_postfix(postfix)
                 step += 1
+
+            # Step the learning rate scheduler at the end of each epoch
+            current_lr = self.optimizer.param_groups[0]["lr"]
+            if self.lr_scheduler is not None:
+                self.lr_scheduler.step()
+                new_lr = self.optimizer.param_groups[0]["lr"]
+                if self.run is not None:
+                    self.run.log({"train/lr": new_lr, "train/epoch": epoch + 1})
+            else:
+                if self.run is not None:
+                    self.run.log({"train/lr": current_lr, "train/epoch": epoch + 1})
 
             val_metrics: Optional[dict[str, float]] = None
             if val_batches > 0:
@@ -874,7 +971,6 @@ class LatentFlowAgent:
         Returns:
             Trajectories of shape (T_out, N, K).
         """
-
         # Use EMA weights if enabled
         with self.use_ema_for_inference():
             if hasattr(self.velocity_model, 'eval'):
@@ -1029,6 +1125,9 @@ class LatentFlowAgent:
             Trajectories of shape (T_out, N, K) in forward time order.
         """
 
+        if self.backward_sde_solver == "euler_physical":
+            return self._generate_backward_sde_euler_physical(yT, t_span)
+
         # Use EMA weights if enabled
         with self.use_ema_for_inference():
             if hasattr(self.velocity_model, 'eval'):
@@ -1049,6 +1148,66 @@ class LatentFlowAgent:
             # Flip to forward time order (s=0 -> t=1, s=1 -> t=0)
             traj = np.flip(traj, axis=0).copy()
             return traj
+
+    @torch.no_grad()
+    def _generate_backward_sde_euler_physical(self, yT: Tensor, t_span: Tensor) -> np.ndarray:
+        """Backward SDE sampling via Euler-Maruyama in physical time (t decreases).
+
+        Uses the same asymmetric SB drift as `BackwardLatentSDE`, but integrates
+        directly on a decreasing physical-time grid (dt < 0) so no explicit
+        solver-time sign inversion is needed in the update.
+        """
+        # Use EMA weights if enabled
+        with self.use_ema_for_inference():
+            if hasattr(self.velocity_model, "eval"):
+                self.velocity_model.eval()
+            if hasattr(self.score_model, "eval"):
+                self.score_model.eval()
+
+            y = yT.to(self.device)
+            t_fwd = t_span.to(device=self.device, dtype=y.dtype).reshape(-1)
+            if t_fwd.numel() < 2:
+                raise ValueError("t_span must contain at least two time points.")
+            if torch.any(t_fwd[1:] < t_fwd[:-1]):
+                raise ValueError("t_span must be non-decreasing (physical time grid).")
+
+            # Integrate on a decreasing grid.
+            t_grid = torch.flip(t_fwd, dims=[0])
+            traj = torch.empty((t_grid.shape[0], y.shape[0], y.shape[1]), device=y.device, dtype=y.dtype)
+            traj[0] = y
+
+            eps = float(getattr(self.flow_matcher.schedule, "t_clip_eps", 0.0))
+            for i in range(t_grid.shape[0] - 1):
+                t = t_grid[i]
+                t_next = t_grid[i + 1]
+                dt = t_next - t  # negative
+                dt_abs = torch.abs(dt)
+                if float(dt_abs) <= 0.0:
+                    traj[i + 1] = y
+                    continue
+
+                # Avoid evaluating models exactly at endpoints.
+                t_eval = torch.clamp(t, min=eps, max=1.0 - eps)
+                t_batch = t_eval.expand(y.shape[0])
+
+                v = self.velocity_model(y, t=t_batch)
+                s_theta = self.score_model(y, t=t_batch)
+                if self.flow_matcher.score_parameterization == "scaled":
+                    score_term = s_theta
+                else:
+                    g_t = self.flow_matcher.schedule.g_diag(t_batch, y)
+                    score_term = (g_t ** 2 / 2.0) * s_theta
+
+                # Drift in physical time: dy = (v - score_term) dt, with dt < 0.
+                drift = v - score_term
+                g_diag = self.flow_matcher.schedule.g_diag(t_batch, y)
+                noise = torch.randn_like(y) * torch.sqrt(dt_abs)
+                y = y + drift * dt + g_diag * noise
+                traj[i + 1] = y
+
+            # traj is stored in decreasing time order; flip back to t increasing.
+            traj_fwd = torch.flip(traj, dims=[0]).cpu().numpy()
+            return traj_fwd
 
     @torch.no_grad()
     def decode_trajectories(

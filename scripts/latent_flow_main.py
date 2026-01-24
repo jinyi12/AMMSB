@@ -10,20 +10,25 @@ Features:
   bridge noise sigma_tau(t)=g(t)*sqrt(r(1-r)) (vanishes at interpolation knots)
 - Supports pairwise and triplet interpolation modes
 - Includes Schrodinger Bridge score model for backward SDE sampling
+- Optionally loads PCA frames + train/test split from a cache pickle
+  (e.g., `tc_selected_embeddings.pkl` or `tc_embeddings.pkl`) via
+  `--use_cache_data` and `--selected_cache_path`/`--cache_dir`
 - Visualization of trajectories and vector fields
 
 Usage:
     python scripts/latent_flow_main.py \
         --data_path data/tran_inclusions.npz \
         --ae_checkpoint results/joint_ae/geodesic_autoencoder_best.pth \
+        --use_cache_data --selected_cache_path data/cache_pca_precomputed/tran_inclusions/tc_selected_embeddings.pkl \
         --interp_mode pairwise \
         --epochs 100
 """
 
 import argparse
+import pickle
 import sys
 from pathlib import Path
-from typing import Optional, Literal
+from typing import Optional, Literal, Any
 
 import numpy as np
 import torch
@@ -52,6 +57,165 @@ from mmsfm.latent_flow.viz import (
     plot_marginal_comparison,
     plot_training_curves,
 )
+
+_DEFAULT_CACHE_FILENAMES: tuple[str, ...] = (
+    # Preferred: dimension-selected cache produced by scripts/pca/reselect_dimensions.py
+    "tc_selected_embeddings.pkl",
+    # Fallback: raw embeddings cache produced by scripts/pca/run_tcdm.py (still contains frames + indices)
+    "tc_embeddings.pkl",
+)
+
+
+def _resolve_cache_base_readonly(cache_dir: Optional[str], data_path: str) -> Path:
+    """Resolve the per-dataset cache base directory without creating it."""
+    base = (
+        Path(cache_dir)
+        if cache_dir is not None
+        else (REPO_ROOT / "data" / "cache_pca_precomputed")
+    )
+    return base.expanduser().resolve() / Path(data_path).stem
+
+
+def _resolve_selected_cache_path(
+    *,
+    data_path: str,
+    cache_dir: Optional[str],
+    selected_cache_path: Optional[str],
+) -> Path:
+    """Resolve a cache pickle via explicit path or cache_dir conventions.
+
+    - `--selected_cache_path` may be any existing pickle file.
+    - If `--selected_cache_path` is a directory, try common cache filenames, and if
+      none match, fall back to a single `.pkl` file if the directory is unambiguous.
+    - `--cache_dir` may be either the per-dataset cache folder or a global cache root.
+    """
+
+    def _pick_from_dir(dir_path: Path) -> Optional[Path]:
+        for name in _DEFAULT_CACHE_FILENAMES:
+            p = (dir_path / name).resolve()
+            if p.exists():
+                return p
+        pkls = sorted(p for p in dir_path.glob("*.pkl") if p.is_file())
+        if len(pkls) == 1:
+            return pkls[0].resolve()
+        return None
+
+    if selected_cache_path is not None:
+        explicit_in = Path(selected_cache_path).expanduser().resolve()
+        if explicit_in.is_dir():
+            picked = _pick_from_dir(explicit_in)
+            if picked is not None:
+                return picked
+            pkls = sorted(p.name for p in explicit_in.glob("*.pkl") if p.is_file())
+            pkls_str = ", ".join(pkls) if pkls else "(none)"
+            raise FileNotFoundError(
+                f"No cache pickle found in directory {explicit_in}. "
+                f"Tried: {', '.join(_DEFAULT_CACHE_FILENAMES)}; available *.pkl: {pkls_str}. "
+                "Pass `--selected_cache_path` as an explicit file path."
+            )
+        if explicit_in.exists():
+            return explicit_in
+        raise FileNotFoundError(f"Specified cache pickle not found: {explicit_in}")
+
+    candidates: list[Path] = []
+
+    if cache_dir is not None:
+        cache_dir_path = Path(cache_dir).expanduser().resolve()
+        if cache_dir_path.is_file():
+            candidates.append(cache_dir_path)
+        else:
+            # Support both:
+            #   1) cache_dir already points at the per-dataset folder, and
+            #   2) cache_dir is the global cache root (contains per-dataset subfolders).
+            for name in _DEFAULT_CACHE_FILENAMES:
+                candidates.append((cache_dir_path / name).resolve())
+                candidates.append((cache_dir_path / Path(data_path).stem / name).resolve())
+    else:
+        cache_base = _resolve_cache_base_readonly(None, data_path)
+        for name in _DEFAULT_CACHE_FILENAMES:
+            candidates.append((cache_base / name).resolve())
+
+    for p in candidates:
+        if p.exists():
+            return p
+
+    tried = ", ".join(str(p) for p in candidates) if candidates else "(none)"
+    raise FileNotFoundError(
+        "Selected embeddings cache not found. Tried: "
+        f"{tried}. Provide `--selected_cache_path` (file/dir) or `--cache_dir`."
+    )
+
+
+def _load_cache_file(path: Path) -> tuple[dict, Any]:
+    with path.open("rb") as f:
+        payload = pickle.load(f)
+    if isinstance(payload, dict) and "meta" in payload and "data" in payload:
+        return dict(payload["meta"]), payload["data"]
+    return {}, payload
+
+
+def _load_frames_split_from_cache(
+    cache_path: Path,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray], dict]:
+    """Load (frames, train_idx, test_idx, marginal_times, meta) from a cache pickle.
+
+    Supports:
+    - Dimension-selected embeddings caches (tc_selected_embeddings*.pkl) via `load_selected_embeddings`
+    - Raw embeddings caches (tc_embeddings*.pkl) via generic pickle loading
+    """
+    from scripts.pca_precomputed_utils import load_selected_embeddings
+
+    try:
+        info = load_selected_embeddings(cache_path, validate_checksums=False)
+        frames = info.get("frames")
+        train_idx = info.get("train_idx")
+        test_idx = info.get("test_idx")
+        marginal_times = info.get("marginal_times", None)
+        meta = info.get("meta", {}) or {}
+        if frames is None or train_idx is None or test_idx is None:
+            raise ValueError("Missing frames/train_idx/test_idx")
+        return (
+            np.asarray(frames, dtype=np.float32),
+            np.asarray(train_idx, dtype=np.int64),
+            np.asarray(test_idx, dtype=np.int64),
+            np.asarray(marginal_times, dtype=float) if marginal_times is not None else None,
+            dict(meta),
+        )
+    except Exception:
+        pass
+
+    meta, data = _load_cache_file(cache_path)
+    if not isinstance(data, dict):
+        data = getattr(data, "__dict__", {})
+    if not isinstance(data, dict):
+        raise ValueError(f"Cache payload at {cache_path} is not a dict; cannot interpret.")
+
+    frames = data.get("frames")
+    if frames is None:
+        raise ValueError(
+            f"Cache file {cache_path} does not contain `frames`. "
+            "Provide a cache that includes PCA frames (e.g., selected embeddings or raw embeddings cache)."
+        )
+
+    train_idx = data.get("train_idx")
+    test_idx = data.get("test_idx")
+    if train_idx is None or test_idx is None:
+        raise ValueError(
+            f"Cache file {cache_path} does not contain `train_idx`/`test_idx`. "
+            "Provide a cache that includes a train/test split (e.g., tc_selected_embeddings.pkl or tc_embeddings.pkl)."
+        )
+
+    marginal_times = data.get("marginal_times", None)
+    if marginal_times is None:
+        marginal_times = data.get("times", None)
+
+    return (
+        np.asarray(frames, dtype=np.float32),
+        np.asarray(train_idx, dtype=np.int64),
+        np.asarray(test_idx, dtype=np.int64),
+        np.asarray(marginal_times, dtype=float) if marginal_times is not None else None,
+        dict(meta) if meta is not None else {},
+    )
 
 
 def load_autoencoder(
@@ -264,14 +428,21 @@ def main() -> None:
         "--cache_dir",
         type=str,
         default=None,
-        help="Cache directory containing landmark dataset (e.g., ./data/cache_landmark_dataset/)",
+        help="Cache directory used to discover cache pickles. Can be either the per-dataset folder or the global cache root.",
+    )
+    parser.add_argument(
+        "--selected_cache_path",
+        type=str,
+        default=None,
+        help="Optional path to a cache pickle (e.g., tc_selected_embeddings.pkl or tc_embeddings.pkl). "
+             "May also be a directory; in that case common filenames are searched.",
     )
     parser.add_argument(
         "--use_cache_data",
         action="store_true",
         help="Load PCA frames from cache instead of --data_path. "
              "Uses the same landmark subset that was used for autoencoder training. "
-             "Requires --cache_dir to be set.",
+             "Requires either --cache_dir or --selected_cache_path.",
     )
 
     # Model
@@ -281,6 +452,14 @@ def main() -> None:
     # Noise schedule
     parser.add_argument("--sigma_0", type=float, default=0.15, help="Initial noise scale")
     parser.add_argument("--decay_rate", type=float, default=2.0, help="Exponential decay rate")
+    parser.add_argument(
+        "--t_clip_eps",
+        type=float,
+        default=1e-4,
+        help=(
+            "Local-time clipping epsilon used to avoid sampling/evaluating exactly at interval endpoints."
+        ),
+    )
 
     # Training
     parser.add_argument("--interp_mode", type=str, default="pairwise", choices=["pairwise", "triplet"])
@@ -304,6 +483,37 @@ def main() -> None:
     parser.add_argument("--steps_per_epoch", type=int, default=500)
     parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument(
+        "--lr_scheduler",
+        type=str,
+        default="cosine",
+        choices=["none", "cosine", "linear", "exponential", "step"],
+        help="Learning rate scheduler type.",
+    )
+    parser.add_argument(
+        "--lr_warmup_epochs",
+        type=int,
+        default=5,
+        help="Number of warmup epochs for the learning rate scheduler.",
+    )
+    parser.add_argument(
+        "--lr_min_factor",
+        type=float,
+        default=0.01,
+        help="Minimum LR as a fraction of initial LR (for cosine/linear schedulers).",
+    )
+    parser.add_argument(
+        "--lr_gamma",
+        type=float,
+        default=0.95,
+        help="Decay factor for exponential/step schedulers.",
+    )
+    parser.add_argument(
+        "--lr_step_epochs",
+        type=int,
+        default=10,
+        help="Step size in epochs for step scheduler.",
+    )
     parser.add_argument("--flow_weight", type=float, default=1.0)
     parser.add_argument("--score_weight", type=float, default=1.0)
     parser.add_argument(
@@ -426,11 +636,40 @@ def main() -> None:
 
     # Inference
     parser.add_argument("--n_infer", type=int, default=500)
+    parser.add_argument(
+        "--eval_n_infer",
+        type=int,
+        default=None,
+        help=(
+            "Number of samples used for final inference/evaluation plots+metrics. "
+            "If omitted, defaults to --n_infer, but is capped at --w2_n_infer when --eval_checkpoint=best_w2."
+        ),
+    )
     parser.add_argument("--t_infer", type=int, default=100)
     parser.add_argument("--eval_ode", action="store_true", default=True)
     parser.add_argument("--no_eval_ode", action="store_false", dest="eval_ode")
     parser.add_argument("--eval_backward_sde", action="store_true", default=True)
     parser.add_argument("--no_eval_backward_sde", action="store_false", dest="eval_backward_sde")
+    parser.add_argument(
+        "--eval_checkpoint",
+        type=str,
+        default=None,
+        choices=["last", "best_w2"],
+        help=(
+            "Which checkpoint(s) to use for the final inference/evaluation block. "
+            "'best_w2' loads the per-metric best checkpoints saved during training "
+            "(best_w2_ode for ODE; best_w2_sde for SDE). If omitted, defaults to "
+            "'best_w2' when --best_metric=w2, else 'last'."
+        ),
+    )
+    parser.add_argument(
+        "--backward_sde_solver",
+        type=str,
+        default="torchsde",
+        choices=["torchsde", "euler_physical"],
+        help="Backward SDE integrator: 'torchsde' uses torchsde with solver-time sign inversion; "
+             "'euler_physical' integrates directly on a decreasing physical-time grid (Euler-Maruyama).",
+    )
 
     # ODE Solver Configuration
     parser.add_argument(
@@ -484,9 +723,36 @@ def main() -> None:
 
     args = parser.parse_args()
 
+    # Validate time clipping epsilon
+    if not (0.0 <= float(args.t_clip_eps) < 0.5):
+        raise ValueError("--t_clip_eps must be in [0, 0.5).")
+
+    # Resolve cache paths early (before creating output dirs) so errors are clearer and args.txt is reproducible.
+    if args.use_cache_data:
+        if args.cache_dir is None and args.selected_cache_path is None:
+            raise ValueError(
+                "Either --cache_dir or --selected_cache_path must be specified when using --use_cache_data"
+            )
+        resolved_cache_path = _resolve_selected_cache_path(
+            data_path=args.data_path,
+            cache_dir=args.cache_dir,
+            selected_cache_path=args.selected_cache_path,
+        )
+        args.selected_cache_path = str(resolved_cache_path)
+
     if args.best_metric == "loss" and args.best_on == "test" and int(args.val_batches) <= 0:
         args.val_batches = 20
         print("best_on='test' with best_metric='loss' selected with --val_batches <= 0; defaulting --val_batches to 20.")
+
+    # Default evaluation checkpoint selection.
+    if args.eval_checkpoint is None:
+        args.eval_checkpoint = "best_w2" if args.best_metric == "w2" else "last"
+
+    # Default inference evaluation sample count.
+    if args.eval_n_infer is None:
+        args.eval_n_infer = int(args.n_infer)
+        if args.eval_checkpoint == "best_w2":
+            args.eval_n_infer = min(int(args.eval_n_infer), int(args.w2_n_infer))
 
     # Validate ODE solver configuration
     if args.ode_solver in ["euler", "rk4"] and args.ode_steps is None:
@@ -519,26 +785,12 @@ def main() -> None:
     # Load data (either from PCA file or from cache)
     if args.use_cache_data:
         # Load from cache (matches autoencoder training data)
-        if args.cache_dir is None:
-            raise ValueError("--cache_dir must be specified when using --use_cache_data")
-        
-        from scripts.pca_precomputed_utils import _resolve_cache_base, load_selected_embeddings
-        
-        cache_base = _resolve_cache_base(args.cache_dir, args.data_path)
-        cache_path = cache_base / "tc_selected_embeddings.pkl"
+        if args.selected_cache_path is None:
+            raise RuntimeError("Internal error: --use_cache_data enabled but selected cache path was not resolved.")
+        cache_path = Path(args.selected_cache_path)
        
         print(f"Loading data from cache: {cache_path}")
-        cache_data = load_selected_embeddings(
-            cache_path,
-            validate_checksums=False,  # We don't have original checksums in this context
-        )
-        
-        # Extract data from cache
-        frames = cache_data["frames"]  # (T, N_landmarks, D)
-        train_idx = cache_data["train_idx"]  # Indices within landmarks
-        test_idx = cache_data["test_idx"]
-        marginal_times = cache_data.get("marginal_times", None)
-        meta = cache_data.get("meta", {}) or {}
+        frames, train_idx, test_idx, marginal_times, meta = _load_frames_split_from_cache(cache_path)
         drop_first_marginal = meta.get("drop_first_marginal", None)
         # Match the non-cache convention (tran_inclusions): drop the initial marginal if it was *not*
         # already dropped during cache creation. Avoid heuristic checks on t=0 since cached times may
@@ -612,8 +864,10 @@ def main() -> None:
         zt,
         sigma_0=args.sigma_0,
         decay_rate=args.decay_rate,
+        t_clip_eps=float(args.t_clip_eps),
     )
     print(f"\nNoise schedule: sigma_0={args.sigma_0}, decay_rate={args.decay_rate}")
+    print(f"  t_clip_eps = {float(args.t_clip_eps):.6g}")
     print(f"  g(0) = {schedule.sigma_t(torch.tensor(0.0)).item():.4f}")
     print(f"  g(1) = {schedule.sigma_t(torch.tensor(1.0)).item():.4f}")
     print(f"  sigma_tau(0) = {schedule.sigma_tau(torch.tensor(0.0)).item():.4f}")
@@ -644,6 +898,11 @@ def main() -> None:
         hidden_dims=list(args.hidden),
         time_dim=args.time_dim,
         lr=args.lr,
+        lr_scheduler=args.lr_scheduler,
+        lr_warmup_epochs=args.lr_warmup_epochs,
+        lr_min_factor=args.lr_min_factor,
+        lr_gamma=args.lr_gamma,
+        lr_step_epochs=args.lr_step_epochs,
         flow_weight=args.flow_weight,
         score_weight=args.score_weight,
         score_mode=args.score_mode,
@@ -657,6 +916,7 @@ def main() -> None:
         ode_steps=args.ode_steps,
         ode_rtol=args.ode_rtol,
         ode_atol=args.ode_atol,
+        backward_sde_solver=args.backward_sde_solver,
         use_ema=args.use_ema,
         ema_decay=args.ema_decay,
         device=device_str,
@@ -707,12 +967,21 @@ def main() -> None:
     print("Inference and Evaluation")
     print("="*50)
 
+    def _load_checkpoint_if_exists(model: nn.Module, path: Path, *, label: str) -> bool:
+        if not path.exists():
+            print(f"Warning: {label} checkpoint not found: {path}. Using current weights.")
+            return False
+        state = torch.load(path, map_location=device_str, weights_only=False)
+        model.load_state_dict(state, strict=True)
+        print(f"Loaded {label} checkpoint: {path.name}")
+        return True
+
     t_span = torch.linspace(0, 1, args.t_infer)
     t_values = t_span.numpy()
 
     # Use the paired TEST split for evaluation so the reference trajectories match
     # the sample identities across time (same sample index at each marginal).
-    n_infer = min(int(args.n_infer), int(flow_matcher.latent_test.shape[1]), int(x_test.shape[1]))
+    n_infer = min(int(args.eval_n_infer), int(flow_matcher.latent_test.shape[1]), int(x_test.shape[1]))
     y0 = flow_matcher.latent_test[0, :n_infer].clone()
     yT = flow_matcher.latent_test[-1, :n_infer].clone()
 
@@ -725,6 +994,13 @@ def main() -> None:
     if args.eval_ode:
         print("\nGenerating ODE trajectories...")
         try:
+            if args.eval_checkpoint == "best_w2":
+                _load_checkpoint_if_exists(
+                    agent.velocity_model,
+                    outdir_path / "latent_flow_model_best_w2_ode.pth",
+                    label="velocity(best_w2_ode)",
+                )
+
             # Forward direction: start from known/reference samples at t=0 and integrate to t=1.
             latent_traj_ode = agent.generate_forward_ode(y0, t_span)
 
@@ -773,6 +1049,18 @@ def main() -> None:
     if args.eval_backward_sde:
         print("\nGenerating backward SDE trajectories...")
         try:
+            if args.eval_checkpoint == "best_w2":
+                _load_checkpoint_if_exists(
+                    agent.velocity_model,
+                    outdir_path / "latent_flow_model_best_w2_sde.pth",
+                    label="velocity(best_w2_sde)",
+                )
+                _load_checkpoint_if_exists(
+                    agent.score_model,
+                    outdir_path / "score_model_best_w2_sde.pth",
+                    label="score(best_w2_sde)",
+                )
+
             latent_traj_sde = agent.generate_backward_sde(yT, t_span)
 
             # Plot latent trajectories

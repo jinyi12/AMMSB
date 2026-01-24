@@ -4,17 +4,10 @@ from .diffusion_map_sampler import DiffusionMapTrajectorySampler
 from .psi_provider import PsiProvider
 from .preimage_decoder import LowRankSPDPreconditioner, PreimageEnergyDecoder, TimeConditionedDecoder
 from .precomputed_cfm import PrecomputedConditionalFlowMatcher
-from .flow_objectives import (
-    VelocityPredictionObjective,
-    XPredictionVelocityMSEObjective,
-    MeanPathXPredictionVelocityMSEObjective,
-    XPredictionDynamicVObjective,
-)
+from .flow_objectives import VelocityPredictionObjective
 
 __all__ = [
     '__version__',
-    'DiffusionMapTrajectorySampler',
-    'PsiProvider',
     'DiffusionMapTrajectorySampler',
     'PsiProvider',
     'LowRankSPDPreconditioner',
@@ -22,7 +15,4 @@ __all__ = [
     'TimeConditionedDecoder',
     'PrecomputedConditionalFlowMatcher',
     'VelocityPredictionObjective',
-    'XPredictionVelocityMSEObjective',
-    'MeanPathXPredictionVelocityMSEObjective',
-    'XPredictionDynamicVObjective',
 ]
