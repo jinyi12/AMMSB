@@ -23,3 +23,15 @@ logs/
 
 # Ignore local WandB directory
 wandb/
+
+/tests
+
+# ignore all archive files and folders with ./archive/
+*archive*
+
+# ignore log files
+*.log
+
+*.out
+
+*.nfs*

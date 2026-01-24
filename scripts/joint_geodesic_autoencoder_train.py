@@ -130,7 +130,17 @@ def _load_tc_info_from_cache(
     """Load cached TCDM/selected embeddings without recomputing TCDM."""
     candidate_paths: list[Path] = []
     if selected_cache_path is not None:
-        candidate_paths.append(Path(selected_cache_path).expanduser().resolve())
+        explicit = Path(selected_cache_path).expanduser().resolve()
+        if explicit.is_dir():
+            # Try common cache names in the directory (allows users to pass a directory).
+            for name in ("tc_selected_embeddings.pkl", "tc_embeddings.pkl"):
+                candidate = (explicit / name).resolve()
+                if candidate.exists():
+                    explicit = candidate
+                    break
+        if not explicit.exists():
+            raise FileNotFoundError(f"Specified selected cache not found: {explicit}")
+        candidate_paths.append(explicit)
     if cache_base is not None:
         candidate_paths.append(cache_base / "tc_selected_embeddings.pkl")
         candidate_paths.append(cache_base / "tc_embeddings.pkl")
@@ -148,7 +158,7 @@ def _load_tc_info_from_cache(
         )
 
     # Preferred: dimension-selected cache with a stable loader + checksum validation.
-    if found.name == "tc_selected_embeddings.pkl":
+    try:
         info = load_selected_embeddings(
             found,
             validate_checksums=(not skip_validation),
@@ -157,6 +167,8 @@ def _load_tc_info_from_cache(
         )
         meta = dict(info.get("meta", {}))
         return dict(info), meta
+    except Exception:
+        pass
 
     # Fallback: pipeline cache (`tc_embeddings.pkl`) produced by `prepare_timecoupled_latents`.
     meta, data = _load_cache_file(found)
