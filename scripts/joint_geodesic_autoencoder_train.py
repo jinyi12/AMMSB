@@ -784,6 +784,20 @@ def main() -> None:
     parser.add_argument("--ode_adjoint_rtol", type=float, default=None)
     parser.add_argument("--ode_adjoint_atol", type=float, default=None)
     parser.add_argument(
+        "--ode_step_size",
+        type=float,
+        default=None,
+        help="Fixed step size for ODE solver. Useful for fixed-step methods like rk4 or euler. "
+             "If not specified, adaptive step size is used (for adaptive solvers like dopri5).",
+    )
+    parser.add_argument(
+        "--ode_max_num_steps",
+        type=int,
+        default=None,
+        help="Maximum number of ODE integration steps. Useful for preventing runaway integration. "
+             "Default: solver-dependent (typically 1000 for torchdiffeq).",
+    )
+    parser.add_argument(
         "--stability_weight",
         type=float,
         default=0.0,
@@ -1176,6 +1190,8 @@ def main() -> None:
                         print(f"    Found phi_frechet_triplet_dense: shape={interp.phi_frechet_triplet_dense.shape}")
                     if hasattr(interp, 'phi_frechet_global_dense') and interp.phi_frechet_global_dense is not None:
                         print(f"    Found phi_frechet_global_dense: shape={interp.phi_frechet_global_dense.shape}")
+                    if hasattr(interp, 'tc_embeddings_aligned') and interp.tc_embeddings_aligned is not None:
+                        print(f"    Found tc_embeddings_aligned: shape={interp.tc_embeddings_aligned.shape}")
                     print(f"    Dense time grid: {len(interp.t_dense)} points, range=[{interp.t_dense[0]:.4f}, {interp.t_dense[-1]:.4f}]")
         except Exception as exc:
             print(f"    Failed to load: {exc}")
@@ -1245,6 +1261,47 @@ def main() -> None:
         dense_trajs_raw = dense_trajs_raw[:, train_idx_arr, :]
         psi_sample_idx = train_idx_arr
 
+    # =========================================================================
+    # Use Frechet-aligned marginal embeddings from interpolation cache
+    # This ensures train and test embeddings are in the same coordinate frame
+    # as the dense trajectories used for cycle consistency.
+    # =========================================================================
+    use_aligned_from_interp = False
+    if hasattr(interp, 'tc_embeddings_aligned') and interp.tc_embeddings_aligned is not None:
+        tc_aligned_all = np.asarray(interp.tc_embeddings_aligned, dtype=np.float32)  # (T, N_landmarks, K)
+        
+        # Verify dimensions match
+        T_aligned, N_aligned, K_aligned = tc_aligned_all.shape
+        T_expected = latent_train_raw.shape[0]
+        K_expected = latent_train_raw.shape[2]
+        
+        if T_aligned == T_expected and K_aligned == K_expected:
+            # Slice by train/test indices (indices within landmark set)
+            train_idx_arr = np.asarray(train_idx, dtype=int).reshape(-1)
+            test_idx_arr = np.asarray(test_idx, dtype=int).reshape(-1)
+            
+            if int(train_idx_arr.max()) < N_aligned and int(test_idx_arr.max()) < N_aligned:
+                latent_train_aligned = tc_aligned_all[:, train_idx_arr, :]  # (T, N_train, K)
+                latent_test_aligned = tc_aligned_all[:, test_idx_arr, :]    # (T, N_test, K)
+                use_aligned_from_interp = True
+                
+                print(f"\n✓ Using Frechet-aligned embeddings from interpolation cache")
+                print(f"  latent_train_aligned: {latent_train_aligned.shape}")
+                print(f"  latent_test_aligned: {latent_test_aligned.shape}")
+            else:
+                print(f"\n⚠ tc_embeddings_aligned indices out of bounds, using unaligned embeddings")
+        else:
+            print(f"\n⚠ tc_embeddings_aligned shape mismatch: got {tc_aligned_all.shape}, expected T={T_expected}, K={K_expected}")
+    else:
+        print("\n⚠ tc_embeddings_aligned not found in interpolation cache")
+
+    if not use_aligned_from_interp:
+        # Fallback to unaligned embeddings from tc_selected_embeddings.pkl
+        print("  Falling back to unaligned embeddings from selected cache")
+        latent_train_aligned = latent_train_raw
+        latent_test_aligned = latent_test_raw
+
+
     print("Fitting DistanceCurveScaler...")
     print(f"  Dense trajectories shape: {dense_trajs_raw.shape}")
     print(f"  target_std={args.target_std}, contraction_power={args.contraction_power}, n_pairs={args.distance_curve_pairs}")
@@ -1258,9 +1315,12 @@ def main() -> None:
     scaler.fit(dense_trajs_raw, t_dense)
     print("  DistanceCurveScaler fitted")
 
-    # DEBUG: Check if dense trajectories at marginal times match raw embeddings
+    # =========================================================================
+    # DIAGNOSTIC: Verify consistency between dense trajectories and aligned embeddings
+    # Since we now use tc_embeddings_aligned, these should match closely.
+    # =========================================================================
     print("\n" + "=" * 70)
-    print("DIAGNOSTIC: Checking consistency between dense trajectories and raw embeddings")
+    print("DIAGNOSTIC: Verifying alignment between dense trajectories and training embeddings")
     print("=" * 70)
 
     # Find dense trajectory indices closest to marginal times
@@ -1270,58 +1330,53 @@ def main() -> None:
         marginal_indices.append(idx)
         time_diff = np.abs(t_dense[idx] - marginal_t)
         if time_diff > 1e-6:
-            print(f"  WARNING: Marginal time {marginal_t:.6f} not in dense grid (closest: {t_dense[idx]:.6f}, diff: {time_diff:.6e})")
+            print(f"  WARNING: Marginal time {marginal_t:.6f} not exact in dense grid (diff: {time_diff:.6e})")
 
-    # Compare dense trajectories at marginal times vs raw embeddings
-    print("\nComparing dense trajectories at marginal times vs raw embeddings:")
+    # Compare dense trajectories at marginal times vs aligned embeddings
+    print("\nComparing dense trajectories at marginal times vs training embeddings:")
+    all_match = True
     for i, (t_idx, dense_idx) in enumerate(zip(range(len(zt_train_times)), marginal_indices)):
         dense_at_marginal = dense_trajs_raw[dense_idx]  # (N, K)
-        raw_embedding = latent_train_raw[t_idx]  # (N, K)
+        aligned_embedding = latent_train_aligned[t_idx]  # (N, K)
 
-        max_diff = np.abs(dense_at_marginal - raw_embedding).max()
-        mean_diff = np.abs(dense_at_marginal - raw_embedding).mean()
+        max_diff = np.abs(dense_at_marginal - aligned_embedding).max()
+        mean_diff = np.abs(dense_at_marginal - aligned_embedding).mean()
+        std_ratio = np.std(dense_at_marginal) / (np.std(aligned_embedding) + 1e-12)
 
-        dense_std = np.std(dense_at_marginal)
-        raw_std = np.std(raw_embedding)
-
-        print(f"  t={zt_train_times[t_idx]:.3f} (raw idx={t_idx}, dense idx={dense_idx}):")
-        print(f"    std(dense)={dense_std:.6f}, std(raw)={raw_std:.6f}, ratio={dense_std/(raw_std+1e-12):.4f}")
-        print(f"    max_diff={max_diff:.6e}, mean_diff={mean_diff:.6e}")
-
+        status = "✓" if max_diff < 1e-4 else "⚠"
         if max_diff > 1e-4:
-            print("    → WARNING: Large mismatch between dense and raw embeddings!")
+            all_match = False
+        print(f"  {status} t={zt_train_times[t_idx]:.3f}: max_diff={max_diff:.2e}, mean_diff={mean_diff:.2e}, std_ratio={std_ratio:.4f}")
 
-    # Print raw embedding statistics BEFORE scaling
-    print("\nRaw TCDM embedding statistics (before scaling):")
+    if all_match:
+        print("\n✓ All marginal embeddings match dense trajectories (consistent Frechet frame)")
+    else:
+        print("\n⚠ Some marginals have large differences (check interpolation alignment)")
+
+    # Print aligned embedding statistics BEFORE scaling
+    print("\nAligned TCDM embedding statistics (before scaling):")
     raw_stds = []
-    for t_idx in range(latent_train_raw.shape[0]):
-        data_t = latent_train_raw[t_idx]
+    for t_idx in range(latent_train_aligned.shape[0]):
+        data_t = latent_train_aligned[t_idx]
         spread = np.std(data_t)
         raw_stds.append(spread)
-        print(f"  t={t_idx} ({zt_train_times[t_idx]:.3f}): std={spread:.6f}, range=[{data_t.min():.6f}, {data_t.max():.6f}]")
+        print(f"  t={t_idx} ({zt_train_times[t_idx]:.3f}): std={spread:.6f}")
     raw_stds = np.array(raw_stds)
     raw_contraction = raw_stds / (raw_stds[0] + 1e-12)
-    print(f"  Raw contraction ratios (from std): {raw_contraction}")
-    print(f"  Raw std is monotonic? {np.all(raw_stds[1:] <= raw_stds[:-1])}")
+    print(f"  Contraction ratios: {np.round(raw_contraction, 4)}")
+    print(f"  Monotonic? {np.all(raw_stds[1:] <= raw_stds[:-1])}")
 
-    # DEBUG: Check contraction ratios at marginal times (from dense trajectories)
+    # Check contraction ratios at marginal times (from dense trajectories)
     r_at_marginals = scaler.contraction_ratio(np.asarray(zt_train_times))
-    print(f"\nContraction ratios at marginal times (from dense trajs): {r_at_marginals}")
-    print(f"  Dense contraction is monotonic? {np.all(r_at_marginals[1:] <= r_at_marginals[:-1])}")
-
-    # Check if raw embedding std profile matches dense trajectory contraction
-    print("\nComparing raw embedding std profile to dense trajectory contraction:")
-    print(f"  scaler.std0 (from dense trajs): {scaler.std0:.6f}")
-    print(f"  raw_stds[0] (from raw embeddings): {raw_stds[0]:.6f}")
-    print(f"  Ratio: {raw_stds[0] / (scaler.std0 + 1e-12):.4f}")
+    print(f"\nContraction ratios from DistanceCurveScaler: {np.round(r_at_marginals, 4)}")
     print("=" * 70 + "\n")
 
-    print("\nTransforming train/test embeddings...")
+    print("\nTransforming train/test embeddings using Frechet-aligned embeddings...")
     latent_train = _as_time_major(scaler.transform_at_times(
-        latent_train_raw, zt_train_times
+        latent_train_aligned, zt_train_times  # Uses aligned embeddings
     )).astype(np.float32)
     latent_test = _as_time_major(scaler.transform_at_times(
-        latent_test_raw, zt_train_times
+        latent_test_aligned, zt_train_times   # Uses aligned embeddings (same frame as train)
     )).astype(np.float32)
     scaler_state = scaler.get_state_dict()
 
@@ -1500,6 +1555,10 @@ def main() -> None:
             f"  solver: method={args.ode_method}, rtol={args.ode_rtol}, atol={args.ode_atol}, "
             f"use_adjoint={not args.ode_no_adjoint}"
         )
+        if args.ode_step_size is not None:
+            print(f"  step_size={args.ode_step_size}")
+        if args.ode_max_num_steps is not None:
+            print(f"  max_num_steps={args.ode_max_num_steps}")
         mu = torch.from_numpy(x_train.reshape(-1, ambient_dim).mean(axis=0, keepdims=True)).float()
         solver = ODESolverConfig(
             method=str(args.ode_method),
@@ -1508,6 +1567,8 @@ def main() -> None:
             use_adjoint=not bool(args.ode_no_adjoint),
             adjoint_rtol=args.ode_adjoint_rtol,
             adjoint_atol=args.ode_adjoint_atol,
+            step_size=args.ode_step_size,
+            max_num_steps=args.ode_max_num_steps,
         )
         autoencoder = NeuralODEIsometricDiffeomorphismAutoencoder(
             ambient_dim=ambient_dim,

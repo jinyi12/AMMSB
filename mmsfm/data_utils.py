@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any, Optional
 
 import numpy as np
+from scipy.spatial.distance import pdist, squareform
 
 
 def get_marginals(npz_obj: Any, choice: str = "pca") -> tuple[list[float], dict[float, np.ndarray], str]:
@@ -154,3 +155,22 @@ def find_holdout_index(times_arr: np.ndarray, holdout_time: float, tol: float = 
             f"using nearest time {times_arr[idx]:.4f} for evaluation."
         )
     return idx
+
+
+def compute_bandwidth_statistics(frames: np.ndarray) -> dict[str, np.ndarray]:
+    """Compute bandwidth statistics (median, q1, q3, max) for given frames."""
+    medians, q1, q3, maxima = [], [], [], []
+    for snapshot in frames:
+        d2 = squareform(pdist(snapshot, metric='sqeuclidean'))
+        mask = d2 > 0
+        vals = d2[mask] if np.any(mask) else np.array([1.0])
+        medians.append(float(np.median(vals)))
+        q1.append(float(np.percentile(vals, 25)))
+        q3.append(float(np.percentile(vals, 75)))
+        maxima.append(float(np.max(vals)))
+    return {
+        'median': np.array(medians),
+        'q1': np.array(q1),
+        'q3': np.array(q3),
+        'max': np.array(maxima),
+    }

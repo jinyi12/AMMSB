@@ -231,6 +231,19 @@ class NeuralODEDiffeomorphism(nn.Module):
             )
 
     def _time_grid(self, *, device: torch.device, dtype: torch.dtype) -> Tensor:
+        # torchdiffeq integrates adaptively (internal steps), so returning only endpoints
+        # is sufficient. rampde uses a fixed grid based on the provided `t`, so we
+        # optionally densify the grid when rampde is enabled.
+        if bool(self.solver.use_rampde) and HAS_RAMPDE:
+            n_steps: int
+            if self.solver.step_size is not None and float(self.solver.step_size) > 0:
+                n_steps = int(torch.ceil(torch.tensor(1.0 / float(self.solver.step_size))).item())
+            elif self.solver.max_num_steps is not None and int(self.solver.max_num_steps) > 0:
+                n_steps = int(self.solver.max_num_steps)
+            else:
+                n_steps = 32
+            n_steps = max(1, n_steps)
+            return torch.linspace(0.0, 1.0, n_steps + 1, device=device, dtype=dtype)
         return torch.tensor([0.0, 1.0], device=device, dtype=dtype)
 
     def _odeint(self, func: nn.Module, y0: Tensor, ts: Tensor) -> Tensor:
