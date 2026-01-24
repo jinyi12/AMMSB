@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Mapping, Sequence
-from typing import Any
+from typing import Any, Literal, Optional
 
 import numpy as np
 import torch
@@ -1337,3 +1337,444 @@ def plot_interpolated_probability_paths(
         plt.close(fig)
         return None
     return fig
+
+
+# =============================================================================
+# Consolidated from mmsfm/viz.py
+# =============================================================================
+
+
+def plot_field_comparisons(
+    imgs_true: np.ndarray,
+    imgs_gh: np.ndarray,
+    imgs_gh_local: np.ndarray | None,
+    imgs_convex: np.ndarray,
+    sample_indices: Sequence[int],
+    imgs_krr: np.ndarray | None = None,
+    vmax_mode: str = "global",
+) -> None:
+    """Plot side-by-side comparisons of reconstructed fields.
+    
+    Ported from mmsfm/viz.py.
+    """
+    methods: list[tuple[str, np.ndarray]] = [("GH", imgs_gh)]
+    if imgs_gh_local is not None:
+        methods.append(("GH-local", imgs_gh_local))
+    methods.append(("Convex", imgs_convex))
+    if imgs_krr is not None:
+        methods.append(("KRR (time-local)", imgs_krr))
+
+    n_rows = len(sample_indices)
+    n_cols = 1 + 2 * len(methods)  # truth + prediction + error for each method
+
+    fig, axes = plt.subplots(
+        n_rows,
+        n_cols,
+        figsize=(3 * n_cols, 3 * n_rows),
+        constrained_layout=True,
+    )
+    if n_rows == 1:
+        axes = np.expand_dims(axes, axis=0)
+
+    cmap_data = "viridis"
+    cmap_err = "inferno"
+
+    # Helper for global vrange
+    def _get_vrange(arrays):
+        vals = np.concatenate([a.ravel() for a in arrays if a is not None])
+        return float(np.min(vals)), float(np.max(vals))
+
+    for row, idx in enumerate(sample_indices):
+        # Always compute vmin/vmax per row as requested
+        vmin, vmax = _get_vrange(
+            [imgs_true[idx : idx + 1]] + [arr[idx : idx + 1] for _, arr in methods]
+        )
+        err_vmax = float(
+            np.max(
+                np.concatenate(
+                    [np.abs(arr[idx] - imgs_true[idx]).ravel() for _, arr in methods]
+                )
+            )
+        )
+
+        col = 0
+        
+        # 1. Truth
+        ax = axes[row, col]
+        im = ax.imshow(imgs_true[idx], vmin=vmin, vmax=vmax, cmap=cmap_data)
+        ax.set_title(f"Truth (idx={idx})")
+        ax.set_xticks([])
+        ax.set_yticks([])
+        col += 1
+
+        # 2. Predictions
+        for i, (name, arr) in enumerate(methods):
+            pred_img = arr[idx]
+            rmse = float(np.sqrt(np.mean((pred_img - imgs_true[idx]) ** 2)))
+
+            ax_pred = axes[row, col]
+            im_pred = ax_pred.imshow(pred_img, vmin=vmin, vmax=vmax, cmap=cmap_data)
+            ax_pred.set_title(f"{name} (RMSE={rmse:.2e})")
+            ax_pred.set_xticks([])
+            ax_pred.set_yticks([])
+            
+            if i == len(methods) - 1:
+                ax_pred.figure.colorbar(im_pred, ax=ax_pred, fraction=0.046, pad=0.01)
+            col += 1
+
+        # 3. Errors
+        for i, (name, arr) in enumerate(methods):
+            pred_img = arr[idx]
+            ax_err = axes[row, col]
+            im_err = ax_err.imshow(np.abs(pred_img - imgs_true[idx]), vmin=0.0, vmax=err_vmax, cmap=cmap_err)
+            ax_err.set_title(f"{name} |error|")
+            ax_err.set_xticks([])
+            ax_err.set_yticks([])
+            
+            if i == len(methods) - 1:
+                ax_err.figure.colorbar(im_err, ax=ax_err, fraction=0.046, pad=0.01)
+            col += 1
+
+    plt.suptitle("Holdout reconstruction comparison", y=1.02)
+    plt.show()
+
+
+def plot_error_statistics(
+    metrics: dict[str, dict[str, Any]],
+    g_star: np.ndarray,
+) -> None:
+    """Plot distributions of errors across methods.
+    
+    Ported from mmsfm/viz.py.
+    """
+    if not metrics:
+        print("No metrics to plot.")
+        return
+
+    method_names = list(metrics.keys())
+    rel_errors = [metrics[name]["rel_error"] for name in method_names]
+    rmses = [metrics[name]["rmse"] for name in method_names]
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4), constrained_layout=True)
+
+    parts = axes[0].violinplot(rel_errors, showmeans=True, showextrema=False)
+    for pc in parts["bodies"]:
+        pc.set_facecolor("lightgray")
+        pc.set_edgecolor("black")
+        pc.set_alpha(0.7)
+    axes[0].set_xticks(np.arange(1, len(method_names) + 1))
+    axes[0].set_xticklabels(method_names)
+    axes[0].set_ylabel("Relative error")
+    axes[0].set_title("Relative error distribution")
+    axes[0].grid(alpha=0.3)
+
+    for name, errs in zip(method_names, rmses):
+        axes[1].scatter(g_star[:, 0], errs, s=10, alpha=0.6, label=name)
+    axes[1].set_xlabel("$g_1$ (held-out latent coord)")
+    axes[1].set_ylabel("RMSE")
+    axes[1].set_title("Error vs latent coordinate")
+    axes[1].grid(alpha=0.3)
+    axes[1].legend()
+
+    plt.show()
+
+
+def plot_conditional_flow_paths(
+    *,
+    path_info: dict[str, np.ndarray],
+    trajectories: np.ndarray,
+    t_eval: np.ndarray,
+    latent_ref: np.ndarray,
+    zt: np.ndarray,
+    sample_indices: Sequence[int],
+    dims: tuple[int, int] = (0, 1),
+    save_path: Any | None = None,
+    show_velocity: bool = False,
+) -> None:
+    """Plot conditional flow paths with uncertainty bands.
+
+    Visualizes Gaussian conditional probability paths p(y_t | z0, z1) including:
+    - Mean path μ_t (deterministic interpolation)
+    - Uncertainty bands at ±1σ, ±2σ
+    - Sampled trajectories from the conditional distribution
+    - Reference marginal distributions
+
+    Ported from mmsfm/viz.py.
+    """
+    from matplotlib import cm
+    from matplotlib.patches import Ellipse
+
+    n_samples = len(sample_indices)
+    d0, d1 = dims
+    
+    # Heuristic for figure height
+    fig = plt.figure(figsize=(16, 4 * n_samples))
+    gs = fig.add_gridspec(n_samples, 3, hspace=0.3, wspace=0.3)
+
+    mu_t = path_info['mu_t']  # (n_times, n_samples, latent_dim)
+    sigma_t = path_info['sigma_t']  # (n_times,)
+    n_times = len(t_eval)
+
+    colors = cm.viridis(np.linspace(0, 1, len(zt)))
+
+    for row_idx, sample_idx in enumerate(sample_indices):
+        # Extract data for this sample
+        mu_sample = mu_t[:, sample_idx, :]  # (n_times, latent_dim)
+        traj_sample = trajectories[:, sample_idx, :, :]  # (n_times, n_traj_samples, latent_dim)
+
+        # Plot 1: Phase plane (dim 0 vs dim 1)
+        ax_phase = fig.add_subplot(gs[row_idx, 0])
+
+        # Reference marginals
+        for t_idx in range(len(zt)):
+            ax_phase.scatter(
+                latent_ref[t_idx, :, d0],
+                latent_ref[t_idx, :, d1],
+                c=[colors[t_idx]],
+                alpha=0.05,
+                s=3,
+                label=f"t={zt[t_idx]:.2f}" if row_idx == 0 and t_idx % 2 == 0 else None,
+            )
+
+        # Mean path
+        ax_phase.plot(
+            mu_sample[:, d0], mu_sample[:, d1],
+            'k-', linewidth=2, alpha=0.8, label='μ_t (mean path)'
+        )
+
+        # Sampled trajectories
+        n_traj_plot = min(10, traj_sample.shape[1])
+        for j in range(n_traj_plot):
+            ax_phase.plot(
+                traj_sample[:, j, d0], traj_sample[:, j, d1],
+                'r-', alpha=0.3, linewidth=0.5,
+                label='Sampled trajectories' if j == 0 else None
+            )
+
+        # Start and end points
+        ax_phase.scatter(mu_sample[0, d0], mu_sample[0, d1], c='green', s=100,
+                        marker='o', edgecolors='black', linewidths=1.5, label='z₀', zorder=10)
+        ax_phase.scatter(mu_sample[-1, d0], mu_sample[-1, d1], c='blue', s=100,
+                        marker='s', edgecolors='black', linewidths=1.5, label='z₁', zorder=10)
+
+        ax_phase.set_xlabel(f"Latent dim {d0}")
+        ax_phase.set_ylabel(f"Latent dim {d1}")
+        ax_phase.set_title(f"Sample {sample_idx}: Phase Plane")
+        ax_phase.grid(alpha=0.3)
+        if row_idx == 0:
+            ax_phase.legend(loc='best', fontsize=8)
+
+        # Plot 2: Dimension 0 vs time with uncertainty bands
+        ax_d0 = fig.add_subplot(gs[row_idx, 1])
+
+        # Mean path
+        ax_d0.plot(t_eval, mu_sample[:, d0], 'k-', linewidth=2, label='μ_t')
+
+        # Uncertainty bands (±1σ, ±2σ)
+        ax_d0.fill_between(
+            t_eval,
+            mu_sample[:, d0] - sigma_t,
+            mu_sample[:, d0] + sigma_t,
+            alpha=0.3, color='orange', label='±1σ'
+        )
+        ax_d0.fill_between(
+            t_eval,
+            mu_sample[:, d0] - 2*sigma_t,
+            mu_sample[:, d0] + 2*sigma_t,
+            alpha=0.15, color='orange', label='±2σ'
+        )
+
+        # Sampled trajectories
+        for j in range(n_traj_plot):
+            ax_d0.plot(
+                t_eval, traj_sample[:, j, d0],
+                'r-', alpha=0.1, linewidth=0.5,
+                label='Samples' if j == 0 else None
+            )
+
+        # Reference marginals
+        for t_idx, t_val in enumerate(zt):
+            ax_d0.axvline(t_val, color='gray', linestyle='--', alpha=0.3, linewidth=0.5)
+            # Plot reference distribution spread
+            ref_mean = latent_ref[t_idx, :, d0].mean()
+            ref_std = latent_ref[t_idx, :, d0].std()
+            ax_d0.errorbar(t_val, ref_mean, yerr=ref_std, fmt='o', color=colors[t_idx],
+                          markersize=5, capsize=3, alpha=0.7)
+
+        ax_d0.set_xlabel("Time t")
+        ax_d0.set_ylabel(f"Latent dim {d0}")
+        ax_d0.set_title(f"Sample {sample_idx}: Dim {d0} with Uncertainty")
+        ax_d0.grid(alpha=0.3)
+        ax_d0.legend(loc='best', fontsize=8)
+
+        # Plot 3: Dimension 1 vs time with uncertainty bands
+        ax_d1 = fig.add_subplot(gs[row_idx, 2])
+
+        # Mean path
+        ax_d1.plot(t_eval, mu_sample[:, d1], 'k-', linewidth=2, label='μ_t')
+
+        # Uncertainty bands
+        ax_d1.fill_between(
+            t_eval,
+            mu_sample[:, d1] - sigma_t,
+            mu_sample[:, d1] + sigma_t,
+            alpha=0.3, color='orange', label='±1σ'
+        )
+        ax_d1.fill_between(
+            t_eval,
+            mu_sample[:, d1] - 2*sigma_t,
+            mu_sample[:, d1] + 2*sigma_t,
+            alpha=0.15, color='orange', label='±2σ'
+        )
+
+        # Sampled trajectories
+        for j in range(n_traj_plot):
+            ax_d1.plot(
+                t_eval, traj_sample[:, j, d1],
+                'r-', alpha=0.1, linewidth=0.5,
+                label='Samples' if j == 0 else None
+            )
+
+        # Reference marginals
+        for t_idx, t_val in enumerate(zt):
+            ax_d1.axvline(t_val, color='gray', linestyle='--', alpha=0.3, linewidth=0.5)
+            ref_mean = latent_ref[t_idx, :, d1].mean()
+            ref_std = latent_ref[t_idx, :, d1].std()
+            ax_d1.errorbar(t_val, ref_mean, yerr=ref_std, fmt='o', color=colors[t_idx],
+                          markersize=5, capsize=3, alpha=0.7)
+
+        ax_d1.set_xlabel("Time t")
+        ax_d1.set_ylabel(f"Latent dim {d1}")
+        ax_d1.set_title(f"Sample {sample_idx}: Dim {d1} with Uncertainty")
+        ax_d1.grid(alpha=0.3)
+        ax_d1.legend(loc='best', fontsize=8)
+
+    plt.suptitle("Gaussian Conditional Flow Paths: p(y_t | z₀, z₁)", fontsize=14, y=0.995)
+
+    if save_path is not None:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"  Saved: {save_path}")
+    else:
+        plt.show()
+
+    plt.close(fig)
+
+
+def plot_uncertainty_bands(
+    *,
+    path_info: dict[str, np.ndarray],
+    t_eval: np.ndarray,
+    sample_indices: Sequence[int],
+    dims: tuple[int, int] = (0, 1),
+    save_path: Any | None = None,
+) -> None:
+    """Plot uncertainty bands evolution over time for multiple samples.
+
+    Shows how the Gaussian spread σ_t evolves over time and affects
+    different latent dimensions.
+    
+    Ported from mmsfm/viz.py.
+    """
+    from matplotlib.patches import Ellipse
+
+    mu_t = path_info['mu_t']  # (n_times, n_samples, latent_dim)
+    sigma_t = path_info['sigma_t']  # (n_times,)
+    d0, d1 = dims
+
+    n_samples = len(sample_indices)
+
+    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+
+    # Plot 1: σ_t over time
+    ax = axes[0, 0]
+    ax.plot(t_eval, sigma_t, 'b-', linewidth=2)
+    ax.fill_between(t_eval, 0, sigma_t, alpha=0.3, color='blue')
+    ax.set_xlabel("Time t")
+    ax.set_ylabel("σ_t")
+    ax.set_title("Noise Schedule σ(t)")
+    ax.grid(alpha=0.3)
+
+    # Plot 2: Mean path trajectories (dimension 0)
+    ax = axes[0, 1]
+    for sample_idx in sample_indices:
+        mu_sample = mu_t[:, sample_idx, :]
+        ax.plot(t_eval, mu_sample[:, d0], alpha=0.7, label=f"Sample {sample_idx}")
+        # Add uncertainty bands for first sample only (for clarity)
+        if sample_idx == sample_indices[0]:
+            ax.fill_between(
+                t_eval,
+                mu_sample[:, d0] - sigma_t,
+                mu_sample[:, d0] + sigma_t,
+                alpha=0.2, color='gray', label='±1σ band'
+            )
+    ax.set_xlabel("Time t")
+    ax.set_ylabel(f"μ_t (dim {d0})")
+    ax.set_title(f"Mean Paths: Dimension {d0}")
+    ax.legend(fontsize=8, loc='best')
+    ax.grid(alpha=0.3)
+
+    # Plot 3: Mean path trajectories (dimension 1)
+    ax = axes[1, 0]
+    for sample_idx in sample_indices:
+        mu_sample = mu_t[:, sample_idx, :]
+        ax.plot(t_eval, mu_sample[:, d1], alpha=0.7, label=f"Sample {sample_idx}")
+        # Add uncertainty bands for first sample only
+        if sample_idx == sample_indices[0]:
+            ax.fill_between(
+                t_eval,
+                mu_sample[:, d1] - sigma_t,
+                mu_sample[:, d1] + sigma_t,
+                alpha=0.2, color='gray', label='±1σ band'
+            )
+    ax.set_xlabel("Time t")
+    ax.set_ylabel(f"μ_t (dim {d1})")
+    ax.set_title(f"Mean Paths: Dimension {d1}")
+    ax.legend(fontsize=8, loc='best')
+    ax.grid(alpha=0.3)
+
+    # Plot 4: Phase plane with uncertainty ellipses at selected times
+    ax = axes[1, 1]
+    n_time_samples = 5
+    time_indices = np.linspace(0, len(t_eval) - 1, n_time_samples, dtype=int)
+
+    for i, t_idx in enumerate(time_indices):
+        t_val = t_eval[t_idx]
+        sigma_val = sigma_t[t_idx]
+        alpha_val = 0.3 - 0.05 * i  # Fade as time progresses
+
+        for sample_idx in sample_indices:
+            mu_sample = mu_t[t_idx, sample_idx, :]
+
+            # Plot mean position
+            ax.scatter(
+                mu_sample[d0], mu_sample[d1],
+                s=50, alpha=0.8, c=f"C{i}",
+                label=f"t={t_val:.2f}" if sample_idx == sample_indices[0] else None
+            )
+
+            # Plot uncertainty ellipse (assuming isotropic noise)
+            ellipse = Ellipse(
+                (mu_sample[d0], mu_sample[d1]),
+                width=2*sigma_val, height=2*sigma_val,
+                facecolor=f"C{i}", alpha=alpha_val, edgecolor='black', linewidth=0.5
+            )
+            ax.add_patch(ellipse)
+
+    ax.set_xlabel(f"Latent dim {d0}")
+    ax.set_ylabel(f"Latent dim {d1}")
+    ax.set_title("Phase Plane with Uncertainty Ellipses")
+    ax.legend(fontsize=8, loc='best')
+    ax.grid(alpha=0.3)
+    ax.set_aspect('equal', adjustable='datalim')
+
+    plt.suptitle("Uncertainty Band Evolution", fontsize=14)
+    plt.tight_layout()
+
+    if save_path is not None:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"  Saved: {save_path}")
+    else:
+        plt.show()
+
+    plt.close(fig)
+
