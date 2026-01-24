@@ -6,7 +6,10 @@ from matplotlib import (
 )
 from scipy.stats import scoreatpercentile
 import scprep
-import wandb
+try:
+    from wandb_compat import wandb  # type: ignore
+except ModuleNotFoundError:
+    from scripts.wandb_compat import wandb  # type: ignore
 
 # Import field visualization utilities
 try:
@@ -200,12 +203,20 @@ class Plotter():
             self, eval_losses_dict, title, legend=True, score=False
     ):
         ## plot eval losses on individual plots
-        fig, axs = plt.subplots(nrows=2, ncols=3, figsize=(3*8 + 2, 2*8 + 1))
+        n_metrics = len(eval_losses_dict)
+        nrows = 2 if n_metrics > 1 else 1
+        ncols = max(1, (n_metrics + nrows - 1) // nrows)
+        fig, axs = plt.subplots(
+            nrows=nrows,
+            ncols=ncols,
+            figsize=(ncols * 8 + 2, nrows * 8 + 1),
+        )
         fig.suptitle(title, fontsize=24)
+        axs = np.asarray(axs).reshape(nrows, ncols)
 
         for k, (loss_name, losses) in enumerate(eval_losses_dict.items()):
-            i, j = divmod(k, 2)
-            ax = axs[j, i]  ## use j, i instead of i, j to iterate over columns from left to right
+            i, j = divmod(k, nrows)
+            ax = axs[j, i]  ## use j, i instead of i, j to iterate cols from left to right
             ax.set_title(loss_name, fontsize=20)
             ax.set_xlabel('Marginals')
             ax.set_ylabel('Loss')
@@ -216,6 +227,11 @@ class Plotter():
                 0.5, 0.1, _txt, bbox={'facecolor':'w', 'alpha':0.5, 'pad':5},
                 transform=ax.transAxes, ha='center', fontsize=16
             )
+
+        # Hide any unused subplots
+        for k in range(n_metrics, nrows * ncols):
+            i, j = divmod(k, nrows)
+            axs[j, i].axis('off')
 
         fig.tight_layout()
 
@@ -239,14 +255,21 @@ class Plotter():
     def plot_traj_loss_epochs(
             self, eval_losses_dict, M, title, legend=True, score=False
     ):
+        n_metrics = len(eval_losses_dict)
+        nrows = 2 if n_metrics > 1 else 1
+        ncols = max(1, (n_metrics + nrows - 1) // nrows)
         for m in range(M):
-            fig, axs = plt.subplots(nrows=2, ncols=3, figsize=(3*8 + 2, 2*8 + 1))
+            fig, axs = plt.subplots(
+                nrows=nrows,
+                ncols=ncols,
+                figsize=(ncols * 8 + 2, nrows * 8 + 1),
+            )
             fig.suptitle(title, fontsize=24)
+            axs = np.asarray(axs).reshape(nrows, ncols)
 
             for k, (loss_name, losses) in enumerate(eval_losses_dict.items()):
-                i, j = divmod(k, 2)
-                ## use j, i instead of i, j to iterate cols from left to right
-                ax = axs[j, i]
+                i, j = divmod(k, nrows)
+                ax = axs[j, i]  ## use j, i instead of i, j to iterate cols from left to right
                 ax.set_title(loss_name, fontsize=20)
                 ax.set_xlabel('Epochs')
                 ax.set_ylabel('Loss')
@@ -254,6 +277,11 @@ class Plotter():
                 xticks = np.arange(1, n_epochs+1).astype(int)
                 ax.set_xticks(xticks)
                 ax.plot(xticks, losses[:, m])
+
+            # Hide any unused subplots
+            for k in range(n_metrics, nrows * ncols):
+                i, j = divmod(k, nrows)
+                axs[j, i].axis('off')
 
             fig.tight_layout()
 

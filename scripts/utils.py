@@ -30,7 +30,10 @@ except ImportError as e:
     def make_dyngen_data(*args, **kwargs):
         raise ImportError("MIOFlow not available")
 
-import wandb
+try:
+    from wandb_compat import wandb  # type: ignore
+except ModuleNotFoundError:
+    from scripts.wandb_compat import wandb  # type: ignore
 
 
 class IndexableScaler(ABC):
@@ -446,4 +449,3 @@ def get_run_id(entity, project, run_name):
         run_id = runs[0].id
 
     return run_id
-
