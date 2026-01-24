@@ -11,24 +11,40 @@ from sklearn.preprocessing import (
     MinMaxScaler,
 )
 
-# MIOFlow imports - conditionally imported to avoid numpy compatibility issues
-try:
-    from MIOFlow.utils import group_extract  # type: ignore
-    from MIOFlow.datasets import (           # type: ignore
-        make_diamonds,    ## petals
-        make_dyngen_data  ## dyngen
-    )
-    MIOFLOW_AVAILABLE = True
-except ImportError as e:
-    print(f"Warning: MIOFlow not available due to: {e}")
-    MIOFLOW_AVAILABLE = False
-    # Define dummy functions to avoid NameError
-    def group_extract(*args, **kwargs):
-        raise ImportError("MIOFlow not available")
-    def make_diamonds(*args, **kwargs):
-        raise ImportError("MIOFlow not available")
-    def make_dyngen_data(*args, **kwargs):
-        raise ImportError("MIOFlow not available")
+# MIOFlow imports (optional)
+#
+# Importing MIOFlow can fail in some environments due to optional dependency
+# issues (scanpy/numba caching, etc). Most of this repo doesn't need MIOFlow at
+# import time, so we only import it lazily when a MIOFlow-backed dataset is
+# requested.
+MIOFLOW_AVAILABLE = None  # unknown until first use
+
+
+def _init_mioflow():
+    global MIOFLOW_AVAILABLE, group_extract, make_diamonds, make_dyngen_data
+    if MIOFLOW_AVAILABLE is not None:
+        return
+    try:
+        from MIOFlow.utils import group_extract as _group_extract  # type: ignore
+        from MIOFlow.datasets import make_diamonds as _make_diamonds  # type: ignore
+        from MIOFlow.datasets import make_dyngen_data as _make_dyngen_data  # type: ignore
+
+        group_extract = _group_extract
+        make_diamonds = _make_diamonds
+        make_dyngen_data = _make_dyngen_data
+        MIOFLOW_AVAILABLE = True
+    except Exception as e:  # pragma: no cover
+        MIOFLOW_AVAILABLE = False
+
+        def group_extract(*args, **kwargs):  # type: ignore[no-redef]
+            raise ImportError("MIOFlow not available") from e
+
+        def make_diamonds(*args, **kwargs):  # type: ignore[no-redef]
+            raise ImportError("MIOFlow not available") from e
+
+        def make_dyngen_data(*args, **kwargs):  # type: ignore[no-redef]
+            raise ImportError("MIOFlow not available") from e
+
 
 try:
     from wandb_compat import wandb  # type: ignore
@@ -212,6 +228,7 @@ def load_data(dataname):
     testdatalabels = None
     margtimes = None
     if dataname == 'petals':
+        _init_mioflow()
         if not MIOFLOW_AVAILABLE:
             raise ImportError("MIOFlow required for 'petals' dataset but not available")
         petals = make_diamonds()
@@ -222,6 +239,7 @@ def load_data(dataname):
         testdata = data
 
     elif dataname == 'dyngen':
+        _init_mioflow()
         if not MIOFLOW_AVAILABLE:
             raise ImportError("MIOFlow required for 'dyngen' dataset but not available")
         dyngen = make_dyngen_data(phate_dims=5)
