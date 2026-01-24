@@ -275,7 +275,11 @@ if __name__ == '__main__':
                     help='Weight applied to the score-matching loss (SB only)')
         parser.add_argument('--flow_param', type=str, default='velocity',
                     choices=['velocity', 'x_pred'],
-                    help='Velocity parameterization (direct velocity or x-pred dynamic v-loss)')
+                    help='Velocity parameterization (direct velocity or mean-path x-pred).')
+        parser.add_argument('--xpred_ratio_clip', type=float, default=None,
+                    help='Optional symmetric clamp on |dot_sigma/sigma| used inside mean-path x-pred->velocity conversion.')
+        parser.add_argument('--xpred_dt', type=float, default=1e-3,
+                    help='Deprecated (ignored): mean-path x-pred uses autograd ∂_t x̂.')
         parser.add_argument('--min_sigma_ratio', type=float, default=1e-4,
                     help='Minimum |dot_sigma/sigma| clamp for x-pred flow loss')
         parser.add_argument('--zt', type=float, nargs='+')

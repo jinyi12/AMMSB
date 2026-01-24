@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING, Optional
 import numpy as np
 
 if TYPE_CHECKING:
-    from tran_inclusions.interpolation import InterpolationResult
+    from mmsfm.types import LatentInterpolationResult as InterpolationResult
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -335,7 +335,7 @@ def compute_bandwidths_and_epsilons(
         semigroup_df: DataFrame with semigroup error metrics
     """
     from diffmap.diffusion_maps import select_epsilons_by_semigroup
-    from tran_inclusions.data_prep import compute_bandwidth_statistics
+    from mmsfm.data_utils import compute_bandwidth_statistics
 
     bandwidth_stats = compute_bandwidth_statistics(frames)
     base_epsilons = bandwidth_stats["median"]
@@ -902,7 +902,7 @@ def compute_interpolation(
     Returns:
         InterpolationBundle with dense trajectories
     """
-    from tran_inclusions.interpolation import build_dense_latent_trajectories
+    from mmsfm.interpolation import build_dense_latent_trajectories
 
     # Reconstruct traj_result-like object for build_dense_latent_trajectories
     # It needs .left_singular_vectors, .singular_values, .stationary_distributions, .A_operators
