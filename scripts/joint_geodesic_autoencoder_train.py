@@ -83,7 +83,7 @@ from scripts.pca_precomputed_utils import (
     load_selected_embeddings,
 )
 from scripts.time_stratified_scaler import DistanceCurveScaler
-from scripts.utils import build_zt, get_device, set_up_exp
+from scripts.utils import build_zt, get_device, set_up_exp, log_cli_metadata_to_wandb
 from mmsfm.psi_provider import PsiProvider
 
 # Import refactored utility functions
@@ -1609,6 +1609,7 @@ def main() -> None:
         name=args.run_name,
         resume="allow",
     )
+    log_cli_metadata_to_wandb(run, args, outdir=outdir)
     print("WandB initialized")
 
     print(f"\nStarting training: {args.epochs} epochs x {args.steps_per_epoch} steps")

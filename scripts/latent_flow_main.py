@@ -46,7 +46,7 @@ from scripts.wandb_compat import wandb
 from mmsfm.geodesic_ae import GeodesicAutoencoder
 from mmsfm.ode_diffeo_ae import NeuralODEIsometricDiffeomorphismAutoencoder, ODESolverConfig
 from scripts.noise_schedules import ExponentialContractingMiniFlowSchedule
-from scripts.utils import build_zt, get_device, set_up_exp
+from scripts.utils import build_zt, get_device, set_up_exp, log_cli_metadata_to_wandb
 from scripts.pca_precomputed_utils import load_pca_data
 
 from mmsfm.latent_flow.matcher import LatentFlowMatcher
@@ -932,6 +932,7 @@ def main() -> None:
         name=args.run_name,
         resume="allow",
     )
+    log_cli_metadata_to_wandb(run, args, outdir=outdir)
     agent.set_run(run)
 
     # Train
