@@ -35,3 +35,5 @@ wandb/
 *.out
 
 *.nfs*
+
+*figures/
