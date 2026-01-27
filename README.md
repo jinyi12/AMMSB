@@ -49,6 +49,34 @@ The result is a single, continuous model of the system's dynamics that can gener
 └── .gitignore
 ```
 
+## Latent-Space MSBM (Experimental)
+
+This repo also includes an experimental latent-space implementation of multi-marginal Schrödinger Bridge Matching (MSBM) that alternates training forward/backward policies with Brownian bridge sampling.
+
+- Entry point: `scripts/latent_msbm_main.py`
+- Evaluation/visualization: `scripts/latent_msbm_eval.py`
+- Core implementation: `mmsfm/latent_msbm/`
+
+Example (using the same cache conventions as `scripts/latent_flow_main.py`):
+
+```bash
+python scripts/latent_msbm_main.py \
+  --data_path data/tran_inclusions.npz \
+  --ae_checkpoint results/joint_ae/geodesic_autoencoder_best.pth \
+  --use_cache_data --selected_cache_path data/cache_pca_precomputed/tran_inclusions/tc_selected_embeddings.pkl
+```
+
+Evaluate W2 and generate forward/backward SDE rollouts + plots:
+
+```bash
+python scripts/latent_msbm_eval.py \
+  --msbm_dir results/<run_dir> \
+  --save_dense --dense_stride 10 \
+  --conditional
+```
+
+`scripts/latent_msbm_eval.py` reads `results/<run_dir>/args.txt` when available (so you can typically omit `--data_path` and `--ae_checkpoint`).
+
 ## Setup and Installation
 
 1.  **Clone the repository:**
