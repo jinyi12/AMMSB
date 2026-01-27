@@ -1,5 +1,10 @@
 import datetime
 import os
+import sys
+import json
+import platform
+import shlex
+import subprocess
 import time
 from abc import ABC, abstractmethod
 
@@ -363,7 +368,143 @@ def set_up_exp(args):
                 v = np.round(v, decimals=4).tolist()
             f.write(f'{k: <27} = {v}\n')
 
+    # Also save a machine-readable snapshot (and the exact CLI invocation).
+    meta = _collect_cli_metadata()
+    payload = {
+        "args": _to_jsonable(vars(args)),
+        "meta": meta,
+    }
+    with open(f"{outdir}/args.json", "w") as f:
+        json.dump(payload, f, indent=2, sort_keys=True)
+
+    with open(f"{outdir}/command.txt", "w") as f:
+        f.write(meta.get("command", "") + "\n")
+        f.write(f"cwd: {meta.get('cwd', '')}\n")
+        f.write(f"hostname: {meta.get('hostname', '')}\n")
+        git = meta.get("git", {})
+        if isinstance(git, dict):
+            f.write(f"git_commit: {git.get('commit', '')}\n")
+            f.write(f"git_dirty: {git.get('dirty', '')}\n")
+
     return outdir
+
+
+def log_cli_metadata_to_wandb(run, args, outdir=None, extra=None):
+    """Persist CLI args + run metadata into W&B config.
+
+    This is intentionally defensive: it no-ops if `wandb` is unavailable
+    (e.g., when using `scripts.wandb_compat`).
+    """
+    if run is None:
+        return
+
+    # The real wandb Run has `.config.update`; our no-op fallback does not.
+    cfg = getattr(run, "config", None)
+    if cfg is None or not hasattr(cfg, "update"):
+        return
+
+    meta = _collect_cli_metadata()
+    if outdir is not None:
+        meta = dict(meta)
+        meta["outdir"] = str(outdir)
+
+    update = {
+        "args": _to_jsonable(vars(args)),
+        "meta": meta,
+    }
+    if extra is not None:
+        update["extra"] = _to_jsonable(extra)
+
+    try:
+        cfg.update(update, allow_val_change=True)
+    except TypeError:
+        # Older wandb versions may not accept allow_val_change in this context.
+        cfg.update(update)
+
+
+def _to_jsonable(obj):
+    """Best-effort conversion to JSON-serializable types."""
+    if obj is None or isinstance(obj, (str, int, float, bool)):
+        return obj
+
+    # pathlib.Path
+    try:
+        from pathlib import Path
+
+        if isinstance(obj, Path):
+            return str(obj)
+    except Exception:
+        pass
+
+    # numpy scalars/arrays
+    try:
+        import numpy as _np
+
+        if isinstance(obj, _np.generic):
+            return obj.item()
+        if isinstance(obj, _np.ndarray):
+            if obj.size <= 256:
+                return obj.tolist()
+            return {
+                "__ndarray__": True,
+                "shape": list(obj.shape),
+                "dtype": str(obj.dtype),
+            }
+    except Exception:
+        pass
+
+    # torch scalars
+    try:
+        import torch as _torch
+
+        if isinstance(obj, _torch.Tensor):
+            if obj.numel() <= 256:
+                return obj.detach().cpu().tolist()
+            return {
+                "__tensor__": True,
+                "shape": list(obj.shape),
+                "dtype": str(obj.dtype),
+            }
+    except Exception:
+        pass
+
+    if isinstance(obj, dict):
+        return {str(k): _to_jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple, set)):
+        return [_to_jsonable(v) for v in obj]
+
+    # Fallback
+    return str(obj)
+
+
+def _collect_cli_metadata():
+    """Collect lightweight run metadata for reproducibility."""
+    try:
+        command = shlex.join(sys.argv)
+    except Exception:
+        command = " ".join(shlex.quote(a) for a in sys.argv)
+
+    meta = {
+        "command": command,
+        "argv": list(sys.argv),
+        "cwd": os.getcwd(),
+        "timestamp": datetime.datetime.now().isoformat(),
+        "hostname": platform.node(),
+        "python": sys.version,
+    }
+
+    # Git info (best-effort, safe if not in a git repo).
+    try:
+        commit = subprocess.check_output(["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL).decode().strip()
+        status = subprocess.check_output(["git", "status", "--porcelain"], stderr=subprocess.DEVNULL).decode()
+        meta["git"] = {
+            "commit": commit,
+            "dirty": bool(status.strip()),
+        }
+    except Exception:
+        meta["git"] = None
+
+    return meta
 
 
 def update_eval_losses_dict(acc, curr):

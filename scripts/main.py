@@ -18,7 +18,8 @@ from utils import (
     timer_func,
     update_eval_losses_dict,
     write_eval_losses,
-    get_run_id
+    get_run_id,
+    log_cli_metadata_to_wandb,
 )
 
 import wandb
@@ -248,12 +249,13 @@ def main():
         entity=entity,
         project=project,
         group=group,
-        config=args,  # type: ignore
+        config=vars(args),
         mode=wandb_mode,
         id=run_id,
         name=run_name,
         resume='allow'
     )
+    log_cli_metadata_to_wandb(run, args, outdir=outdir)
     agent.set_run(run)
 
     ### Training

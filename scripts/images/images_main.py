@@ -1,5 +1,10 @@
 import argparse
 import os
+import sys
+import json
+import platform
+import shlex
+import subprocess
 from time import (
     sleep,
 )
@@ -11,6 +16,8 @@ from torch.cuda import (
     get_device_properties as cuda_get_device_properties
 )
 import wandb
+
+from scripts.utils import log_cli_metadata_to_wandb
 
 from scripts.images import (
     images_train,
@@ -42,6 +49,34 @@ def set_up_exp(args):
             if k == 'zt':
                 v = np.round(v, decimals=4).tolist()
             f.write(f'{k: <27} = {v}\n')
+
+    # Also save a machine-readable snapshot and the exact CLI invocation.
+    try:
+        command = shlex.join(sys.argv)
+    except Exception:
+        command = " ".join(shlex.quote(a) for a in sys.argv)
+
+    meta = {
+        "command": command,
+        "argv": list(sys.argv),
+        "cwd": os.getcwd(),
+        "timestamp": datetime.datetime.now().isoformat(),
+        "hostname": platform.node(),
+        "python": sys.version,
+    }
+    try:
+        commit = subprocess.check_output(["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL).decode().strip()
+        status = subprocess.check_output(["git", "status", "--porcelain"], stderr=subprocess.DEVNULL).decode()
+        meta["git"] = {"commit": commit, "dirty": bool(status.strip())}
+    except Exception:
+        meta["git"] = None
+
+    with open(f"{args.outdir}/args.json", "w") as f:
+        json.dump({"args": vars(args), "meta": meta}, f, indent=2, sort_keys=True)
+    with open(f"{args.outdir}/command.txt", "w") as f:
+        f.write(command + "\n")
+        f.write(f"cwd: {meta.get('cwd', '')}\n")
+        f.write(f"hostname: {meta.get('hostname', '')}\n")
 
     ## if resubmit flag from previous call exists, remove it
     resubmitflag = os.path.join(args.outdir, RESUBMITFILE)
@@ -273,12 +308,13 @@ def main():
         entity=args.entity,
         project=args.project,
         group=args.group,
-        config=args,  # type: ignore
+        config=vars(args),
         mode=args.wandb_mode,
         id=run_id,
         name=args.run_name,
         resume='allow'
     )
+    log_cli_metadata_to_wandb(run, args, outdir=args.outdir)
     ## update run_id variable if necessary
     run_id = run.id
 

@@ -26,7 +26,8 @@ from utils import (
     timer_func,
     update_eval_losses_dict,
     write_eval_losses,
-    get_run_id
+    get_run_id,
+    log_cli_metadata_to_wandb,
 )
 from diffmap.diffusion_maps import (
     time_coupled_diffusion_map,
@@ -465,12 +466,13 @@ if __name__ == '__main__':
             entity=args.entity,
             project=args.project,
             group=args.group,
-            config=args,
+            config=vars(args),
             mode=args.wandb_mode,
             id=run_id,
             name=args.run_name,
             resume='allow'
         )
+        log_cli_metadata_to_wandb(run, args, outdir=outdir)
         agent.set_run(run)
 
         ### Training
