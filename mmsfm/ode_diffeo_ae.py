@@ -265,29 +265,64 @@ class NeuralODEDiffeomorphism(nn.Module):
         if self.solver.max_num_steps is not None:
             options['max_num_steps'] = int(self.solver.max_num_steps)
 
-        if bool(self.solver.use_adjoint):
-            adj_rtol = float(self.solver.adjoint_rtol) if self.solver.adjoint_rtol is not None else float(self.solver.rtol)
-            adj_atol = float(self.solver.adjoint_atol) if self.solver.adjoint_atol is not None else float(self.solver.atol)
-            return _odeint_adjoint(  # type: ignore[misc]
+        def _run_torchdiffeq(*, method: str, step_size: Optional[float]) -> Tensor:
+            local_options = dict(options)
+            if step_size is not None:
+                local_options["step_size"] = float(step_size)
+            local_options = local_options if local_options else None
+
+            if bool(self.solver.use_adjoint):
+                adj_rtol = (
+                    float(self.solver.adjoint_rtol) if self.solver.adjoint_rtol is not None else float(self.solver.rtol)
+                )
+                adj_atol = (
+                    float(self.solver.adjoint_atol) if self.solver.adjoint_atol is not None else float(self.solver.atol)
+                )
+                return _odeint_adjoint(  # type: ignore[misc]
+                    func,
+                    y0,
+                    ts,
+                    rtol=float(self.solver.rtol),
+                    atol=float(self.solver.atol),
+                    method=str(method),
+                    adjoint_rtol=adj_rtol,
+                    adjoint_atol=adj_atol,
+                    options=local_options,
+                )
+            return _odeint(  # type: ignore[misc]
                 func,
                 y0,
                 ts,
                 rtol=float(self.solver.rtol),
                 atol=float(self.solver.atol),
-                method=str(self.solver.method),
-                adjoint_rtol=adj_rtol,
-                adjoint_atol=adj_atol,
-                options=options if options else None,
+                method=str(method),
+                options=local_options,
             )
-        return _odeint(  # type: ignore[misc]
-            func,
-            y0,
-            ts,
-            rtol=float(self.solver.rtol),
-            atol=float(self.solver.atol),
-            method=str(self.solver.method),
-            options=options if options else None,
-        )
+
+        try:
+            return _run_torchdiffeq(method=str(self.solver.method), step_size=self.solver.step_size)
+        except AssertionError as e:
+            # torchdiffeq adaptive solvers can fail with "underflow in dt 0.0" for stiff
+            # or out-of-distribution states. For inference/eval this is usually better
+            # handled by falling back to a fixed-step integrator.
+            if "underflow in dt" not in str(e):
+                raise
+
+            fallback_step: float
+            if self.solver.step_size is not None and float(self.solver.step_size) > 0:
+                fallback_step = float(self.solver.step_size)
+            elif self.solver.max_num_steps is not None and int(self.solver.max_num_steps) > 0:
+                fallback_step = 1.0 / float(int(self.solver.max_num_steps))
+            else:
+                fallback_step = 1.0 / 32.0
+
+            try:
+                return _run_torchdiffeq(method="rk4", step_size=fallback_step)
+            except Exception as e2:  # pragma: no cover
+                raise RuntimeError(
+                    "torchdiffeq failed with an adaptive-step underflow, and fixed-step fallback also failed. "
+                    "Consider evaluating with a larger `ode_step_size`, looser tolerances, or a different AE."
+                ) from e2
 
     def forward_map(self, x: Tensor, t: Tensor) -> Tensor:
         """Compute φ_t(x) (centered output, i.e. in R^d coordinates)."""
