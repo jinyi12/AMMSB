@@ -17,23 +17,6 @@ __all__ = [
     'fit_coordinate_splines',
     'evaluate_coordinate_splines',
     'CoordinateSplineWindow',
-    'compute_latent_harmonics',
-    'GeometricHarmonicsModel',
-    'SpatioTemporalGeometricHarmonicsModel',
-    'fit_geometric_harmonics',
-    'fit_spatiotemporal_geometric_harmonics',
-    'nystrom_extension',
-    'spatiotemporal_nystrom_extension',
-    'geometric_harmonics_lift',
-    'geometric_harmonics_lift_local',
-    'spatiotemporal_geometric_harmonics_lift',
-    'geometric_harmonics_diagnostics',
-    'TimeCoupledGeometricHarmonicsModel',
-    'fit_time_coupled_geometric_harmonics',
-    'time_coupled_nystrom_extension',
-    'select_bandwidth_semigroup_error_intrinsic',
-    'time_coupled_geometric_harmonics_lift',
-    'time_coupled_geometric_harmonics_diagnostics',
     'TimeCoupledDiffusionMapResult',
     'TimeCoupledTrajectoryResult',
     'time_coupled_diffusion_map',
@@ -90,27 +73,6 @@ import jax.numpy as jnp
 from .distance import CuPyDistanceMixin, JAXDistanceMixin
 from .kernels import exponential_kernel
 from .utils import guess_spatial_scale
-from .geometric_harmonics import (
-    GeometricHarmonicsModel,
-    compute_latent_harmonics,
-    fit_geometric_harmonics,
-    geometric_harmonics_lift,
-    geometric_harmonics_lift_local,
-    geometric_harmonics_diagnostics,
-    nystrom_extension,
-)
-from .geometric_harmonics_archive import (
-    TimeCoupledGeometricHarmonicsModel,
-    SpatioTemporalGeometricHarmonicsModel,
-    spatiotemporal_nystrom_extension,
-    fit_spatiotemporal_geometric_harmonics,
-    spatiotemporal_geometric_harmonics_lift,
-    time_coupled_nystrom_extension,
-    fit_time_coupled_geometric_harmonics,
-    time_coupled_geometric_harmonics_lift,
-    time_coupled_geometric_harmonics_diagnostics,
-    select_bandwidth_semigroup_error_intrinsic,
-)
 
 
 DEFAULT_ALPHA: float = 1.0  # Renormalization exponent.
@@ -2301,8 +2263,4 @@ def select_non_harmonic_coordinates(
 
     intrinsic = coords[:, mask]
     return intrinsic, mask, residuals
-
-
-
-# Geometric harmonics utilities are defined in diffmap.geometric_harmonics.
 # This module re-exports them via imports near the top of the file.
