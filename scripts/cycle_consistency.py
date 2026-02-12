@@ -167,6 +167,7 @@ def cycle_pairwise_losses(
     dist_mode: str,
     min_ref_dist: float,
     gm_weight: float,
+    gm_normalization: str = "paper",
     eps: float,
 ) -> tuple[Tensor, Tensor, Tensor]:
     """Compute cycle consistency + distance/GM losses for intermediate-time embeddings.
@@ -251,6 +252,15 @@ def cycle_pairwise_losses(
             loss_gm = torch.tensor(0.0, device=device, dtype=loss_cycle.dtype)
         else:
             loss_gm = graph_matching_loss_from_distance_matrices(d_pred, d_ref)
+            gm_normalization_eff = (gm_normalization or "paper").lower().strip()
+            if gm_normalization_eff not in {"paper", "n_pairs"}:
+                raise ValueError(
+                    f"Unknown gm_normalization '{gm_normalization}'. Use 'paper' or 'n_pairs'."
+                )
+            if gm_normalization_eff == "n_pairs":
+                n = int(d_ref.shape[0])
+                if n >= 2:
+                    loss_gm = loss_gm / float(n * (n - 1))
 
     return loss_cycle, loss_dist, loss_gm
 

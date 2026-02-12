@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -236,6 +237,7 @@ class LatentMSBMAgent:
         log_interval: int = 50,
         rolling_window: int = 200,
         outdir: Optional[Path] = None,
+        stage_callback: Callable[[int, Direction, "LatentMSBMAgent"], None] | None = None,
     ) -> list[MSBMTrainStats]:
         if self.coupling_sampler is None:
             raise RuntimeError("Call encode_marginals() before train().")
@@ -423,6 +425,9 @@ class LatentMSBMAgent:
                     },
                     step=self.step_counter,
                 )
+
+            if stage_callback is not None:
+                stage_callback(int(stage), direction, self)
 
         return stats
 

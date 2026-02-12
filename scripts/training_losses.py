@@ -353,6 +353,7 @@ def pairwise_losses_all_pairs(
     eps: float = 1e-8,
     stable: bool = True,
     clamp_gm: bool = True,
+    gm_normalization: str = "paper",
 ) -> tuple[Tensor, Tensor]:
     """Compute both distance loss and graph matching loss from embedding pairs.
 
@@ -370,6 +371,9 @@ def pairwise_losses_all_pairs(
         eps: Numerical stability constant for distance loss.
         stable: If True, uses stable distance matrix computation (see pairwise_distance_matrix).
         clamp_gm: If True, clamps errors in GM loss for numerical stability.
+        gm_normalization: How to normalize the graph matching loss. One of:
+            - "paper": Use the paper form (1/n sum over i and j≠i), which scales ~O(n^2).
+            - "n_pairs": Further divide by n(n-1) to make it roughly invariant to batch size.
 
     Returns:
         Tuple of (distance_loss, graph_matching_loss). Each is 0 if corresponding weight is 0.
@@ -400,6 +404,15 @@ def pairwise_losses_all_pairs(
     if float(gm_weight) == 0.0:
         loss_gm = torch.tensor(0.0, device=y_pred.device, dtype=loss_dist.dtype)
     else:
+        gm_normalization_eff = (gm_normalization or "paper").lower().strip()
+        if gm_normalization_eff not in {"paper", "n_pairs"}:
+            raise ValueError(
+                f"Unknown gm_normalization '{gm_normalization}'. Use 'paper' or 'n_pairs'."
+            )
         loss_gm = graph_matching_loss_from_distance_matrices(d_pred, d_ref, clamp=clamp_gm)
+        if gm_normalization_eff == "n_pairs":
+            n = int(d_ref.shape[0])
+            if n >= 2:
+                loss_gm = loss_gm / float(n * (n - 1))
 
     return loss_dist, loss_gm

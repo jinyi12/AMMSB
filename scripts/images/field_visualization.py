@@ -112,8 +112,18 @@ def _save_and_log_figure(
             save_kwargs["dpi"] = dpi
         fig.savefig(f"{base_path}.{ext}", **save_kwargs)
 
-    if run is not None and wandb is not None and wandb_key is not None:
-        run.log({wandb_key: wandb.Image(data_or_path=f"{base_path}.png", mode="RGB")})
+    if (
+        run is not None
+        and wandb is not None
+        and wandb_key is not None
+        and hasattr(run, "log")
+        and hasattr(wandb, "Image")
+    ):
+        try:
+            run.log({wandb_key: wandb.Image(data_or_path=f"{base_path}.png", mode="RGB")})
+        except Exception:
+            # WandB is an optional dependency and may be partially installed.
+            return
 
 
 def _save_and_log_animation(
@@ -128,8 +138,17 @@ def _save_and_log_animation(
     _ensure_dir(outdir)
     ani.save(path, writer="imagemagick", fps=fps)
 
-    if run is not None and wandb is not None and wandb_key is not None:
-        run.log({wandb_key: wandb.Video(data_or_path=path, format="gif")})
+    if (
+        run is not None
+        and wandb is not None
+        and wandb_key is not None
+        and hasattr(run, "log")
+        and hasattr(wandb, "Video")
+    ):
+        try:
+            run.log({wandb_key: wandb.Video(data_or_path=path, format="gif")})
+        except Exception:
+            return
 
 
 def _select_time_indices(num_steps: int, target_steps: int) -> np.ndarray:
@@ -1777,4 +1796,3 @@ def plot_uncertainty_bands(
         plt.show()
 
     plt.close(fig)
-

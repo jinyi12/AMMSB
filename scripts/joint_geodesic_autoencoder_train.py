@@ -245,6 +245,7 @@ def train_joint_autoencoder(
     recon_weight: float,
     dist_mode: str,
     min_ref_dist: float,
+    gm_normalization: str = "paper",
     dist_space: str = "latent",
     max_grad_norm: float,
     run,
@@ -436,6 +437,7 @@ def train_joint_autoencoder(
                         min_ref_dist=float(min_ref_dist),
                         gm_weight=float(gm_weight),
                         eps=1e-8,
+                        gm_normalization=str(gm_normalization),
                     )
                     loss_dist_accum = loss_dist_accum + loss_dist_t
                     loss_gm_accum = loss_gm_accum + loss_gm_t
@@ -503,6 +505,7 @@ def train_joint_autoencoder(
                     dist_mode=dist_mode,
                     min_ref_dist=float(min_ref_dist),
                     gm_weight=float(cycle_gm_weight),
+                    gm_normalization=str(gm_normalization),
                     eps=1e-8,
                 )
                 
@@ -849,8 +852,23 @@ def main() -> None:
         "--dist_mode",
         type=str,
         default="mse",
-        choices=["mse"],
-        help="Distance loss form (fixed): MSE(d_pred, d_ref) over all pairs.",
+        choices=["mse", "relative", "normalized_mse"],
+        help=(
+            "Distance loss form. "
+            "'mse' matches distances; 'relative' matches relative error (scale-invariant); "
+            "'normalized_mse' normalizes by mean reference distance."
+        ),
+    )
+    parser.add_argument(
+        "--gm_normalization",
+        type=str,
+        default="paper",
+        choices=["paper", "n_pairs"],
+        help=(
+            "Graph matching loss normalization. "
+            "'paper' uses the O(n^2)-scaling paper form; "
+            "'n_pairs' further divides by n(n-1) to reduce batch-size dependence."
+        ),
     )
     parser.add_argument(
         "--min_ref_dist",
@@ -1649,6 +1667,7 @@ def main() -> None:
         recon_weight=args.recon_weight,
         dist_mode=args.dist_mode,
         min_ref_dist=args.min_ref_dist,
+        gm_normalization=args.gm_normalization,
         dist_space=args.dist_space,
         max_grad_norm=args.max_grad_norm,
         run=run,

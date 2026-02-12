@@ -31,6 +31,7 @@ from mmsfm.ode_diffeo_ae import (
     NeuralODEIsometricDiffeomorphismAutoencoder,
     ODESolverConfig,
 )
+from mmsfm.ode_diffeo_ae_time_invariant import TimeInvariantNeuralODEDiffeomorphismAutoencoder
 from mmsfm.latent_msbm import LatentMSBMAgent
 from mmsfm.latent_msbm.noise_schedule import ConstantSigmaSchedule, ExponentialContractingSigmaSchedule
 
@@ -329,15 +330,16 @@ def load_autoencoder(
     ambient_dim = config.get("ambient_dim")
     if ambient_dim is None:
         ambient_dim = ckpt.get("ambient_dim")
+    
+    # For diffeo AEs, prioritize diffeo.mu for ambient_dim as it's most reliable
+    if ambient_dim is None and "diffeo.mu" in state_dict:
+        ambient_dim = state_dict["diffeo.mu"].shape[1]
 
     latent_dim = config.get("latent_dim")
     if latent_dim is None:
         latent_dim = ckpt.get("latent_dim")
     if latent_dim is None:
         latent_dim = ckpt.get("ref_latent_dim")
-
-    if ambient_dim is None and "diffeo.mu" in state_dict:
-        ambient_dim = state_dict["diffeo.mu"].shape[1]
 
     if latent_dim is None:
         if latent_dim_override is not None:
@@ -385,8 +387,16 @@ def load_autoencoder(
             if vf_weight0 is not None and ambient_dim is not None:
                 in_features = int(vf_weight0.shape[1])
                 time_emb_dim = in_features - int(ambient_dim)
-                if time_emb_dim > 0 and time_emb_dim % 2 == 0:
+                if time_emb_dim >= 0 and time_emb_dim % 2 == 0:
                     n_freqs = int(time_emb_dim // 2)
+                else:
+                    # Fallback: try to infer ambient_dim from diffeo.mu if time_emb_dim is inconsistent
+                    if "diffeo.mu" in state_dict:
+                        inferred_ambient = int(state_dict["diffeo.mu"].shape[1])
+                        time_emb_dim = in_features - inferred_ambient
+                        if time_emb_dim >= 0 and time_emb_dim % 2 == 0:
+                            ambient_dim = inferred_ambient
+                            n_freqs = int(time_emb_dim // 2)
 
             vf_weight_keys = []
             for k in state_dict.keys():
@@ -433,13 +443,22 @@ def load_autoencoder(
                 f"Found: ambient_dim={ambient_dim}, latent_dim={latent_dim}"
             )
 
-        autoencoder = NeuralODEIsometricDiffeomorphismAutoencoder(
-            ambient_dim=int(ambient_dim),
-            latent_dim=int(latent_dim),
-            vector_field_hidden=list(hidden),
-            n_time_frequencies=int(n_freqs),
-            solver=solver_config,
-        ).to(device)
+        # Use time-invariant version if n_freqs=0
+        if n_freqs == 0:
+            autoencoder = TimeInvariantNeuralODEDiffeomorphismAutoencoder(
+                ambient_dim=int(ambient_dim),
+                latent_dim=int(latent_dim),
+                vector_field_hidden=list(hidden),
+                solver=solver_config,
+            ).to(device)
+        else:
+            autoencoder = NeuralODEIsometricDiffeomorphismAutoencoder(
+                ambient_dim=int(ambient_dim),
+                latent_dim=int(latent_dim),
+                vector_field_hidden=list(hidden),
+                n_time_frequencies=int(n_freqs),
+                solver=solver_config,
+            ).to(device)
 
     else:
         raise ValueError(f"Unknown ae_type: {ae_type}")
