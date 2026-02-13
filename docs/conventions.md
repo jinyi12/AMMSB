@@ -62,3 +62,13 @@ assert n_points == resolution**2, "FFT reshape requires full grid"
 ```
 
 Always check before attempting FFT reshape.
+
+## Time-Scale Mapping (Latent MSBM)
+
+Time-scale consistency is critical in latent MSBM evaluation. Maintain explicit `t_dists ↔ zt` mapping as implemented in `scripts/latent_msbm_eval.py`. The `t_dists` represents physical time points while `zt` represents indices — they must remain synchronized across forward/backward rollouts.
+
+## Data Utilities
+
+- `data/multimarginal_generation.py` — Multi-marginal OT data generation
+- `data/transform_utils.py` — Data transformation utilities (used by `scripts/fae/tran_evaluation/core.py`)
+- `data/datagen.py` — Main dataset preprocessing script

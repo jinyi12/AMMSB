@@ -14,6 +14,11 @@ MMSFM/
 │   ├── ode_diffeo_ae.py            # ODE diffeomorphism autoencoder
 │   └── training/                   # Training utilities
 │
+├── data/
+│   ├── datagen.py                  # Dataset generation/preprocessing
+│   ├── multimarginal_generation.py # Multi-marginal data generation utilities
+│   └── transform_utils.py          # Data transformation utilities
+│
 ├── functional_autoencoders/        # [SUBMODULE — do not modify]
 │   └── src/functional_autoencoders/
 │       ├── losses/                 # Loss functions (contains _call_autoencoder_fn)

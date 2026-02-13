@@ -22,12 +22,12 @@
 | Decoder | Module | Notes |
 |---------|--------|-------|
 | Standard MLP | (built-in FAE) | Default decoder |
-| RFF readout | `fourier_enhanced_decoder.py` | Random Fourier Features output layer |
-| Enhanced RFF | `enhanced_rff_decoder.py` | Multi-band RFF (Phase C) |
+| Fourier-enhanced | `fourier_enhanced_decoder.py` | Random Fourier Features output layer |
 | MLP decoder | `mmlp_decoder.py` | Custom MLP variant |
 | Wire2D | `wire2d_decoder.py` | Wire implicit neural representation |
-| Diffusion denoiser | `diffusion_denoiser_decoder.py` | Score-based denoising |
+| Diffusion denoiser | `diffusion_denoiser_decoder.py` | Score-based denoising with 1-NFE support |
 | Diffusion locality | `diffusion_locality_denoiser_decoder.py` | Locality-aware denoising |
+| PointNet denoiser | `diffusion_pointnet.py` | PointNet-style denoiser variant |
 
 ## Loss Functions
 
