@@ -5,7 +5,7 @@ This implements the minimal drifting objective from:
 adapted to denoiser decoding in this repository.
 
 Key ideas:
-- Keep the denoiser forward process (sample t, mix clean/noise, predict clean x).
+- Support one-step generation (paper-aligned 1-NFE) and diffusion-mode generation.
 - Replace/augment the reconstruction objective with a drifting loss.
 - Compute drifting in feature space (Eq. 14) by splitting encoder features
   into multiple "head" feature groups.
@@ -85,7 +85,7 @@ def compute_drifting_field(
 
     dist = _pairwise_l2(gen, targets)
     # Mask self-similarity in the generated-negative block.
-    dist = dist + jnp.eye(g, dtype=dist.dtype) * 1e6
+    dist = dist.at[:, :g].add(jnp.eye(g, dtype=dist.dtype) * 1e6)
 
     kernel = jnp.exp(-dist / temperature)
     if dual_normalization:
@@ -137,6 +137,8 @@ def get_drifting_denoiser_loss_fn(
     autoencoder,
     *,
     beta: float = 0.0,
+    generator_mode: str = "one_step",
+    one_step_noise_scale: float = 1.0,
     time_sampling: str = "logit_normal",
     logit_mean: float = 0.0,
     logit_std: float = 1.0,
@@ -155,13 +157,22 @@ def get_drifting_denoiser_loss_fn(
     groups ("heads") extracted from the FAE encoder embedding.
     """
     decoder = autoencoder.decoder
-    if not hasattr(decoder, "diffusion_steps") or not hasattr(
-        decoder, "predict_x_from_mixture"
-    ):
+    if not hasattr(decoder, "diffusion_steps"):
         raise TypeError(
-            "Expected a denoiser decoder exposing diffusion_steps and "
-            "predict_x_from_mixture."
+            "Expected a denoiser decoder exposing diffusion_steps."
         )
+    if generator_mode not in {"one_step", "diffusion"}:
+        raise ValueError("generator_mode must be one of {'one_step', 'diffusion'}.")
+    if generator_mode == "diffusion" and not hasattr(decoder, "predict_x_from_mixture"):
+        raise TypeError(
+            "generator_mode='diffusion' expects a decoder exposing predict_x_from_mixture."
+        )
+    if generator_mode == "one_step" and not hasattr(decoder, "one_step_generate"):
+        raise TypeError(
+            "generator_mode='one_step' expects a decoder exposing one_step_generate."
+        )
+    if one_step_noise_scale <= 0:
+        raise ValueError("one_step_noise_scale must be > 0.")
     if logit_std <= 0:
         raise ValueError("logit_std must be > 0.")
     if drifting_temperature <= 0:
@@ -172,6 +183,10 @@ def get_drifting_denoiser_loss_fn(
         raise ValueError("drifting_weight must be >= 0.")
     if x0_anchor_weight < 0 or velocity_anchor_weight < 0 or ambient_anchor_weight < 0:
         raise ValueError("Anchor weights must be >= 0.")
+    if generator_mode == "one_step" and velocity_anchor_weight > 0:
+        raise ValueError(
+            "velocity_anchor_weight is only defined for generator_mode='diffusion'."
+        )
     if drifting_weight + x0_anchor_weight + velocity_anchor_weight + ambient_anchor_weight <= 0:
         raise ValueError("At least one of drifting/anchor weights must be > 0.")
 
@@ -199,7 +214,10 @@ def get_drifting_denoiser_loss_fn(
         return autoencoder.encoder.apply(variables, field, coords, train=False)
 
     def loss_fn(params, key, batch_stats, u_enc, x_enc, u_dec, x_dec):
-        key, enc_dropout_key, t_key, noise_key = jax.random.split(key, 4)
+        if generator_mode == "one_step":
+            key, enc_dropout_key, gen_key = jax.random.split(key, 3)
+        else:
+            key, enc_dropout_key, t_key, noise_key = jax.random.split(key, 4)
 
         latents, encoder_updates = _call_autoencoder_fn(
             params=params,
@@ -211,32 +229,45 @@ def get_drifting_denoiser_loss_fn(
             dropout_key=enc_dropout_key,
         )
 
-        batch_size = u_dec.shape[0]
-        t = _sample_t(
-            t_key=t_key,
-            batch_size=batch_size,
-            time_sampling=time_sampling,
-            logit_mean=logit_mean,
-            logit_std=logit_std,
-            time_eps=decoder.time_eps,
-        )
-        noise = jax.random.normal(noise_key, u_dec.shape)
-
         decoder_variables = {
             "params": params["decoder"],
             "batch_stats": _get_stats_or_empty(batch_stats, "decoder"),
         }
-        (x_pred, z_t), decoder_updates = autoencoder.decoder.apply(
-            decoder_variables,
-            latents,
-            x_dec,
-            u_dec,
-            t,
-            noise,
-            train=True,
-            mutable=["batch_stats"],
-            method=autoencoder.decoder.predict_x_from_mixture,
-        )
+        if generator_mode == "one_step":
+            x_pred = autoencoder.decoder.apply(
+                decoder_variables,
+                latents,
+                x_dec,
+                key=gen_key,
+                noise_scale=one_step_noise_scale,
+                train=True,
+                method=autoencoder.decoder.one_step_generate,
+            )
+            decoder_updates = {}
+            z_t = None
+            t = None
+        else:
+            batch_size = u_dec.shape[0]
+            t = _sample_t(
+                t_key=t_key,
+                batch_size=batch_size,
+                time_sampling=time_sampling,
+                logit_mean=logit_mean,
+                logit_std=logit_std,
+                time_eps=decoder.time_eps,
+            )
+            noise = jax.random.normal(noise_key, u_dec.shape)
+            (x_pred, z_t), decoder_updates = autoencoder.decoder.apply(
+                decoder_variables,
+                latents,
+                x_dec,
+                u_dec,
+                t,
+                noise,
+                train=True,
+                mutable=["batch_stats"],
+                method=autoencoder.decoder.predict_x_from_mixture,
+            )
 
         pred_features = _encode_features(
             encoder_params=params["encoder"],

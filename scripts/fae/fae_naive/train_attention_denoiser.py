@@ -229,27 +229,6 @@ def main() -> None:
             "Set >0 for a low-overhead distribution anchor."
         ),
     )
-    parser.add_argument(
-        "--denoiser-step-loss-weight",
-        type=float,
-        default=0.0,
-        help=(
-            "Weight for one-step trajectory consistency loss L_step "
-            "(matches Euler backstep against the analytic rectified-flow trajectory)."
-        ),
-    )
-    parser.add_argument(
-        "--denoiser-step-min-delta",
-        type=float,
-        default=0.05,
-        help="Minimum timestep delta used by L_step.",
-    )
-    parser.add_argument(
-        "--denoiser-step-max-delta",
-        type=float,
-        default=0.25,
-        help="Maximum timestep delta used by L_step.",
-    )
     parser.add_argument("--encoder-mlp-dim", type=int, default=128)
     parser.add_argument("--encoder-mlp-layers", type=int, default=2)
 
@@ -489,12 +468,6 @@ def main() -> None:
             denoiser_args_used.append("--denoiser-x0-loss-weight")
         if args.denoiser_ambient_loss_weight != 0.0:
             denoiser_args_used.append("--denoiser-ambient-loss-weight")
-        if args.denoiser_step_loss_weight != 0.0:
-            denoiser_args_used.append("--denoiser-step-loss-weight")
-        if args.denoiser_step_min_delta != 0.05:
-            denoiser_args_used.append("--denoiser-step-min-delta")
-        if args.denoiser_step_max_delta != 0.25:
-            denoiser_args_used.append("--denoiser-step-max-delta")
 
         if denoiser_args_used:
             warnings.warn(
@@ -527,27 +500,15 @@ def main() -> None:
             raise ValueError("--denoiser-x0-loss-weight must be >= 0.")
         if args.denoiser_ambient_loss_weight < 0:
             raise ValueError("--denoiser-ambient-loss-weight must be >= 0.")
-        if args.denoiser_step_loss_weight < 0:
-            raise ValueError("--denoiser-step-loss-weight must be >= 0.")
-        if args.denoiser_step_min_delta < 0:
-            raise ValueError("--denoiser-step-min-delta must be >= 0.")
-        if args.denoiser_step_max_delta < 0:
-            raise ValueError("--denoiser-step-max-delta must be >= 0.")
-        if args.denoiser_step_max_delta < args.denoiser_step_min_delta:
-            raise ValueError(
-                "--denoiser-step-max-delta must be >= --denoiser-step-min-delta."
-            )
         if (
             args.denoiser_velocity_loss_weight
             + args.denoiser_x0_loss_weight
             + args.denoiser_ambient_loss_weight
-            + args.denoiser_step_loss_weight
             <= 0
         ):
             raise ValueError(
                 "At least one of --denoiser-velocity-loss-weight, "
-                "--denoiser-x0-loss-weight, --denoiser-ambient-loss-weight, "
-                "or --denoiser-step-loss-weight must be > 0."
+                "--denoiser-x0-loss-weight, or --denoiser-ambient-loss-weight must be > 0."
             )
         if (
             args.denoiser_sample_steps > 0
@@ -679,9 +640,7 @@ def main() -> None:
             f"time_sampling={args.denoiser_time_sampling}"
             f"(mu={args.denoiser_time_logit_mean}, sigma={args.denoiser_time_logit_std}), "
             f"loss_weights=(v={args.denoiser_velocity_loss_weight}, "
-            f"x0={args.denoiser_x0_loss_weight}, ambient={args.denoiser_ambient_loss_weight}, "
-            f"step={args.denoiser_step_loss_weight}), "
-            f"step_delta=[{args.denoiser_step_min_delta}, {args.denoiser_step_max_delta}], "
+            f"x0={args.denoiser_x0_loss_weight}, ambient={args.denoiser_ambient_loss_weight}), "
             f"latent_reg_beta={args.beta}"
         )
         if args.decoder_type == "denoiser_local":
@@ -704,7 +663,7 @@ def main() -> None:
         print(f"  Muon beta: {args.muon_beta}, ns_steps: {args.muon_ns_steps}, adaptive: {args.muon_adaptive}")
     print(f"  Loss type: {args.loss_type}")
     print(f"  Attention heads: {args.n_heads}")
-    fs_compat = args.pooling_type == "coord_aware_attention" or (args.pooling_type == "transformer_v2" and args.coord_aware)
+    fs_compat = True
     print(f"  Function space compatible: {fs_compat}")
     print("=" * 70 + "\n")
 
@@ -848,9 +807,6 @@ def main() -> None:
             velocity_weight=args.denoiser_velocity_loss_weight,
             x0_weight=args.denoiser_x0_loss_weight,
             ambient_weight=args.denoiser_ambient_loss_weight,
-            step_weight=args.denoiser_step_loss_weight,
-            step_min_delta=args.denoiser_step_min_delta,
-            step_max_delta=args.denoiser_step_max_delta,
         )
         denoiser_sample_steps = (
             args.denoiser_sample_steps

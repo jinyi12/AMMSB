@@ -51,8 +51,8 @@ class LocalityDenoiserDecoder(DiffusionDenoiserDecoder):
     local_low_noise_power: float = 1.0
 
     def setup(self):
-        if self.diffusion_steps < 2:
-            raise ValueError("diffusion_steps must be >= 2.")
+        if self.diffusion_steps < 1:
+            raise ValueError("diffusion_steps must be >= 1.")
         if self.time_emb_dim < 2:
             raise ValueError("time_emb_dim must be >= 2.")
         if self.beta_schedule not in {"cosine", "linear", "reversed_log"}:
@@ -107,7 +107,17 @@ class LocalityDenoiserDecoder(DiffusionDenoiserDecoder):
         ys = jnp.linspace(0.0, 1.0, n_y, dtype=jnp.float32)
         grid_x, grid_y = jnp.meshgrid(xs, ys, indexing="xy")
         centers = jnp.stack([grid_x.reshape(-1), grid_y.reshape(-1)], axis=-1)
-        return centers[:n_centers]
+        total = centers.shape[0]
+        if total == n_centers:
+            return centers
+        # Select uniformly across the full grid to avoid spatial bias from
+        # prefix truncation when n_centers is not a perfect square.
+        select = jnp.floor(
+            (jnp.arange(n_centers, dtype=jnp.float32) + 0.5)
+            * (float(total) / float(n_centers))
+        ).astype(jnp.int32)
+        select = jnp.clip(select, 0, total - 1)
+        return centers[select]
 
     def _local_basis(self, x: jax.Array) -> jax.Array:
         if x.shape[-1] < 2:

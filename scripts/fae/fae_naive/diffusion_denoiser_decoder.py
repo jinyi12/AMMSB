@@ -50,8 +50,8 @@ class DiffusionDenoiserDecoder(Decoder):
     post_activation: Callable[[jax.Array], jax.Array] = lambda x: x
 
     def setup(self):
-        if self.diffusion_steps < 2:
-            raise ValueError("diffusion_steps must be >= 2.")
+        if self.diffusion_steps < 1:
+            raise ValueError("diffusion_steps must be >= 1.")
         if self.time_emb_dim < 2:
             raise ValueError("time_emb_dim must be >= 2.")
         if self.beta_schedule not in {"cosine", "linear", "reversed_log"}:
@@ -233,6 +233,25 @@ class DiffusionDenoiserDecoder(Decoder):
         x_pred = self.predict_x(z=z, x=x, noisy_field=z_t, t=t, train=train)
         return x_pred, z_t
 
+    def one_step_generate(
+        self,
+        z: jax.Array,
+        x: jax.Array,
+        key: jax.Array,
+        noise_scale: float = 1.0,
+        train: bool = False,
+    ) -> jax.Array:
+        """One-pass generator used for drifting-style 1-NFE decoding."""
+        if noise_scale <= 0:
+            raise ValueError("noise_scale must be > 0.")
+        batch_size, n_points, _ = x.shape
+        noisy = noise_scale * jax.random.normal(
+            key, (batch_size, n_points, self.out_dim)
+        )
+        t = jnp.full((batch_size,), 1.0 - self.time_eps, dtype=jnp.float32)
+        x_pred = self.predict_x(z=z, x=x, noisy_field=noisy, t=t, train=train)
+        return self.post_activation(x_pred)
+
     def sample(
         self,
         z: jax.Array,
@@ -327,9 +346,6 @@ def get_denoiser_loss_fn(
     velocity_weight: float = 1.0,
     x0_weight: float = 0.1,
     ambient_weight: float = 0.0,
-    step_weight: float = 0.0,
-    step_min_delta: float = 0.05,
-    step_max_delta: float = 0.25,
 ) -> Callable:
     """x-pred denoiser objective with velocity loss and cheap auxiliary anchors."""
 
@@ -340,11 +356,9 @@ def get_denoiser_loss_fn(
         raise ValueError("time_sampling must be one of {'uniform', 'logit_normal'}.")
     if logit_std <= 0:
         raise ValueError("logit_std must be > 0.")
-    if velocity_weight < 0 or x0_weight < 0 or ambient_weight < 0 or step_weight < 0:
-        raise ValueError("velocity/x0/ambient/step weights must be >= 0.")
-    if step_min_delta < 0 or step_max_delta < 0 or step_max_delta < step_min_delta:
-        raise ValueError("step delta bounds must satisfy 0 <= step_min_delta <= step_max_delta.")
-    if velocity_weight + x0_weight + ambient_weight + step_weight <= 0:
+    if velocity_weight < 0 or x0_weight < 0 or ambient_weight < 0:
+        raise ValueError("velocity/x0/ambient weights must be >= 0.")
+    if velocity_weight + x0_weight + ambient_weight <= 0:
         raise ValueError("At least one denoiser reconstruction weight must be > 0.")
 
     def _sample_t(t_key: jax.Array, batch_size: int) -> jax.Array:
@@ -362,7 +376,7 @@ def get_denoiser_loss_fn(
         return mean, std
 
     def loss_fn(params, key, batch_stats, u_enc, x_enc, u_dec, x_dec):
-        key, enc_dropout_key, t_key, noise_key, step_key = jax.random.split(key, 5)
+        key, enc_dropout_key, t_key, noise_key = jax.random.split(key, 4)
 
         latents, encoder_updates = _call_autoencoder_fn(
             params=params,
@@ -404,30 +418,10 @@ def get_denoiser_loss_fn(
         ambient_loss = jnp.mean((pred_mean - target_mean) ** 2) + jnp.mean(
             (pred_std - target_std) ** 2
         )
-        if step_weight > 0.0:
-            if step_max_delta == step_min_delta:
-                step_delta = jnp.full((batch_size,), step_min_delta, dtype=t.dtype)
-            else:
-                step_delta = jax.random.uniform(
-                    step_key,
-                    (batch_size,),
-                    minval=step_min_delta,
-                    maxval=step_max_delta,
-                )
-            t_prev = jnp.maximum(t - step_delta, decoder.time_eps)
-            z_prev_target = decoder._mix_with_noise(
-                clean_field=u_dec, t=t_prev, noise=noise
-            )
-            z_prev_pred = z_t + (t_prev - t)[:, None, None] * v_pred
-            step_loss = jnp.mean((z_prev_pred - z_prev_target) ** 2)
-        else:
-            step_loss = jnp.asarray(0.0, dtype=u_dec.dtype)
-
         recon_loss = (
             velocity_weight * velocity_loss
             + x0_weight * x0_loss
             + ambient_weight * ambient_loss
-            + step_weight * step_loss
         )
 
         latent_reg = jnp.mean(beta * jnp.sum(latents ** 2, axis=-1))
@@ -475,6 +469,38 @@ def reconstruct_with_denoiser(
         sde_sigma=sde_sigma,
         train=False,
         method=autoencoder.decoder.sample,
+    )
+    return u_hat
+
+
+def reconstruct_with_denoiser_one_step(
+    autoencoder,
+    state,
+    u_enc: jax.Array,
+    x_enc: jax.Array,
+    x_dec: jax.Array,
+    key: jax.Array,
+    noise_scale: float = 1.0,
+) -> jax.Array:
+    """Reconstruct fields by a single decoder forward pass from Gaussian noise."""
+    encoder_vars = {
+        "params": state.params["encoder"],
+        "batch_stats": _get_stats_or_empty(state.batch_stats, "encoder"),
+    }
+    decoder_vars = {
+        "params": state.params["decoder"],
+        "batch_stats": _get_stats_or_empty(state.batch_stats, "decoder"),
+    }
+
+    z = autoencoder.encoder.apply(encoder_vars, u_enc, x_enc, train=False)
+    u_hat = autoencoder.decoder.apply(
+        decoder_vars,
+        z,
+        x_dec,
+        key=key,
+        noise_scale=noise_scale,
+        train=False,
+        method=autoencoder.decoder.one_step_generate,
     )
     return u_hat
 
@@ -536,5 +562,60 @@ class DenoiserReconstructionMSEMetric(Metric):
             num_steps=self.num_steps,
             sampler=self.sampler,
             sde_sigma=self.sde_sigma,
+        )
+        return jnp.mean((u_dec - u_hat) ** 2)
+
+
+class DenoiserOneStepReconstructionMSEMetric(Metric):
+    """Validation metric for one-step denoiser decoding."""
+
+    def __init__(
+        self,
+        autoencoder,
+        noise_scale: float = 1.0,
+        progress_every_batches: int = 0,
+    ):
+        self.autoencoder = autoencoder
+        self.noise_scale = float(noise_scale)
+        self.progress_every_batches = max(0, int(progress_every_batches))
+
+    @property
+    def name(self) -> str:
+        return "Denoiser One-Step Reconstruction MSE"
+
+    @property
+    def batched(self) -> bool:
+        return True
+
+    def __call__(self, state, key, test_dataloader):
+        metric_value = 0.0
+        n_batches = len(test_dataloader) if hasattr(test_dataloader, "__len__") else None
+        n_seen = 0
+        for i, batch in enumerate(test_dataloader):
+            key, subkey = jax.random.split(key)
+            metric_value += self.call_batched(state, batch, subkey)
+            n_seen = i + 1
+            if (
+                self.progress_every_batches > 0
+                and n_seen % self.progress_every_batches == 0
+            ):
+                if n_batches is None:
+                    print(f"    denoiser eval metric: processed {n_seen} batches")
+                else:
+                    print(f"    denoiser eval metric: processed {n_seen}/{n_batches} batches")
+        return metric_value / max(n_seen, 1)
+
+    @partial(jax.jit, static_argnums=0)
+    def call_batched(self, state, batch, key):
+        u_dec, x_dec, u_enc, x_enc = batch
+        key, sample_key = jax.random.split(key)
+        u_hat = reconstruct_with_denoiser_one_step(
+            autoencoder=self.autoencoder,
+            state=state,
+            u_enc=u_enc,
+            x_enc=x_enc,
+            x_dec=x_dec,
+            key=sample_key,
+            noise_scale=self.noise_scale,
         )
         return jnp.mean((u_dec - u_hat) ** 2)

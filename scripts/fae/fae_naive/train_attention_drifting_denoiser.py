@@ -34,7 +34,9 @@ from scripts.fae.multiscale_dataset_naive import (
 )
 from scripts.fae.wandb_trainer import WandbAutoencoderTrainer
 from scripts.fae.fae_naive.diffusion_denoiser_decoder import (
+    DenoiserOneStepReconstructionMSEMetric,
     DenoiserReconstructionMSEMetric,
+    reconstruct_with_denoiser_one_step,
     reconstruct_with_denoiser,
 )
 from scripts.fae.fae_naive.drifting_denoiser_loss import (
@@ -67,9 +69,6 @@ LEGACY_IGNORED_FLAGS: dict[str, bool] = {
     "--lambda-residual": True,
     "--residual-sigma": True,
     "--spectral-n-bins": True,
-    "--denoiser-step-loss-weight": True,
-    "--denoiser-step-min-delta": True,
-    "--denoiser-step-max-delta": True,
     # boolean flags
     "--track-spectral-metrics": False,
 }
@@ -222,7 +221,10 @@ def _build_parser() -> argparse.ArgumentParser:
         "--denoiser-diffusion-steps",
         type=int,
         default=1000,
-        help="Number of diffusion steps for denoiser training.",
+        help=(
+            "Number of diffusion steps used by diffusion-mode decoding "
+            "(and as a denoiser schedule parameter). Can be 1 for strict 1-NFE mode."
+        ),
     )
     parser.add_argument(
         "--denoiser-beta-schedule",
@@ -299,6 +301,22 @@ def _build_parser() -> argparse.ArgumentParser:
         "--drifting-train-feature-encoder",
         action="store_true",
         help="Allow drifting gradients to update feature-encoder params.",
+    )
+    parser.add_argument(
+        "--drifting-generator-mode",
+        type=str,
+        default="one_step",
+        choices=["one_step", "diffusion"],
+        help=(
+            "Decoder generation mode used by drifting training/reconstruction: "
+            "'one_step' reproduces 1-NFE behavior; 'diffusion' uses iterative Euler updates."
+        ),
+    )
+    parser.add_argument(
+        "--drifting-one-step-noise-scale",
+        type=float,
+        default=1.0,
+        help="Gaussian noise scale for one-step generation when --drifting-generator-mode=one_step.",
     )
 
     # Optional anchors
@@ -473,8 +491,8 @@ def _validate_args(args: argparse.Namespace, drifting_feature_heads: int) -> Non
         raise ValueError("--denoiser-time-emb-dim must be >= 2.")
     if args.denoiser_scaling <= 0:
         raise ValueError("--denoiser-scaling must be > 0.")
-    if args.denoiser_diffusion_steps < 2:
-        raise ValueError("--denoiser-diffusion-steps must be >= 2.")
+    if args.denoiser_diffusion_steps < 1:
+        raise ValueError("--denoiser-diffusion-steps must be >= 1.")
     if args.denoiser_sampler not in {"ode", "sde"}:
         raise ValueError("--denoiser-sampler must be one of {'ode', 'sde'}.")
     if args.denoiser_sde_sigma < 0:
@@ -492,6 +510,8 @@ def _validate_args(args: argparse.Namespace, drifting_feature_heads: int) -> Non
         raise ValueError("--drifting-feature-heads must be >= 0.")
     if args.drifting_weight < 0:
         raise ValueError("--drifting-weight must be >= 0.")
+    if args.drifting_one_step_noise_scale <= 0:
+        raise ValueError("--drifting-one-step-noise-scale must be > 0.")
 
     if args.denoiser_velocity_loss_weight < 0:
         raise ValueError("--denoiser-velocity-loss-weight must be >= 0.")
@@ -499,6 +519,14 @@ def _validate_args(args: argparse.Namespace, drifting_feature_heads: int) -> Non
         raise ValueError("--denoiser-x0-loss-weight must be >= 0.")
     if args.denoiser_ambient_loss_weight < 0:
         raise ValueError("--denoiser-ambient-loss-weight must be >= 0.")
+    if (
+        args.drifting_generator_mode == "one_step"
+        and args.denoiser_velocity_loss_weight > 0
+    ):
+        raise ValueError(
+            "--denoiser-velocity-loss-weight is only supported with "
+            "--drifting-generator-mode=diffusion."
+        )
 
     if (
         args.drifting_weight
@@ -512,10 +540,44 @@ def _validate_args(args: argparse.Namespace, drifting_feature_heads: int) -> Non
             "--denoiser-x0-loss-weight, or --denoiser-ambient-loss-weight must be > 0."
         )
 
-    if args.denoiser_sample_steps > 0 and args.denoiser_sample_steps > args.denoiser_diffusion_steps:
-        raise ValueError("--denoiser-sample-steps cannot exceed --denoiser-diffusion-steps.")
-    if args.denoiser_eval_sample_steps > 0 and args.denoiser_eval_sample_steps > args.denoiser_diffusion_steps:
-        raise ValueError("--denoiser-eval-sample-steps cannot exceed --denoiser-diffusion-steps.")
+    if args.drifting_generator_mode == "diffusion":
+        if args.denoiser_sample_steps > 0 and args.denoiser_sample_steps > args.denoiser_diffusion_steps:
+            raise ValueError("--denoiser-sample-steps cannot exceed --denoiser-diffusion-steps.")
+        if args.denoiser_eval_sample_steps > 0 and args.denoiser_eval_sample_steps > args.denoiser_diffusion_steps:
+            raise ValueError("--denoiser-eval-sample-steps cannot exceed --denoiser-diffusion-steps.")
+    else:
+        ignored = []
+        if args.denoiser_sample_steps != 0:
+            ignored.append("--denoiser-sample-steps")
+        if args.denoiser_eval_sample_steps != 32:
+            ignored.append("--denoiser-eval-sample-steps")
+        if args.denoiser_sampler != "ode":
+            ignored.append("--denoiser-sampler")
+        if args.denoiser_sde_sigma != 1.0:
+            ignored.append("--denoiser-sde-sigma")
+        if args.denoiser_time_sampling != "logit_normal":
+            ignored.append("--denoiser-time-sampling")
+        if args.denoiser_time_logit_mean != 0.0:
+            ignored.append("--denoiser-time-logit-mean")
+        if args.denoiser_time_logit_std != 1.0:
+            ignored.append("--denoiser-time-logit-std")
+        if ignored:
+            warnings.warn(
+                f"Arguments {ignored} are ignored when --drifting-generator-mode=one_step.",
+                UserWarning,
+            )
+        if (
+            args.decoder_type == "denoiser_local"
+            and args.denoiser_local_low_noise_power > 0
+        ):
+            warnings.warn(
+                "With --decoder-type=denoiser_local and --drifting-generator-mode=one_step, "
+                "generation uses t≈1 and the local branch gate (1 - t)^p can become very small "
+                f"for p={args.denoiser_local_low_noise_power}. This often over-smooths outputs. "
+                "Consider --denoiser-local-low-noise-power=0.0 or using "
+                "--drifting-generator-mode=diffusion.",
+                UserWarning,
+            )
 
     if args.beta != 0.0:
         warnings.warn(
@@ -622,24 +684,45 @@ def main() -> None:
     print(f"  Decoder type: {args.decoder_type}")
     if args.decoder_type == "denoiser":
         print(f"  Decoder MMLP: {'enabled' if args.decoder_use_mmlp else 'disabled'}")
-    print(
-        "  Decoder: x-prediction denoiser "
-        f"(steps={args.denoiser_diffusion_steps}, grid={args.denoiser_beta_schedule}, "
-        f"sampler={args.denoiser_sampler}, sde_sigma={args.denoiser_sde_sigma}, "
-        f"eval_steps={args.denoiser_eval_sample_steps})"
-    )
-    print(
-        "           "
-        f"time_sampling={args.denoiser_time_sampling}"
-        f"(mu={args.denoiser_time_logit_mean}, sigma={args.denoiser_time_logit_std}), "
-        f"drifting=(weight={args.drifting_weight}, tau={args.drifting_temperature}, "
-        f"feature_heads={drifting_feature_heads}, "
-        f"dual_norm={not args.drifting_no_dual_normalization}, "
-        f"freeze_feature_encoder={not args.drifting_train_feature_encoder}), "
-        f"anchors=(v={args.denoiser_velocity_loss_weight}, "
-        f"x0={args.denoiser_x0_loss_weight}, ambient={args.denoiser_ambient_loss_weight}), "
-        f"latent_reg_beta={args.beta}"
-    )
+    if args.drifting_generator_mode == "one_step":
+        print(
+            "  Decoder: one-step drifting generator "
+            f"(noise_scale={args.drifting_one_step_noise_scale}, "
+            f"time_grid={args.denoiser_beta_schedule})"
+        )
+    else:
+        print(
+            "  Decoder: diffusion-style denoiser "
+            f"(steps={args.denoiser_diffusion_steps}, grid={args.denoiser_beta_schedule}, "
+            f"sampler={args.denoiser_sampler}, sde_sigma={args.denoiser_sde_sigma}, "
+            f"eval_steps={args.denoiser_eval_sample_steps})"
+        )
+    if args.drifting_generator_mode == "one_step":
+        print(
+            "           "
+            f"generator_mode={args.drifting_generator_mode}, "
+            f"drifting=(weight={args.drifting_weight}, tau={args.drifting_temperature}, "
+            f"feature_heads={drifting_feature_heads}, "
+            f"dual_norm={not args.drifting_no_dual_normalization}, "
+            f"freeze_feature_encoder={not args.drifting_train_feature_encoder}), "
+            f"anchors=(v={args.denoiser_velocity_loss_weight}, "
+            f"x0={args.denoiser_x0_loss_weight}, ambient={args.denoiser_ambient_loss_weight}), "
+            f"latent_reg_beta={args.beta}"
+        )
+    else:
+        print(
+            "           "
+            f"time_sampling={args.denoiser_time_sampling}"
+            f"(mu={args.denoiser_time_logit_mean}, sigma={args.denoiser_time_logit_std}), "
+            f"generator_mode={args.drifting_generator_mode}, "
+            f"drifting=(weight={args.drifting_weight}, tau={args.drifting_temperature}, "
+            f"feature_heads={drifting_feature_heads}, "
+            f"dual_norm={not args.drifting_no_dual_normalization}, "
+            f"freeze_feature_encoder={not args.drifting_train_feature_encoder}), "
+            f"anchors=(v={args.denoiser_velocity_loss_weight}, "
+            f"x0={args.denoiser_x0_loss_weight}, ambient={args.denoiser_ambient_loss_weight}), "
+            f"latent_reg_beta={args.beta}"
+        )
     if args.decoder_type == "denoiser_local":
         print(
             "           "
@@ -658,9 +741,7 @@ def main() -> None:
             f"adaptive: {args.muon_adaptive}"
         )
     print(f"  Attention heads: {args.n_heads}")
-    fs_compat = args.pooling_type == "coord_aware_attention" or (
-        args.pooling_type == "transformer_v2" and args.coord_aware
-    )
+    fs_compat = True
     print(f"  Function space compatible: {fs_compat}")
     print("=" * 70 + "\n")
 
@@ -804,23 +885,18 @@ def main() -> None:
     architecture_info["drifting_freeze_feature_encoder"] = (
         not args.drifting_train_feature_encoder
     )
+    architecture_info["drifting_generator_mode"] = args.drifting_generator_mode
+    architecture_info["drifting_one_step_noise_scale"] = (
+        args.drifting_one_step_noise_scale
+    )
 
     save_model_info(paths, architecture_info, args)
-
-    denoiser_sample_steps = (
-        args.denoiser_sample_steps
-        if args.denoiser_sample_steps > 0
-        else args.denoiser_diffusion_steps
-    )
-    denoiser_eval_sample_steps = (
-        args.denoiser_eval_sample_steps
-        if args.denoiser_eval_sample_steps > 0
-        else denoiser_sample_steps
-    )
 
     loss_fn = get_drifting_denoiser_loss_fn(
         autoencoder,
         beta=args.beta,
+        generator_mode=args.drifting_generator_mode,
+        one_step_noise_scale=args.drifting_one_step_noise_scale,
         time_sampling=args.denoiser_time_sampling,
         logit_mean=args.denoiser_time_logit_mean,
         logit_std=args.denoiser_time_logit_std,
@@ -833,36 +909,69 @@ def main() -> None:
         ambient_anchor_weight=args.denoiser_ambient_loss_weight,
         freeze_feature_encoder=(not args.drifting_train_feature_encoder),
     )
-
-    print(
-        "Denoiser reconstruction schedule: "
-        f"train_sampling_steps={denoiser_sample_steps}, "
-        f"eval_sampling_steps={denoiser_eval_sample_steps}"
-    )
-
-    metrics = [
-        DenoiserReconstructionMSEMetric(
-            autoencoder,
-            num_steps=denoiser_eval_sample_steps,
-            sampler=args.denoiser_sampler,
-            sde_sigma=args.denoiser_sde_sigma,
-            progress_every_batches=25,
+    if args.drifting_generator_mode == "one_step":
+        print(
+            "Denoiser reconstruction schedule: one-step "
+            f"(NFE=1, noise_scale={args.drifting_one_step_noise_scale})"
         )
-    ]
+        metrics = [
+            DenoiserOneStepReconstructionMSEMetric(
+                autoencoder,
+                noise_scale=args.drifting_one_step_noise_scale,
+                progress_every_batches=25,
+            )
+        ]
 
-    def reconstruct_fn(autoencoder_, state_, u_dec_, x_dec_, u_enc_, x_enc_, key_):
-        del u_dec_
-        return reconstruct_with_denoiser(
-            autoencoder=autoencoder_,
-            state=state_,
-            u_enc=u_enc_,
-            x_enc=x_enc_,
-            x_dec=x_dec_,
-            key=key_,
-            num_steps=denoiser_eval_sample_steps,
-            sampler=args.denoiser_sampler,
-            sde_sigma=args.denoiser_sde_sigma,
+        def reconstruct_fn(autoencoder_, state_, u_dec_, x_dec_, u_enc_, x_enc_, key_):
+            del u_dec_
+            return reconstruct_with_denoiser_one_step(
+                autoencoder=autoencoder_,
+                state=state_,
+                u_enc=u_enc_,
+                x_enc=x_enc_,
+                x_dec=x_dec_,
+                key=key_,
+                noise_scale=args.drifting_one_step_noise_scale,
+            )
+    else:
+        denoiser_sample_steps = (
+            args.denoiser_sample_steps
+            if args.denoiser_sample_steps > 0
+            else args.denoiser_diffusion_steps
         )
+        denoiser_eval_sample_steps = (
+            args.denoiser_eval_sample_steps
+            if args.denoiser_eval_sample_steps > 0
+            else denoiser_sample_steps
+        )
+        print(
+            "Denoiser reconstruction schedule: "
+            f"train_sampling_steps={denoiser_sample_steps}, "
+            f"eval_sampling_steps={denoiser_eval_sample_steps}"
+        )
+        metrics = [
+            DenoiserReconstructionMSEMetric(
+                autoencoder,
+                num_steps=denoiser_eval_sample_steps,
+                sampler=args.denoiser_sampler,
+                sde_sigma=args.denoiser_sde_sigma,
+                progress_every_batches=25,
+            )
+        ]
+
+        def reconstruct_fn(autoencoder_, state_, u_dec_, x_dec_, u_enc_, x_enc_, key_):
+            del u_dec_
+            return reconstruct_with_denoiser(
+                autoencoder=autoencoder_,
+                state=state_,
+                u_enc=u_enc_,
+                x_enc=x_enc_,
+                x_dec=x_dec_,
+                key=key_,
+                num_steps=denoiser_eval_sample_steps,
+                sampler=args.denoiser_sampler,
+                sde_sigma=args.denoiser_sde_sigma,
+            )
 
     vis_callback = None
     if wandb_run is not None:
@@ -1052,6 +1161,8 @@ def main() -> None:
         "drifting_temperature": args.drifting_temperature,
         "drifting_weight": args.drifting_weight,
         "drifting_feature_heads": drifting_feature_heads,
+        "drifting_generator_mode": args.drifting_generator_mode,
+        "drifting_one_step_noise_scale": args.drifting_one_step_noise_scale,
         "optimizer": args.optimizer,
     }
     with open(os.path.join(paths["root"], "eval_results.json"), "w") as f:
