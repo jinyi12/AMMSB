@@ -65,7 +65,7 @@ Always check before attempting FFT reshape.
 
 ## Time-Scale Mapping (Latent MSBM)
 
-Time-scale consistency is critical in latent MSBM evaluation. Maintain explicit `t_dists ↔ zt` mapping as implemented in `scripts/latent_msbm_eval.py`. The `t_dists` represents physical time points while `zt` represents indices — they must remain synchronized across forward/backward rollouts.
+Time-scale consistency is critical in latent MSBM evaluation. Maintain explicit `t_dists ↔ zt` mapping as implemented in `archive/2026-02-16_non_fae_scripts/scripts/latent_msbm_eval.py`. The `t_dists` represents physical time points while `zt` represents indices — they must remain synchronized across forward/backward rollouts.
 
 ## Data Utilities
 

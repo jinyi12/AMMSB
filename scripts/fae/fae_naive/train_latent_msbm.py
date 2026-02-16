@@ -1,6 +1,6 @@
 """Train Multi-marginal Schrödinger Bridge Matching (MSBM) in a pretrained FAE latent space.
 
-This script is the Functional Autoencoder (FAE) analogue of `scripts/latent_msbm_main.py`.
+This script is the Functional Autoencoder (FAE) analogue of `archive/2026-02-16_non_fae_scripts/scripts/latent_msbm_main.py`.
 
 Pipeline
 --------

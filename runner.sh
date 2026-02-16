@@ -66,6 +66,6 @@ MISCARGS=\
 ARGS="$TRAINARGS $INFERENCEARGS $EVALARGS $PLOTARGS $WANDBARGS $MISCARGS"
 
 echo $(which python)
-echo python scripts/main.py $ARGS
+echo python archive/2026-02-16_non_fae_scripts/scripts/main.py $ARGS
 
-python scripts/main.py $ARGS
+python archive/2026-02-16_non_fae_scripts/scripts/main.py $ARGS

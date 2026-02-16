@@ -58,7 +58,6 @@ MISCARGS=\
 ARGS="$CMDS $TRAINARGS $INFERENCEARGS $PLOTARGS $WANDBARGS $MISCARGS"
 
 echo $(which python)
-echo python scripts/images/images_main.py $ARGS
+echo python archive/2026-02-16_non_fae_scripts/scripts/images/images_main.py $ARGS
 
-python scripts/images/images_main.py $ARGS
-
+python archive/2026-02-16_non_fae_scripts/scripts/images/images_main.py $ARGS

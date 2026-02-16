@@ -19,14 +19,10 @@ import wandb
 
 from scripts.utils import log_cli_metadata_to_wandb
 
-from scripts.images import (
-    images_train,
-    images_eval,
-    images_plot,
-)
-from scripts.images.images_utils import (
-    RetCode,
-)
+import images_eval
+import images_plot
+import images_train
+from images_utils import RetCode
 
 RESUBMITFILE = os.getenv('RESUBMITFILE', 'RESUBMIT')
 EXCEPTIONFILE = os.getenv('EXCEPTIONFILE', 'EXCEPTION')

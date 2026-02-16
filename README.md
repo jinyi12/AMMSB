@@ -29,23 +29,18 @@ The result is a single, continuous model of the system's dynamics that can gener
 │   │   └── models.py                 # Network architectures
 │   ├── multimarginal_cfm.py          # Core implementation of multi-marginal flow matcher w/ splines
 │   └── multimarginal_otsampler.py    # Implementation of (ordered) multi-marginal optimal transport
-├── scripts/                          # Contains scripts for training models
-│   ├── main.py                       # Core training script for synthetic and single-cell data
-│   ├── modelagent.py                 # Contains logic for training, evaluation, and inference
-│   ├── plotter.py                    # Plotting utilities for training losses, evaluations, and trajectories
+├── scripts/                          # Active scripts (FAE + shared helpers)
 │   ├── utils.py
-│   └── images/                       # Contains scripts for training models on image datasets
-│       ├── images_main.py            # Core training script for class progression task on image data
-│       ├── images_train.py           # Contains training logic
-│       ├── images_eval.py            # Contains inference logic
-│       ├── images_plot.py            # Contains plotting logic for losses and trajectories
-│       └── images_utils.py
+│   ├── fae/                          # Functional autoencoder (FAE) experiments
+│   └── images/
+│       └── field_visualization.py    # Shared visualization utilities (used by FAE eval)
+├── archive/2026-02-16_non_fae_scripts/ # Legacy (non-FAE) training scripts
 ├── README.md
 ├── pyproject.toml
 ├── requirements.txt                  # Environment file w/ all package versions pinned
 ├── make_venv.sh                      # Helper script to install this package
-├── runner.sh                         # Helper script to call scripts/main.py
-├── image_runner.sh                   # Helper script to call scripts/images/image_main.py
+├── runner.sh                         # Helper script to call archived scripts/main.py
+├── image_runner.sh                   # Helper script to call archived scripts/images/images_main.py
 └── .gitignore
 ```
 
@@ -53,14 +48,14 @@ The result is a single, continuous model of the system's dynamics that can gener
 
 This repo also includes an experimental latent-space implementation of multi-marginal Schrödinger Bridge Matching (MSBM) that alternates training forward/backward policies with Brownian bridge sampling.
 
-- Entry point: `scripts/latent_msbm_main.py`
-- Evaluation/visualization: `scripts/latent_msbm_eval.py`
+- Entry point: `archive/2026-02-16_non_fae_scripts/scripts/latent_msbm_main.py`
+- Evaluation/visualization: `archive/2026-02-16_non_fae_scripts/scripts/latent_msbm_eval.py`
 - Core implementation: `mmsfm/latent_msbm/`
 
-Example (using the same cache conventions as `scripts/latent_flow_main.py`):
+Example (using the same cache conventions as `archive/2026-02-16_non_fae_scripts/scripts/latent_flow_main.py`):
 
 ```bash
-python scripts/latent_msbm_main.py \
+python archive/2026-02-16_non_fae_scripts/scripts/latent_msbm_main.py \
   --data_path data/tran_inclusions.npz \
   --ae_checkpoint results/joint_ae/geodesic_autoencoder_best.pth \
   --use_cache_data --selected_cache_path data/cache_pca_precomputed/tran_inclusions/tc_selected_embeddings.pkl
@@ -69,13 +64,13 @@ python scripts/latent_msbm_main.py \
 Evaluate W2 and generate forward/backward SDE rollouts + plots:
 
 ```bash
-python scripts/latent_msbm_eval.py \
+python archive/2026-02-16_non_fae_scripts/scripts/latent_msbm_eval.py \
   --msbm_dir results/<run_dir> \
   --save_dense --dense_stride 10 \
   --conditional
 ```
 
-`scripts/latent_msbm_eval.py` reads `results/<run_dir>/args.txt` when available (so you can typically omit `--data_path` and `--ae_checkpoint`).
+`archive/2026-02-16_non_fae_scripts/scripts/latent_msbm_eval.py` reads `results/<run_dir>/args.txt` when available (so you can typically omit `--data_path` and `--ae_checkpoint`).
 
 ## Setup and Installation
 
@@ -153,18 +148,18 @@ python scripts/latent_msbm_eval.py \
 ## Running Experiments
 
 ### Synthetic and Single-cell Data
-You can train a new MMSFM model for the synthetic and single-cell data using [`scripts/main.py`](scripts/main.py).
+You can train a new MMSFM model for the synthetic and single-cell data using `archive/2026-02-16_non_fae_scripts/scripts/main.py`.
 Given the large number of possible arguments, we provide a simple runner script in [`runner.sh`](runner.sh) where you can easily set the desired hyperparameters.
 Don't forget to update the `WANDBARGS` in `runner.sh` to either include your entity and project names, or to set the `--no_wandb` flag to disable wandb for that run.
-Whether you choose to directly call `scripts/main.py` or use `runner.sh`, please do so from the base directory `<rootdir>/MMSFM/`.
+Whether you choose to directly call the archived script or use `runner.sh`, please do so from the base directory `<rootdir>/MMSFM/`.
 Either way, you will train the model, generate some sample trajectories, and create some evaluation and visualization plots.
 
 **Example: Training the Triplet model on S-shaped Gaussians**
 ```bash
 ## pwd shoud output <rootdir>/MMSFM/
 
-## Directly calling scripts/main.py
-python scripts/main.py \
+## Directly calling the archived script
+python archive/2026-02-16_non_fae_scripts/scripts/main.py \
     --dataname sg \
     --flowmatcher sb \
     --agent_type triplet \
@@ -183,7 +178,7 @@ python scripts/main.py \
 ```
 
 ### CIFAR-10 and Imagenette Data
-Given some differences in the datatypes (especially size of the data) as well as evaluations and plots, we provide a second script for training a MMSFM model for the image datasets found at [`scripts/images/images_main.py`](scripts/images/images_main.py).
+Given some differences in the datatypes (especially size of the data) as well as evaluations and plots, we provide a second script for training a MMSFM model for the image datasets found at `archive/2026-02-16_non_fae_scripts/scripts/images/images_main.py`.
 Likewise, we also provide a simple runner script in [`image_runner.sh`](image_runner.sh), which also contains a `WANDBARGS` argument list as well as a `no_wandb` flag.
 Again, please call either the python script or runner script from the base directory `<rootdir>/MMSFM/`.
 
@@ -196,8 +191,8 @@ If not submitting jobs through Slurm, we assume the remaining walltime is practi
 ```bash
 ## pwd shoud output <rootdir>/MMSFM/
 
-## Directly calling scripts/images/images_main.py
-python scripts/images/images_main.py \
+## Directly calling the archived script
+python archive/2026-02-16_non_fae_scripts/scripts/images/images_main.py \
     train eval plot \
     --dataname cifar10 \
     --size 32 \

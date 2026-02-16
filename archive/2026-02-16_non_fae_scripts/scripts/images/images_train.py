@@ -21,7 +21,7 @@ from mmsfm.multimarginal_cfm import (
     MultiMarginalPairedSchrodingerBridgeConditionalFlowMatcher
 )
 
-from scripts.images.images_utils import (
+from images_utils import (
     load_data,
     get_hypers,
     build_models,
@@ -625,4 +625,3 @@ def main(args, run) -> RetCode :
                 # rm(fpath)
 
     return retcode
-

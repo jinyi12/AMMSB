@@ -7,7 +7,7 @@ import wandb
 from torchdyn.core import NeuralODE
 import torchsde
 
-from scripts.images.images_utils import (
+from images_utils import (
     RetCode,
     load_data,
     get_hypers,
@@ -215,4 +215,3 @@ def main(args, run) -> RetCode :
         torch.save(torch_sde_trajs, sdetrajpath)
 
     return RetCode.DONE
-

@@ -8,7 +8,7 @@ import joblib
 import os
 from enum import Enum
 
-from .grf_data import load_grf_dataset
+from grf_data import load_grf_dataset
 
 from torchcfm.models.unet import UNetModel  # type: ignore
 
@@ -205,4 +205,3 @@ def build_models(hypers, sm, device):
         score_model = None
 
     return model, score_model
-

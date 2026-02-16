@@ -6,14 +6,14 @@ from matplotlib import animation as animation
 
 import wandb
 
-from scripts.images.grf_data import load_grf_dataset
+from grf_data import load_grf_dataset
 from scripts.images.field_visualization import (
     plot_field_snapshots,
     plot_field_evolution_gif,
     plot_field_statistics,
     plot_spatial_correlation,
 )
-from scripts.images.images_utils import RetCode
+from images_utils import RetCode
 
 
 def _denormalise_grf_tensor(tensor: torch.Tensor, metadata: dict) -> torch.Tensor:

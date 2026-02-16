@@ -1,9 +1,10 @@
-
 from typing import Literal
+
 import torch
 import torch.nn as nn
 from torch import Tensor
-from scripts.noise_schedules import ExponentialContractingSchedule
+
+from mmsfm.noise_schedules import ExponentialContractingSchedule
 
 class ForwardLatentSDE(nn.Module):
     """Forward SDE in latent space: dY_t = v(Y_t, t) dt + g(t) dW_t.

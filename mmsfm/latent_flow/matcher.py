@@ -1,12 +1,12 @@
+from typing import Literal, Optional
 
-from typing import Optional, Literal
 import numpy as np
 import torch
 import torch.nn as nn
 from torch import Tensor
 from scipy.interpolate import CubicSpline, PchipInterpolator
 
-from scripts.noise_schedules import ExponentialContractingSchedule
+from mmsfm.noise_schedules import ExponentialContractingSchedule
 
 class LatentFlowMatcher:
     """Flow matcher operating in the latent space of a geodesic autoencoder.

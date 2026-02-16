@@ -1,12 +1,12 @@
-
 from pathlib import Path
 from typing import Literal
 
 import numpy as np
 import torch
 import torch.nn as nn
-from scripts.wandb_compat import wandb
-from scripts.noise_schedules import ExponentialContractingSchedule
+
+from mmsfm.noise_schedules import ExponentialContractingSchedule
+from mmsfm.wandb_compat import wandb
 
 def plot_latent_trajectories(
     traj: np.ndarray,       # (T, N, K)

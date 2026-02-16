@@ -21,7 +21,7 @@ from mmsfm.flow_ode_trainer import (
     ODESolverConfig as FlowODESolverConfig,
     compute_grad_norm,
 )
-from scripts.training_losses import stability_regularization_loss
+from mmsfm.losses import stability_regularization_loss
 
 from mmsfm.training.ema import EMA
 from mmsfm.latent_flow.matcher import LatentFlowMatcher

@@ -4,9 +4,9 @@
 
 | Experiment | Script | Description |
 |-----------|--------|-------------|
-| Synthetic/Single-cell | `scripts/main.py` | Multi-marginal flow matching with splines |
-| Image progression | `scripts/images/images_main.py` | Class progression on CIFAR-10/Imagenette |
-| Latent MSBM | `scripts/latent_msbm_main.py` | Latent-space Schrödinger Bridge Matching |
+| Synthetic/Single-cell | `archive/2026-02-16_non_fae_scripts/scripts/main.py` | Multi-marginal flow matching with splines |
+| Image progression | `archive/2026-02-16_non_fae_scripts/scripts/images/images_main.py` | Class progression on CIFAR-10/Imagenette |
+| Latent MSBM | `archive/2026-02-16_non_fae_scripts/scripts/latent_msbm_main.py` | Latent-space Schrödinger Bridge Matching |
 
 ## FAE Extensions (JAX/Flax)
 
