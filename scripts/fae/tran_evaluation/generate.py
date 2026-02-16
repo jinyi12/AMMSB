@@ -16,10 +16,11 @@ The main entry point is :func:`generate_backward_realizations`, which:
 
 from __future__ import annotations
 
+import ast
 import sys
 from contextlib import nullcontext
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import numpy as np
 import torch
@@ -38,8 +39,25 @@ from scripts.fae.fae_naive.train_latent_msbm import (  # noqa: E402
     _make_fae_apply_fns,
 )
 from scripts.fae.generate_full_trajectories import _sample_full_trajectory  # noqa: E402
-from scripts.pca.pca_visualization_utils import parse_args_file  # noqa: E402
 from scripts.utils import get_device  # noqa: E402
+
+
+def parse_args_file(args_path: Path) -> dict[str, Any]:
+    """Parse args.txt file with key=value format."""
+    if not args_path.exists():
+        raise FileNotFoundError(f"Args file not found at {args_path}")
+    parsed: dict[str, Any] = {}
+    for line in args_path.read_text().splitlines():
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        try:
+            parsed[key] = ast.literal_eval(value)
+        except Exception:
+            parsed[key] = value
+    return parsed
 
 from mmsfm.latent_msbm import LatentMSBMAgent  # noqa: E402
 from mmsfm.latent_msbm.noise_schedule import (  # noqa: E402

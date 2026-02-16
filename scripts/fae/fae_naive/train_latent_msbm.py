@@ -136,6 +136,16 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--decode_use_ema", action="store_true", default=True)
     p.add_argument("--no_decode_use_ema", action="store_false", dest="decode_use_ema")
     p.add_argument("--decode_drift_clip_norm", type=float, default=None)
+    p.add_argument(
+        "--decode_mode",
+        type=str,
+        default="auto",
+        choices=["auto", "standard", "one_step", "multistep"],
+        help="Decode mode for FAE decoder. 'auto' uses one_step for denoiser decoders, "
+        "standard call for MLP decoders. 'one_step'=1-NFE denoiser, 'multistep'=ODE/SDE sampling.",
+    )
+    p.add_argument("--denoiser_num_steps", type=int, default=32, help="Euler steps for multistep decode mode.")
+    p.add_argument("--denoiser_noise_scale", type=float, default=1.0, help="Noise scale for one_step decode mode.")
 
     # Lightweight eval during training (plots + decoded samples)
     p.add_argument(
@@ -208,29 +218,56 @@ def _build_attention_fae_from_checkpoint(
     if not decoder_features:
         raise ValueError("Checkpoint architecture missing `decoder_features`.")
 
+    def _ckpt_val(key: str, default):
+        """Look up a value in arch first, then ckpt_args, then fallback to default."""
+        return arch.get(key, ckpt_args.get(key, default))
+
+    # Multiscale sigmas are stored as lists in arch but build_autoencoder expects
+    # comma-separated strings.
+    def _sigmas_to_str(key: str) -> str:
+        val = _ckpt_val(key, "")
+        if isinstance(val, (list, tuple)):
+            return ",".join(str(s) for s in val)
+        return str(val) if val else ""
+
     autoencoder, _arch_info = build_attention_fae(
         key=subkey,
         latent_dim=int(arch["latent_dim"]),
         n_freqs=int(arch["n_freqs"]),
         fourier_sigma=float(arch["fourier_sigma"]),
         decoder_features=decoder_features,
-        encoder_mlp_dim=int(arch.get("encoder_mlp_dim", ckpt_args.get("encoder_mlp_dim", 128))),
-        encoder_mlp_layers=int(arch.get("encoder_mlp_layers", ckpt_args.get("encoder_mlp_layers", 2))),
-        pooling_type=str(arch.get("pooling_type", ckpt_args.get("pooling_type", "deepset"))),
-        n_heads=int(arch.get("n_heads", ckpt_args.get("n_heads", 4))),
-        coord_aware=bool(arch.get("coord_aware", ckpt_args.get("coord_aware", False))),
-        n_residual_blocks=int(arch.get("n_residual_blocks", ckpt_args.get("n_residual_blocks", 3))),
-        decoder_type=str(arch.get("decoder_type", ckpt_args.get("decoder_type", "standard"))),
-        rff_dim=int(arch.get("rff_dim", ckpt_args.get("rff_dim", 256))),
-        rff_sigma=float(arch.get("rff_sigma", ckpt_args.get("rff_sigma", 1.0))),
-        rff_multiscale_sigmas=str(arch.get("rff_multiscale_sigmas", ckpt_args.get("rff_multiscale_sigmas", "")) or ""),
-        wire_first_omega0=float(arch.get("wire_first_omega0", ckpt_args.get("wire_first_omega0", 10.0))),
-        wire_hidden_omega0=float(arch.get("wire_hidden_omega0", ckpt_args.get("wire_hidden_omega0", 10.0))),
-        wire_sigma0=float(arch.get("wire_sigma0", ckpt_args.get("wire_sigma0", 10.0))),
-        wire_trainable_omega_sigma=bool(
-            arch.get("wire_trainable_omega_sigma", ckpt_args.get("wire_trainable_omega_sigma", False))
-        ),
-        wire_layers=int(arch.get("wire_layers", ckpt_args.get("wire_layers", 2))),
+        encoder_multiscale_sigmas=_sigmas_to_str("encoder_multiscale_sigmas"),
+        decoder_multiscale_sigmas=_sigmas_to_str("decoder_multiscale_sigmas"),
+        encoder_mlp_dim=int(_ckpt_val("encoder_mlp_dim", 128)),
+        encoder_mlp_layers=int(_ckpt_val("encoder_mlp_layers", 2)),
+        pooling_type=str(_ckpt_val("pooling_type", "deepset")),
+        n_heads=int(_ckpt_val("n_heads", 4)),
+        coord_aware=bool(_ckpt_val("coord_aware", False)),
+        n_residual_blocks=int(_ckpt_val("n_residual_blocks", 3)),
+        decoder_type=str(_ckpt_val("decoder_type", "standard")),
+        rff_dim=int(_ckpt_val("rff_dim", 256)),
+        rff_sigma=float(_ckpt_val("rff_sigma", 1.0)),
+        rff_multiscale_sigmas=str(_ckpt_val("rff_multiscale_sigmas", "") or ""),
+        wire_first_omega0=float(_ckpt_val("wire_first_omega0", 10.0)),
+        wire_hidden_omega0=float(_ckpt_val("wire_hidden_omega0", 10.0)),
+        wire_sigma0=float(_ckpt_val("wire_sigma0", 10.0)),
+        wire_trainable_omega_sigma=bool(_ckpt_val("wire_trainable_omega_sigma", False)),
+        wire_layers=int(_ckpt_val("wire_layers", 2)),
+        # Denoiser-specific params (no-op for standard decoders)
+        denoiser_time_emb_dim=int(_ckpt_val("denoiser_time_emb_dim", 32)),
+        denoiser_scaling=float(_ckpt_val("denoiser_scaling", 2.0)),
+        denoiser_diffusion_steps=int(_ckpt_val("denoiser_diffusion_steps", 1000)),
+        denoiser_beta_schedule=str(_ckpt_val("denoiser_beta_schedule", "cosine")),
+        denoiser_norm=str(_ckpt_val("denoiser_norm", "layernorm")),
+        denoiser_sampler=str(_ckpt_val("denoiser_sampler", "ode")),
+        denoiser_sde_sigma=float(_ckpt_val("denoiser_sde_sigma", 1.0)),
+        denoiser_local_basis_size=int(_ckpt_val("denoiser_local_basis_size", 64)),
+        denoiser_local_sigma=float(_ckpt_val("denoiser_local_sigma", 0.08)),
+        denoiser_local_low_noise_power=float(_ckpt_val("denoiser_local_low_noise_power", 1.0)),
+        decoder_use_mmlp=bool(_ckpt_val("decoder_use_mmlp", False)),
+        mmlp_factors=int(_ckpt_val("mmlp_factors", 2)),
+        mmlp_activation=str(_ckpt_val("mmlp_activation", "tanh")),
+        mmlp_gaussian_sigma=float(_ckpt_val("mmlp_gaussian_sigma", 1.0)),
     )
 
     params = ckpt.get("params", None)
@@ -247,15 +284,51 @@ def _build_attention_fae_from_checkpoint(
     return autoencoder, params, batch_stats, meta
 
 
-def _make_fae_apply_fns(autoencoder, params: dict, batch_stats: Optional[dict]):
-    """Return (encode_fn, decode_fn) that operate on numpy arrays and return numpy arrays."""
+def _make_fae_apply_fns(
+    autoencoder,
+    params: dict,
+    batch_stats: Optional[dict],
+    decode_mode: str = "auto",
+    denoiser_num_steps: int = 32,
+    denoiser_noise_scale: float = 1.0,
+):
+    """Return (encode_fn, decode_fn) that operate on numpy arrays and return numpy arrays.
+
+    Parameters
+    ----------
+    decode_mode : str
+        How to decode latent codes to fields.  Options:
+        - ``"auto"``: use ``one_step`` for denoiser decoders, standard call otherwise.
+        - ``"standard"``: always use the default ``__call__`` (deterministic proxy
+          for denoisers — only useful for standard MLP decoders).
+        - ``"one_step"``: 1-NFE denoiser generation (``decoder.one_step_generate``).
+        - ``"multistep"``: iterative ODE/SDE sampling (``decoder.sample``).
+    denoiser_num_steps : int
+        Number of Euler steps for ``"multistep"`` mode.
+    denoiser_noise_scale : float
+        Noise scale for ``"one_step"`` mode.
+    """
     import jax
     import jax.numpy as jnp
+    from scripts.fae.fae_naive.diffusion_denoiser_decoder import DiffusionDenoiserDecoder
 
     params_enc = params["encoder"]
     params_dec = params["decoder"]
     bs_enc = None if batch_stats is None else batch_stats.get("encoder", None)
     bs_dec = None if batch_stats is None else batch_stats.get("decoder", None)
+
+    is_denoiser = isinstance(autoencoder.decoder, DiffusionDenoiserDecoder)
+
+    # Resolve "auto" mode
+    if decode_mode == "auto":
+        decode_mode = "one_step" if is_denoiser else "standard"
+
+    if decode_mode in ("one_step", "multistep") and not is_denoiser:
+        print(
+            f"Warning: decode_mode='{decode_mode}' requested but decoder is not a "
+            "denoiser. Falling back to 'standard'."
+        )
+        decode_mode = "standard"
 
     def _encode(u: jnp.ndarray, x: jnp.ndarray):
         variables = {"params": params_enc}
@@ -263,11 +336,44 @@ def _make_fae_apply_fns(autoencoder, params: dict, batch_stats: Optional[dict]):
             variables["batch_stats"] = bs_enc
         return autoencoder.encoder.apply(variables, u, x, train=False)
 
-    def _decode(z: jnp.ndarray, x: jnp.ndarray):
+    def _build_dec_variables():
         variables = {"params": params_dec}
         if bs_dec is not None:
             variables["batch_stats"] = bs_dec
-        return autoencoder.decoder.apply(variables, z, x, train=False)
+        return variables
+
+    if decode_mode == "standard":
+        def _decode(z: jnp.ndarray, x: jnp.ndarray):
+            return autoencoder.decoder.apply(_build_dec_variables(), z, x, train=False)
+    elif decode_mode == "one_step":
+        # Pre-allocate a counter for deterministic-but-varied PRNG keys
+        _call_counter = [0]
+
+        def _decode(z: jnp.ndarray, x: jnp.ndarray):
+            key = jax.random.PRNGKey(_call_counter[0])
+            _call_counter[0] += 1
+            return autoencoder.decoder.apply(
+                _build_dec_variables(),
+                z, x, key,
+                noise_scale=denoiser_noise_scale,
+                train=False,
+                method=autoencoder.decoder.one_step_generate,
+            )
+    elif decode_mode == "multistep":
+        _call_counter = [0]
+
+        def _decode(z: jnp.ndarray, x: jnp.ndarray):
+            key = jax.random.PRNGKey(_call_counter[0])
+            _call_counter[0] += 1
+            return autoencoder.decoder.apply(
+                _build_dec_variables(),
+                z, x, key,
+                num_steps=denoiser_num_steps,
+                train=False,
+                method=autoencoder.decoder.sample,
+            )
+    else:
+        raise ValueError(f"Unknown decode_mode='{decode_mode}'. Expected 'auto', 'standard', 'one_step', or 'multistep'.")
 
     encode_jit = jax.jit(_encode)
     decode_jit = jax.jit(_decode)
@@ -280,6 +386,7 @@ def _make_fae_apply_fns(autoencoder, params: dict, batch_stats: Optional[dict]):
         u_hat = decode_jit(jnp.asarray(z_np), jnp.asarray(x_np))
         return np.asarray(jax.device_get(u_hat), dtype=np.float32)
 
+    print(f"FAE decode mode: {decode_mode}" + (f" (is_denoiser={is_denoiser})" if is_denoiser else ""))
     return encode_np, decode_np
 
 
@@ -501,7 +608,14 @@ def main() -> None:
     train_ratio = float(args.train_ratio) if args.train_ratio is not None else float(fae_meta["args"].get("train_ratio", 0.8))
     train_ratio = float(np.clip(train_ratio, 0.01, 0.99))
 
-    encode_fn, decode_fn = _make_fae_apply_fns(autoencoder, fae_params, fae_batch_stats)
+    encode_fn, decode_fn = _make_fae_apply_fns(
+        autoencoder,
+        fae_params,
+        fae_batch_stats,
+        decode_mode=str(args.decode_mode),
+        denoiser_num_steps=int(args.denoiser_num_steps),
+        denoiser_noise_scale=float(args.denoiser_noise_scale),
+    )
     latent_dim = int(fae_meta["latent_dim"])
 
     print("Encoding time marginals to FAE latent space...")

@@ -57,9 +57,11 @@ trained to reconstruct it.
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import sys
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
@@ -110,7 +112,24 @@ from scripts.fae.tran_evaluation.report import (  # noqa: E402
     print_trajectory_summary_table,
 )
 from scripts.images.field_visualization import format_for_paper  # noqa: E402
-from scripts.pca.pca_visualization_utils import parse_args_file  # noqa: E402
+
+
+def parse_args_file(args_path: Path) -> dict[str, Any]:
+    """Parse args.txt file with key=value format."""
+    if not args_path.exists():
+        raise FileNotFoundError(f"Args file not found at {args_path}")
+    parsed: dict[str, Any] = {}
+    for line in args_path.read_text().splitlines():
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        try:
+            parsed[key] = ast.literal_eval(value)
+        except Exception:
+            parsed[key] = value
+    return parsed
 
 
 # ============================================================================

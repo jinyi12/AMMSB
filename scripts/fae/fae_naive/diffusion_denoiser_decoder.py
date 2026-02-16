@@ -320,6 +320,92 @@ class DiffusionDenoiserDecoder(Decoder):
 
         return self.post_activation(z_t)
 
+    def sample_trajectory(
+        self,
+        z: jax.Array,
+        x: jax.Array,
+        key: jax.Array,
+        num_steps: Optional[int] = None,
+        sampler: Optional[str] = None,
+        sde_sigma: Optional[float] = None,
+        train: bool = False,
+    ) -> tuple[jax.Array, jax.Array]:
+        """Sample while returning the full latent spacetime trajectory.
+
+        Returns
+        -------
+        t_grid : jax.Array
+            Array of shape [steps+1] with the diffusion time values.
+        z_traj : jax.Array
+            Array of shape [steps+1, batch, n_points, out_dim] containing the
+            intermediate noisy fields along the sampling path, including the
+            initial noise state.
+
+        Notes
+        -----
+        - This returns the *internal* noisy state, without `post_activation`, so
+          it can be used for spacetime geometry diagnostics.
+        - The time grid is the same as used by `sample()`.
+        """
+        del train
+
+        steps = self.diffusion_steps if num_steps is None else int(num_steps)
+        if steps <= 0:
+            raise ValueError("num_steps must be positive.")
+        if steps > self.diffusion_steps:
+            raise ValueError("num_steps cannot exceed diffusion_steps used in training.")
+
+        sampler_mode = self.sampler if sampler is None else sampler
+        if sampler_mode not in {"ode", "sde"}:
+            raise ValueError("sampler must be one of {'ode', 'sde'}.")
+        sigma = float(self.sde_sigma if sde_sigma is None else sde_sigma)
+        if sigma < 0:
+            raise ValueError("sde_sigma must be >= 0.")
+
+        t_grid = self._make_time_grid(steps)
+        batch_size, n_points, _ = x.shape
+        key, noise_key = jax.random.split(key)
+        z0 = jax.random.normal(noise_key, (batch_size, n_points, self.out_dim))
+        use_stochastic = jnp.asarray(sampler_mode == "sde" and sigma > 0.0)
+
+        def scan_step(carry, ts):
+            z_curr, rng = carry
+            t_curr, t_next = ts
+            dt = t_next - t_curr
+
+            t_batch = jnp.full((batch_size,), t_curr, dtype=jnp.float32)
+            x_pred = self.predict_x(z=z, x=x, noisy_field=z_curr, t=t_batch, train=False)
+            v_pred = self._v_from_xz(x=x_pred, z_t=z_curr, t=t_batch)
+            z_next = z_curr + dt * v_pred
+
+            def add_noise(args):
+                z_in, rng_in = args
+                rng_out, step_noise_key = jax.random.split(rng_in)
+                step_noise = jax.random.normal(step_noise_key, z_in.shape)
+                z_out = z_in + jnp.sqrt(jnp.abs(dt)) * sigma * step_noise
+                return z_out, rng_out
+
+            def no_noise(args):
+                z_in, rng_in = args
+                return z_in, rng_in
+
+            z_next, rng = jax.lax.cond(
+                use_stochastic,
+                add_noise,
+                no_noise,
+                (z_next, rng),
+            )
+            return (z_next, rng), z_next
+
+        (zT, _), z_hist = jax.lax.scan(
+            scan_step,
+            (z0, key),
+            (t_grid[:-1], t_grid[1:]),
+        )
+        del zT
+        z_traj = jnp.concatenate([z0[None, ...], z_hist], axis=0)
+        return t_grid, z_traj
+
     def _forward(self, z, x, train: bool = False):
         # Autoencoder initialization calls decoder(z, x). For denoiser training,
         # this path is not used for reconstruction; return a deterministic proxy.

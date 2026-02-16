@@ -930,6 +930,10 @@ def visualize_reconstructions_all_times(
 
     if held_out_indices is None:
         held_out_indices = [int(i) for i in data.get("held_out_indices", [])]
+    # Match training loaders: for Tran inclusions, exclude the microscale t=0 field.
+    data_generator = str(data.get("data_generator", ""))
+    if data_generator == "tran_inclusion":
+        held_out_indices = sorted(set(held_out_indices) | {0})
     ho_set = set(held_out_indices)
 
     os.makedirs(output_dir, exist_ok=True)
@@ -986,6 +990,239 @@ def visualize_reconstructions_all_times(
         plt.close(fig)
 
     print(f"Saved reconstruction visualizations to {output_dir}")
+
+
+def visualize_physical_space_reconstructions(
+    autoencoder: Autoencoder,
+    state,
+    test_dataloader,
+    transform_info: dict,
+    n_samples: int = 4,
+    n_batches: int = 1,
+    reconstruct_fn: Optional[Callable] = None,
+    key: Optional[jax.Array] = None,
+) -> Optional[plt.Figure]:
+    """Create reconstruction visualization in **physical** (inverse-transformed) space.
+
+    This applies the inverse transform (e.g. affine rescaling for affine-standardized data)
+    to both ground-truth and reconstructed fields before plotting, so the
+    visualization shows values in the original physical units (e.g. conductivity).
+
+    Returns a figure with 3 rows: physical original, physical reconstruction,
+    and pointwise absolute error in physical space.
+    """
+    from data.transform_utils import apply_inverse_transform
+
+    import matplotlib.tri as mtri
+    if key is None:
+        key = jax.random.PRNGKey(0)
+
+    if transform_info.get("type", "none") == "none":
+        return None
+
+    samples_collected = []
+    for i, batch in enumerate(test_dataloader):
+        if i >= n_batches:
+            break
+        u_dec, x_dec, u_enc, x_enc = batch
+        u_enc = jnp.array(u_enc)
+        x_enc = jnp.array(x_enc)
+        x_dec = jnp.array(x_dec)
+        u_dec = jnp.array(u_dec)
+
+        if reconstruct_fn is None:
+            z = autoencoder.encode(state, u_enc, x_enc, train=False)
+            u_hat = autoencoder.decode(state, z, x_dec, train=False)
+        else:
+            key, subkey = jax.random.split(key)
+            u_hat = reconstruct_fn(
+                autoencoder, state, u_dec, x_dec, u_enc, x_enc, subkey,
+            )
+
+        u_dec_np = np.array(u_dec[:, :, 0])
+        u_hat_np = np.array(u_hat[:, :, 0])
+
+        try:
+            orig_phys = apply_inverse_transform(u_dec_np, transform_info)
+            recon_phys = apply_inverse_transform(u_hat_np, transform_info)
+        except ValueError:
+            # Per-pixel transform arrays (e.g. minmax data_min/data_scale)
+            # can't broadcast with subsampled decoder points. Skip.
+            return None
+
+        for j in range(min(n_samples - len(samples_collected), u_dec.shape[0])):
+            coords = np.array(x_dec[j])
+            if coords.ndim != 2 or coords.shape[-1] < 2:
+                continue
+            samples_collected.append({
+                "coords": coords[:, :2],
+                "original_phys": orig_phys[j],
+                "reconstructed_phys": recon_phys[j],
+            })
+            if len(samples_collected) >= n_samples:
+                break
+        if len(samples_collected) >= n_samples:
+            break
+
+    if not samples_collected:
+        return None
+
+    n_show = len(samples_collected)
+    fig, axes = plt.subplots(3, n_show, figsize=(3 * n_show, 9))
+    if n_show == 1:
+        axes = axes[:, None]
+
+    for j in range(n_show):
+        coords = samples_collected[j]["coords"]
+        orig = samples_collected[j]["original_phys"]
+        recon = samples_collected[j]["reconstructed_phys"]
+        vmin = float(min(orig.min(), recon.min()))
+        vmax = float(max(orig.max(), recon.max()))
+
+        x = coords[:, 0]
+        y = coords[:, 1]
+        try:
+            tri = mtri.Triangulation(x, y)
+        except Exception:
+            tri = None
+
+        for row, field, label in [
+            (0, orig, "GT (phys)"),
+            (1, recon, "Recon (phys)"),
+        ]:
+            if tri is not None:
+                axes[row, j].tripcolor(
+                    tri, field, vmin=vmin, vmax=vmax, cmap="viridis", shading="gouraud",
+                )
+            else:
+                axes[row, j].scatter(
+                    x, y, c=field, s=6, vmin=vmin, vmax=vmax, cmap="viridis",
+                )
+            axes[row, j].set_title(f"{label} {j+1}")
+            axes[row, j].axis("off")
+            axes[row, j].set_aspect("equal")
+
+        abs_err = np.abs(orig - recon)
+        if tri is not None:
+            axes[2, j].tripcolor(tri, abs_err, cmap="hot", shading="gouraud")
+        else:
+            axes[2, j].scatter(x, y, c=abs_err, s=6, cmap="hot")
+        axes[2, j].set_title(f"|Error| {j+1}")
+        axes[2, j].axis("off")
+        axes[2, j].set_aspect("equal")
+
+        rel_error = np.linalg.norm(orig - recon) / max(np.linalg.norm(orig), 1e-10)
+        axes[2, j].text(
+            0.5, -0.05, f"Rel-Err: {rel_error:.3f}",
+            transform=axes[2, j].transAxes, ha="center", fontsize=8,
+        )
+
+    fig.suptitle("Physical-space reconstruction", fontsize=12)
+    fig.tight_layout()
+    return fig
+
+
+def visualize_reconstructions_all_times_physical(
+    autoencoder: Autoencoder,
+    state,
+    npz_path: str,
+    output_dir: str,
+    n_samples: int = 4,
+    held_out_indices: Optional[list[int]] = None,
+    reconstruct_fn: Optional[Callable] = None,
+    key: Optional[jax.Array] = None,
+) -> None:
+    """Save physical-space reconstruction visualizations for all times.
+
+    Like ``visualize_reconstructions_all_times`` but applies the inverse
+    transform so plots are in physical units (conductivity, etc.).
+    """
+    from data.transform_utils import load_transform_info, apply_inverse_transform
+
+    if key is None:
+        key = jax.random.PRNGKey(0)
+
+    data = np.load(npz_path, allow_pickle=True)
+    transform_info = load_transform_info(data)
+    if transform_info.get("type", "none") == "none":
+        print("No inverse transform to apply; skipping physical-space visualization.")
+        data.close()
+        return
+
+    grid_coords = data["grid_coords"].astype(np.float32)
+    resolution = int(data["resolution"])
+
+    marginal_keys = sorted(
+        [k for k in data.keys() if k.startswith("raw_marginal_")],
+        key=lambda k: float(k.replace("raw_marginal_", "")),
+    )
+
+    if held_out_indices is None:
+        held_out_indices = [int(i) for i in data.get("held_out_indices", [])]
+    # Match training loaders: for Tran inclusions, exclude the microscale t=0 field.
+    data_generator = str(data.get("data_generator", ""))
+    if data_generator == "tran_inclusion":
+        held_out_indices = sorted(set(held_out_indices) | {0})
+    ho_set = set(held_out_indices)
+
+    phys_dir = os.path.join(output_dir, "physical_space")
+    os.makedirs(phys_dir, exist_ok=True)
+
+    for tidx, marginal_key in enumerate(marginal_keys):
+        t = float(marginal_key.replace("raw_marginal_", ""))
+        tag = "held_out" if tidx in ho_set else "train"
+
+        fields = data[marginal_key].astype(np.float32)
+        n_show = min(n_samples, fields.shape[0])
+        u_batch = jnp.array(fields[:n_show, :, None])
+
+        x_batch = jnp.broadcast_to(
+            jnp.array(grid_coords)[None], (n_show, *grid_coords.shape)
+        )
+
+        if reconstruct_fn is None:
+            z = autoencoder.encode(state, u_batch, x_batch, train=False)
+            u_hat = autoencoder.decode(state, z, x_batch, train=False)
+        else:
+            key, subkey = jax.random.split(key)
+            u_hat = reconstruct_fn(
+                autoencoder, state, u_batch, x_batch, u_batch, x_batch, subkey,
+            )
+        u_hat_np = np.array(u_hat[:, :, 0])
+
+        orig_phys = apply_inverse_transform(fields[:n_show], transform_info)
+        recon_phys = apply_inverse_transform(u_hat_np, transform_info)
+
+        fig, axes = plt.subplots(3, n_show, figsize=(3 * n_show, 9))
+        if n_show == 1:
+            axes = axes[:, None]
+
+        for j in range(n_show):
+            o = orig_phys[j].reshape(resolution, resolution)
+            r = recon_phys[j].reshape(resolution, resolution)
+            vmin = min(o.min(), r.min())
+            vmax = max(o.max(), r.max())
+
+            axes[0, j].imshow(o, vmin=vmin, vmax=vmax, cmap="viridis", origin="lower")
+            axes[0, j].set_title("GT (phys)")
+            axes[0, j].axis("off")
+
+            axes[1, j].imshow(r, vmin=vmin, vmax=vmax, cmap="viridis", origin="lower")
+            axes[1, j].set_title("Recon (phys)")
+            axes[1, j].axis("off")
+
+            err = np.abs(o - r)
+            axes[2, j].imshow(err, cmap="hot", origin="lower")
+            axes[2, j].set_title("|Error|")
+            axes[2, j].axis("off")
+
+        fig.suptitle(f"Physical space — t={t:.4f} ({tag})", fontsize=14)
+        fig.tight_layout()
+        fig.savefig(os.path.join(phys_dir, f"recon_phys_t{tidx}_{tag}.png"), dpi=150)
+        plt.close(fig)
+
+    data.close()
+    print(f"Saved physical-space visualizations to {phys_dir}")
 
 
 # ---------------------------------------------------------------------------

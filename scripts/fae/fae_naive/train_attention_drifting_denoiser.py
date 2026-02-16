@@ -56,7 +56,9 @@ from scripts.fae.fae_naive.train_attention_components import (
     save_model_artifact,
     save_model_info,
     setup_output_directory,
+    visualize_physical_space_reconstructions,
     visualize_reconstructions_all_times,
+    visualize_reconstructions_all_times_physical,
     visualize_sample_reconstructions,
 )
 
@@ -843,6 +845,12 @@ def main() -> None:
     )
     print(f"  Train samples: {len(train_dataset)}  |  Test samples: {len(test_dataset)}")
 
+    # Load inverse-transform metadata for physical-space visualizations
+    from data.transform_utils import load_transform_info
+    with np.load(args.data_path, allow_pickle=True) as _ds:
+        transform_info = load_transform_info(_ds)
+    print(f"  Inverse transform: {transform_info.get('type', 'none')}")
+
     key, subkey = jax.random.split(key)
     autoencoder, architecture_info = build_autoencoder(
         key=subkey,
@@ -976,7 +984,8 @@ def main() -> None:
     vis_callback = None
     if wandb_run is not None:
         def vis_callback(state, epoch):
-            return visualize_sample_reconstructions(
+            # Scaled-space reconstruction
+            fig_scaled = visualize_sample_reconstructions(
                 autoencoder,
                 state,
                 test_loader,
@@ -985,6 +994,24 @@ def main() -> None:
                 reconstruct_fn=reconstruct_fn,
                 key=jax.random.PRNGKey(args.seed + int(epoch) + 1000),
             )
+            # Physical-space reconstruction (inverse transform)
+            fig_phys = visualize_physical_space_reconstructions(
+                autoencoder,
+                state,
+                test_loader,
+                transform_info=transform_info,
+                n_samples=args.n_vis_samples,
+                n_batches=1,
+                reconstruct_fn=reconstruct_fn,
+                key=jax.random.PRNGKey(args.seed + int(epoch) + 2000),
+            )
+            if fig_phys is not None:
+                wandb_run.log({
+                    "eval/reconstructions_physical": wandb.Image(fig_phys),
+                    "eval/epoch_vis_phys": epoch,
+                })
+                plt.close(fig_phys)
+            return fig_scaled
 
     best_model_path = (
         os.path.join(paths["checkpoints"], "best_state.pkl")
@@ -1203,6 +1230,17 @@ def main() -> None:
                 reconstruct_fn=reconstruct_fn,
                 key=jax.random.PRNGKey(args.seed + 5000),
             )
+            # Physical-space (inverse-transformed) visualizations
+            visualize_reconstructions_all_times_physical(
+                autoencoder,
+                state,
+                args.data_path,
+                paths["figures"],
+                n_samples=args.n_vis_samples,
+                held_out_indices=held_out_indices,
+                reconstruct_fn=reconstruct_fn,
+                key=jax.random.PRNGKey(args.seed + 6000),
+            )
         else:
             fig = visualize_sample_reconstructions(
                 autoencoder,
@@ -1221,9 +1259,12 @@ def main() -> None:
                 plt.close(fig)
 
         if wandb_run is not None:
-            for vis_file in glob.glob(os.path.join(paths["figures"], "*.png")):
-                img_name = os.path.basename(vis_file).replace(".png", "")
-                wandb_run.log({f"reconstructions/{img_name}": wandb.Image(vis_file)})
+            fig_dirs = [paths["figures"], os.path.join(paths["figures"], "physical_space")]
+            for fig_dir in fig_dirs:
+                for vis_file in glob.glob(os.path.join(fig_dir, "*.png")):
+                    img_name = os.path.basename(vis_file).replace(".png", "")
+                    prefix = "reconstructions_physical" if "physical_space" in fig_dir else "reconstructions"
+                    wandb_run.log({f"{prefix}/{img_name}": wandb.Image(vis_file)})
     except Exception as e:
         print(f"Warning: Visualization failed: {e}")
 

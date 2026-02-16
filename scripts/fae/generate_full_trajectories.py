@@ -15,10 +15,11 @@ python scripts/fae/generate_full_trajectories.py \\
 from __future__ import annotations
 
 import argparse
+import ast
 import pickle
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import numpy as np
 import torch
@@ -36,8 +37,25 @@ from scripts.fae.fae_naive.train_latent_msbm import (
     _load_fae_checkpoint,
     _make_fae_apply_fns,
 )
-from scripts.pca.pca_visualization_utils import parse_args_file
 from scripts.utils import get_device
+
+
+def parse_args_file(args_path: Path) -> dict[str, Any]:
+    """Parse args.txt file with key=value format."""
+    if not args_path.exists():
+        raise FileNotFoundError(f"Args file not found at {args_path}")
+    parsed: dict[str, Any] = {}
+    for line in args_path.read_text().splitlines():
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        try:
+            parsed[key] = ast.literal_eval(value)
+        except Exception:
+            parsed[key] = value
+    return parsed
 
 from mmsfm.latent_msbm import LatentMSBMAgent
 from mmsfm.latent_msbm.coupling import MSBMCouplingSampler
@@ -73,6 +91,16 @@ def _parse_args() -> argparse.Namespace:
         default=0,
         help="Sample index to use for realizations (only used if --n_realizations is set).",
     )
+    p.add_argument(
+        "--decode_mode",
+        type=str,
+        default="auto",
+        choices=["auto", "standard", "one_step", "multistep"],
+        help="Decode mode for FAE decoder. 'auto' uses one_step for denoiser decoders.",
+    )
+    p.add_argument("--denoiser_num_steps", type=int, default=32, help="Euler steps for multistep decode.")
+    p.add_argument("--denoiser_noise_scale", type=float, default=1.0, help="Noise scale for one_step decode.")
+    p.add_argument("--decode_batch_size", type=int, default=None, help="Batch size for decoding (overrides train config).")
     return p.parse_args()
 
 
@@ -502,9 +530,17 @@ def main() -> None:
         else:
             ckpt = _load_fae_checkpoint(fae_checkpoint_path)
             autoencoder, fae_params, fae_batch_stats, _ = _build_attention_fae_from_checkpoint(ckpt)
-            _, decode_fn = _make_fae_apply_fns(autoencoder, fae_params, fae_batch_stats)
+            _, decode_fn = _make_fae_apply_fns(
+                autoencoder,
+                fae_params,
+                fae_batch_stats,
+                decode_mode=str(args.decode_mode),
+                denoiser_num_steps=int(args.denoiser_num_steps),
+                denoiser_noise_scale=float(args.denoiser_noise_scale),
+            )
 
-            encode_batch_size = int(train_cfg.get("encode_batch_size", 64))
+            encode_batch_size = args.decode_batch_size if args.decode_batch_size is not None else int(train_cfg.get("encode_batch_size", 64))
+            print(f"FAE decode batch size: {encode_batch_size}")
 
             if args.direction in ("forward", "both") and "latent_forward_full" in artifacts:
                 print("  Decoding forward trajectory...")
