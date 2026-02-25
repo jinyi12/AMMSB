@@ -190,6 +190,7 @@ class MSBMCouplingSampler:
                 t_final=t1_f,
                 save_traj=False,
                 drift_clip_norm=drift_clip_norm,
+                direction=getattr(policy_impt, "direction", "forward"),
             )
 
             # Reversed endpoint order for backward policy regression.
@@ -212,6 +213,7 @@ class MSBMCouplingSampler:
                 t_final=t1_rev,
                 save_traj=False,
                 drift_clip_norm=drift_clip_norm,
+                direction=getattr(policy_impt, "direction", "backward"),
             )
 
             # Forward endpoint order for forward policy regression.

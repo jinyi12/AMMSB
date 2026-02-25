@@ -31,12 +31,12 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from data.transform_utils import apply_inverse_transform, load_transform_info  # noqa: E402
-from scripts.fae.fae_naive.train_latent_msbm import (  # noqa: E402
-    _NoopTimeModule,
-    _build_attention_fae_from_checkpoint,
-    _decode_latent_knots_to_fields,
-    _load_fae_checkpoint,
-    _make_fae_apply_fns,
+from scripts.fae.fae_naive.fae_latent_utils import (  # noqa: E402
+    NoopTimeModule,
+    build_attention_fae_from_checkpoint,
+    decode_latent_knots_to_fields,
+    load_fae_checkpoint,
+    make_fae_apply_fns,
 )
 from scripts.fae.generate_full_trajectories import _sample_full_trajectory  # noqa: E402
 from scripts.utils import get_device  # noqa: E402
@@ -94,8 +94,8 @@ def _build_agent(
         )
 
     return LatentMSBMAgent(
-        encoder=_NoopTimeModule(),
-        decoder=_NoopTimeModule(),
+        encoder=NoopTimeModule(),
+        decoder=NoopTimeModule(),
         latent_dim=latent_dim,
         zt=list(map(float, zt.tolist())),
         initial_coupling=str(train_cfg.get("initial_coupling", "paired")),
@@ -300,13 +300,13 @@ def generate_backward_realizations(
     if not fae_checkpoint_path.exists():
         raise FileNotFoundError(f"FAE checkpoint not found: {fae_checkpoint_path}")
 
-    ckpt = _load_fae_checkpoint(fae_checkpoint_path)
-    autoencoder, fae_params, fae_batch_stats, _ = _build_attention_fae_from_checkpoint(ckpt)
-    _, decode_fn = _make_fae_apply_fns(autoencoder, fae_params, fae_batch_stats)
+    ckpt = load_fae_checkpoint(fae_checkpoint_path)
+    autoencoder, fae_params, fae_batch_stats, _ = build_attention_fae_from_checkpoint(ckpt)
+    _, decode_fn = make_fae_apply_fns(autoencoder, fae_params, fae_batch_stats)
 
     encode_batch_size = int(train_cfg.get("encode_batch_size", 64))
 
-    fields_b = _decode_latent_knots_to_fields(
+    fields_b = decode_latent_knots_to_fields(
         latent_knots=full_traj_b_np,
         grid_coords=grid_coords,
         decode_fn=decode_fn,
@@ -327,7 +327,7 @@ def generate_backward_realizations(
     # Decode knot-time marginals (trajectory fields at each MSBM scale)
     # ------------------------------------------------------------------
     print("  Decoding knot-time marginals for trajectory evaluation...")
-    knot_fields_log = _decode_latent_knots_to_fields(
+    knot_fields_log = decode_latent_knots_to_fields(
         latent_knots=knots_b_np,
         grid_coords=grid_coords,
         decode_fn=decode_fn,

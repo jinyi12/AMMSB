@@ -12,6 +12,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
+from matplotlib.patches import Patch
 from numpy.typing import NDArray
 
 from scripts.images.field_visualization import format_for_paper  # noqa: F401
@@ -927,7 +928,7 @@ def plot_direct_field_pdfs(
         ax.fill_between(x, y_gen, alpha=0.14, color=C_GEN)
 
         H_val = eval_H_schedule[scale] if scale < len(eval_H_schedule) else scale
-        ax.set_title(f"$H = {H_val}$", fontsize=FONT_TITLE)
+        ax.set_title(f"$H={H_val:.3g}$", fontsize=FONT_TITLE)
         ax.set_ylabel("Density", fontsize=FONT_LABEL)
         ax.legend(fontsize=FONT_LEGEND, framealpha=0.8)
         ax.grid(alpha=0.2)
@@ -938,6 +939,73 @@ def plot_direct_field_pdfs(
 
     plt.tight_layout()
     _save_fig(fig, out_dir, "fig10_direct_field_pdfs")
+    plt.close(fig)
+
+
+# ============================================================================
+# Conditional evaluation figure – per-pair conditional PDFs
+# ============================================================================
+
+def plot_conditional_pdfs(
+    conditional_pdf_values: Dict[str, Dict],
+    out_dir: Path,
+    n_cols: int = N_COLS,
+) -> None:
+    """Conditional one-point PDFs by scale pair (reference vs generated).
+
+    Parameters
+    ----------
+    conditional_pdf_values : dict
+        Mapping ``pair_label -> {'ref_values': ndarray, 'gen_values': ndarray,
+        'title': str (optional)}``.
+    """
+    pairs = list(conditional_pdf_values.keys())
+    if len(pairs) == 0:
+        return
+
+    n_pairs = len(pairs)
+    n_rows = (n_pairs + n_cols - 1) // n_cols
+
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(FIG_WIDTH, SUBPLOT_HEIGHT * n_rows))
+    axes = np.atleast_2d(axes)
+
+    rng = np.random.default_rng(0)
+
+    for i, pair_label in enumerate(pairs):
+        ax = axes[i // n_cols, i % n_cols]
+        pair_data = conditional_pdf_values[pair_label]
+        ref_values = np.asarray(pair_data["ref_values"], dtype=np.float64)
+        gen_values = np.asarray(pair_data["gen_values"], dtype=np.float64)
+
+        x, y_ref, y_gen = _density_pair_curve(ref_values, gen_values, rng)
+        markevery = max(1, int(len(x) // 10))
+
+        ax.plot(
+            x, y_ref,
+            color=C_OBS, lw=1.4, label="Ref cond.",
+            marker="o", markersize=2.2, markevery=markevery,
+        )
+        ax.fill_between(x, y_ref, alpha=0.14, color=C_OBS)
+
+        ax.plot(
+            x, y_gen,
+            color=C_GEN, lw=1.4, label="Gen cond.",
+            marker="^", markersize=2.2, markevery=markevery,
+        )
+        ax.fill_between(x, y_gen, alpha=0.14, color=C_GEN)
+
+        title = str(pair_data.get("title", pair_label))
+        ax.set_title(title, fontsize=FONT_TITLE)
+        ax.set_ylabel("Density", fontsize=FONT_LABEL)
+        ax.legend(fontsize=FONT_LEGEND, framealpha=0.8)
+        ax.grid(alpha=0.2)
+        _set_tick_fontsize(ax)
+
+    for i in range(n_pairs, n_rows * n_cols):
+        axes[i // n_cols, i % n_cols].set_visible(False)
+
+    plt.tight_layout()
+    _save_fig(fig, out_dir, "fig_conditional_pdfs")
     plt.close(fig)
 
 
@@ -1222,7 +1290,8 @@ def plot_trajectory_pdfs(
 
     **Pass / fail.**  Density curves should overlap closely at every scale.
     Discrepancies reveal where in the backward SDE trajectory the
-    distribution deviates from the target.
+    distribution deviates from the target.  The corresponding per-scale
+    W1 metrics are reported in the trajectory summary table.
     """
     knots = sorted(trajectory_results.keys())
     n_knots = len(knots)
@@ -1258,9 +1327,7 @@ def plot_trajectory_pdfs(
 
         ds_idx = int(time_indices[k])
         H_val = full_H_schedule[ds_idx] if ds_idx < len(full_H_schedule) else ds_idx
-        w1_norm = res["wasserstein1"]["w1_normalised"]
-        ax.set_title(f"$H={H_val}$  ($W_1^{{\\mathrm{{norm}}}}$={w1_norm:.4f})",
-                     fontsize=FONT_TITLE)
+        ax.set_title(f"$H={H_val:.3g}$", fontsize=FONT_TITLE)
         ax.set_ylabel("Density", fontsize=FONT_LABEL)
         ax.legend(fontsize=FONT_LEGEND, framealpha=0.8)
         ax.grid(alpha=0.2)
@@ -1298,7 +1365,8 @@ def plot_trajectory_correlation(
     residuals.  Unlike Fig 11, these are not post-hoc filtered fields.
 
     **Pass / fail.**  Obs curves should fall within the gen +/- sigma
-    envelope.  The J_norm value in each title quantifies the mismatch.
+    envelope.  The corresponding per-scale J metrics are reported in
+    the trajectory summary table.
     """
     knots = sorted(trajectory_results.keys())
     n_knots = len(knots)
@@ -1306,6 +1374,10 @@ def plot_trajectory_correlation(
 
     fig, axes = plt.subplots(n_rows, n_cols, figsize=(FIG_WIDTH, SUBPLOT_HEIGHT * n_rows))
     axes = np.atleast_2d(axes)
+
+    x_max = 0.0
+    y_min = np.inf
+    y_max = -np.inf
 
     for i, k in enumerate(knots):
         ax = axes[i // n_cols, i % n_cols]
@@ -1327,6 +1399,21 @@ def plot_trajectory_correlation(
         m2 = gc["R_e2_mean"][:max_lag_idx]
         s2 = gc["R_e2_std"][:max_lag_idx]
 
+        if lags.size > 0:
+            x_max = max(x_max, float(lags[-1]))
+        for y in (
+            res["R_obs_e1"][:max_lag_idx],
+            res["R_obs_e2"][:max_lag_idx],
+            m1 - s1,
+            m1 + s1,
+            m2 - s2,
+            m2 + s2,
+        ):
+            if y.size == 0:
+                continue
+            y_min = min(y_min, float(np.min(y)))
+            y_max = max(y_max, float(np.max(y)))
+
         ax.plot(lags, m1, "-", color=C_GEN, lw=1.2, label="Gen $e_1$")
         ax.fill_between(lags, m1 - s1, m1 + s1, color=C_FILL, alpha=0.25)
 
@@ -1338,17 +1425,35 @@ def plot_trajectory_correlation(
 
         ds_idx = int(time_indices[k])
         H_val = full_H_schedule[ds_idx] if ds_idx < len(full_H_schedule) else ds_idx
-        J_val = res["J"]["J_normalised"]
-        ax.set_title(
-            f"$H={H_val}$  ($J_{{\\mathrm{{norm}}}}$={J_val:.4f})",
-            fontsize=FONT_TITLE,
-        )
+        ax.set_title(f"$H={H_val:.3g}$", fontsize=FONT_TITLE)
         ax.set_xlabel("$\\tau / D$", fontsize=FONT_LABEL)
         ax.set_ylabel("$R(\\tau)$", fontsize=FONT_LABEL)
         if i == 0:
-            ax.legend(fontsize=FONT_LEGEND, framealpha=0.8, loc="upper right")
+            handles, _ = ax.get_legend_handles_labels()
+            handles.append(
+                Patch(
+                    facecolor=C_FILL,
+                    edgecolor="none",
+                    alpha=0.20,
+                    label="Gen $\\pm 1\\sigma$ (shaded)",
+                )
+            )
+            ax.legend(handles=handles, fontsize=FONT_LEGEND, framealpha=0.8, loc="upper right")
         ax.grid(alpha=0.2)
         _set_tick_fontsize(ax)
+
+    if not np.isfinite(y_min) or not np.isfinite(y_max) or y_max <= y_min:
+        y_min, y_max = -0.1, 1.1
+    y_min = min(y_min, 0.0)
+    y_max = max(y_max, 1.0)
+    y_pad = 0.05 * max(1e-8, y_max - y_min)
+    y_lims = (y_min - y_pad, y_max + y_pad)
+    x_lims = (0.0, x_max if x_max > 0 else 1.0)
+
+    for i in range(n_knots):
+        ax = axes[i // n_cols, i % n_cols]
+        ax.set_xlim(*x_lims)
+        ax.set_ylim(*y_lims)
 
     for i in range(n_knots, n_rows * n_cols):
         axes[i // n_cols, i % n_cols].set_visible(False)
@@ -1484,7 +1589,8 @@ def plot_trajectory_psd(
     correct spectral content at each intermediate time.
 
     **Pass / fail.**  Obs and gen PSD curves should overlap across the
-    full wavenumber range at every knot time.
+    full wavenumber range at every knot time.  The corresponding per-scale
+    PSD mismatch metrics are reported in the trajectory summary table.
     """
     knots = sorted(trajectory_results.keys())
     n_knots = len(knots)
@@ -1514,15 +1620,20 @@ def plot_trajectory_psd(
 
         ds_idx = int(time_indices[k])
         H_val = full_H_schedule[ds_idx] if ds_idx < len(full_H_schedule) else ds_idx
-        delta = res["psd_mismatch"]
-        ax.set_title(
-            f"$H={H_val}$  ($\\Delta_{{\\mathrm{{PSD}}}}$={delta:.3f})",
-            fontsize=FONT_TITLE,
-        )
+        ax.set_title(f"$H={H_val:.3g}$", fontsize=FONT_TITLE)
         ax.set_xlabel("$k$", fontsize=FONT_LABEL)
         ax.set_ylabel("$S(k)$", fontsize=FONT_LABEL)
         if i == 0:
-            ax.legend(fontsize=FONT_LEGEND, framealpha=0.8)
+            handles, _ = ax.get_legend_handles_labels()
+            handles.append(
+                Patch(
+                    facecolor=C_FILL,
+                    edgecolor="none",
+                    alpha=0.20,
+                    label="Gen $\\pm 1\\sigma$ (shaded)",
+                )
+            )
+            ax.legend(handles=handles, fontsize=FONT_LEGEND, framealpha=0.8)
         ax.grid(alpha=0.2)
         _set_tick_fontsize(ax)
 

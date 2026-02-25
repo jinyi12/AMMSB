@@ -312,8 +312,9 @@ class LatentMSBMAgent:
                         t_sample = t0 + eps + t_off
 
                         t_triplet = torch.cat([t0, t_sample, t1], dim=-1)
-                        y_t = self.sde.sample_bridge(y0, y1, t_triplet)
-                        target = self.sde.sample_target(y0, y1, t_triplet)
+                        sde_dir = getattr(policy_opt, "direction", "forward")
+                        y_t = self.sde.sample_bridge(y0, y1, t_triplet, direction=sde_dir)
+                        target = self.sde.sample_target(y0, y1, t_triplet, direction=sde_dir)
                         if torch.isfinite(y_t).all() and torch.isfinite(target).all():
                             break
 

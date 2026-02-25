@@ -42,6 +42,93 @@ class _FiLMLayer(nn.Module):
         return self.act(h)
 
 
+class AugmentedMLP(nn.Module):
+    """Modified MLP with dual input encoders and gated mixing (Wang et al., 2021).
+
+    Given an input x, compute two parallel encodings (U, V), and then mix them at
+    every hidden layer via an element-wise gate:
+
+        U = σ(W_u x + b_u),  V = σ(W_v x + b_v)
+        f^(l) = W^(l) g^(l-1) + b^(l)
+        g^(l) = σ(f^(l)) ⊙ U + (1 - σ(f^(l))) ⊙ V
+        out = W_out g^(L) + b_out
+
+    To support varying hidden widths, we learn (U_l, V_l) per hidden layer.
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        output_dim: int,
+        hidden_dims: list[int],
+        *,
+        activation_cls: type[nn.Module] = nn.ReLU,
+        dropout: float = 0.0,
+        use_spectral_norm: bool = False,
+    ) -> None:
+        super().__init__()
+        input_dim = int(input_dim)
+        output_dim = int(output_dim)
+        hidden_dims = [int(d) for d in hidden_dims]
+        if input_dim <= 0 or output_dim <= 0:
+            raise ValueError("AugmentedMLP requires positive input/output dimensions.")
+
+        self.activation = activation_cls()
+        self.dropout = nn.Dropout(p=float(dropout)) if float(dropout) > 0.0 else None
+
+        def _linear(in_dim: int, out_dim: int, *, is_intermediate: bool) -> nn.Module:
+            layer = nn.Linear(in_dim, out_dim)
+            if use_spectral_norm and is_intermediate:
+                layer = nn.utils.spectral_norm(layer)
+            return layer
+
+        self.gates = nn.ModuleList()
+        self.hat_layers = nn.ModuleList()
+        self.tilde_layers = nn.ModuleList()
+        self.step_norms = nn.ModuleList()
+
+        if len(hidden_dims) == 0:
+            self.first = _linear(input_dim, output_dim, is_intermediate=False)
+            self.first_norm = nn.Identity()
+            self.out = nn.Identity()
+            return
+
+        self.first = _linear(input_dim, hidden_dims[0], is_intermediate=True)
+        self.first_norm = nn.BatchNorm1d(hidden_dims[0])
+        self.hat_layers.append(_linear(input_dim, hidden_dims[0], is_intermediate=True))
+        self.tilde_layers.append(_linear(input_dim, hidden_dims[0], is_intermediate=True))
+
+        for in_dim, out_dim in zip(hidden_dims[:-1], hidden_dims[1:]):
+            self.gates.append(_linear(in_dim, out_dim, is_intermediate=True))
+            self.step_norms.append(nn.BatchNorm1d(out_dim))
+            self.hat_layers.append(_linear(input_dim, out_dim, is_intermediate=True))
+            self.tilde_layers.append(_linear(input_dim, out_dim, is_intermediate=True))
+
+        self.out = nn.Linear(hidden_dims[-1], output_dim)
+
+    def forward(self, x: Tensor) -> Tensor:
+        if len(self.hat_layers) == 0:
+            return self.first(x)
+
+        hat_vals = [self.activation(layer(x)) for layer in self.hat_layers]
+        tilde_vals = [self.activation(layer(x)) for layer in self.tilde_layers]
+
+        f = self.first(x)
+        gate = self.activation(f)
+        g = gate * hat_vals[0] + (1.0 - gate) * tilde_vals[0]
+        if self.dropout is not None:
+            g = self.dropout(g)
+
+        for idx, gate_layer in enumerate(self.gates, start=1):
+            f = gate_layer(g)
+            gate = self.activation(f)
+            g = gate * hat_vals[idx] + (1.0 - gate) * tilde_vals[idx]
+            if self.dropout is not None:
+                g = self.dropout(g)
+
+        return self.out(g)
+
+
 class SinusoidalTimeFiLMMLP(nn.Module):
     """TimeFiLMMLP variant using MSBM-style sinusoidal time embedding."""
 
@@ -93,8 +180,6 @@ class SinusoidalTimeAugmentedMLP(nn.Module):
         zero_out_last_layer: bool = True,
     ):
         super().__init__()
-        from mmsfm.geodesic_ae import AugmentedMLP
-
         self.dim_x = int(dim_x)
         self.dim_out = int(dim_out)
         self.t_dim = int(t_dim)

@@ -45,8 +45,8 @@ class WandbAutoencoderTrainer(AutoencoderTrainer):
         vis_interval: int = 1,
         save_best_model: bool = False,
         best_model_path: Optional[str] = None,
-        track_spectral: bool = False,
         optimizer_config: Optional[dict] = None,
+        extra_init_params_fn: Optional[Callable] = None,
     ):
         super().__init__(
             autoencoder=autoencoder,
@@ -62,9 +62,8 @@ class WandbAutoencoderTrainer(AutoencoderTrainer):
         self.best_model_path = best_model_path
         self.best_metric_value = float("inf")
         self.best_state = None
-        self.track_spectral = track_spectral
-        self.spectral_history = []  # For storing full spectral metrics over training
         self.optimizer_config = dict(optimizer_config or {"name": "adam"})
+        self.extra_init_params_fn = extra_init_params_fn
 
         if save_best_model and best_model_path is None:
             raise ValueError("best_model_path must be provided if save_best_model=True")
@@ -110,9 +109,12 @@ class WandbAutoencoderTrainer(AutoencoderTrainer):
         This is necessary for time-invariant decoder architectures where:
         - Encoder uses 3D coordinates (x, y, t)
         - Decoder uses 2D coordinates (x, y)
+
+        When ``extra_init_params_fn`` is set, its output is merged into
+        ``variables["params"]`` (e.g. to initialise a latent prior network).
         """
         batch = next(iter(self.train_dataloader))
-        u_dec, x_dec, u_enc, x_enc = batch
+        u_dec, x_dec, u_enc, x_enc = batch[:4]
 
         # Use a single sample for initialization
         init_u = jnp.array(u_enc[:1])
@@ -121,10 +123,15 @@ class WandbAutoencoderTrainer(AutoencoderTrainer):
 
         # Initialize with separate encoder and decoder coordinates
         variables = self.autoencoder.init(key, init_u, init_x_enc, init_x_dec, train=False)
+
+        if self.extra_init_params_fn is not None:
+            extra = self.extra_init_params_fn(key)
+            variables = {**variables, "params": {**variables["params"], **extra}}
+
         return variables
 
     def _print_metrics(self, epoch, verbose):
-        """Override to handle dict-valued metrics (e.g. SpectralMetric)."""
+        """Override to handle dict-valued metrics."""
         if verbose != "none":
             parts = []
             for metric_name in self.metrics_history:
@@ -156,6 +163,50 @@ class WandbAutoencoderTrainer(AutoencoderTrainer):
             })
 
         return state, step
+
+    def _get_train_step_fn(self):
+        """Override to support both 4-item and 5-item batch tuples.
+
+        Some functional_autoencoders releases only support
+        (u_dec, x_dec, u_enc, x_enc). Sobolev training uses an additional
+        decoder gradient tensor du_dec.
+        """
+
+        @jax.jit
+        def step_func(k, state, batch):
+            if len(batch) == 4:
+                u_dec, x_dec, u_enc, x_enc = batch
+                extra_kwargs = {}
+            elif len(batch) == 5:
+                u_dec, x_dec, u_enc, x_enc, du_dec = batch
+                extra_kwargs = {"du_dec": du_dec}
+            else:
+                raise ValueError(
+                    "Unexpected batch structure. Expected 4-tuple "
+                    "(u_dec, x_dec, u_enc, x_enc) or 5-tuple "
+                    "(u_dec, x_dec, u_enc, x_enc, du_dec). "
+                    f"Got {len(batch)} elements."
+                )
+
+            grad_fn = jax.value_and_grad(self.loss_fn, has_aux=True)
+            loss_kwargs = {
+                "key": k,
+                "batch_stats": state.batch_stats,
+                "u_enc": u_enc,
+                "x_enc": x_enc,
+                "u_dec": u_dec,
+                "x_dec": x_dec,
+            }
+            loss_kwargs.update(extra_kwargs)
+            (loss_value, batch_stats), grads = grad_fn(
+                state.params,
+                **loss_kwargs,
+            )
+            state = state.apply_gradients(grads=grads)
+            state = state.replace(batch_stats=batch_stats)
+            return loss_value, state
+
+        return step_func
 
     def _evaluate(self, key, state):
         """Override to add wandb logging and best model tracking."""

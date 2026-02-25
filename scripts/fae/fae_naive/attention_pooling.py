@@ -1,53 +1,33 @@
-"""Coordinate-aware attention pooling for function space compatibility.
+"""Pooling operators for function space compatible encoders.
 
-This module provides attention-based pooling operators that explicitly use
-spatial coordinates for proper function space formulation. The key insight
-is that for true mesh-invariance and function space compatibility, the
-pooling should approximate an integral of the form:
+This module provides pooling operators that are NOT available in the base
+``functional_autoencoders`` package.  For standard attention-based pooling
+(single-seed dot-product attention, DeepSets mean pooling), use the classes
+in ``functional_autoencoders.util.networks.pooling`` directly.
 
-    z = ∫ K(x, x') φ(u(x')) dx'
+Operators provided here
+=======================
 
-where K is a learnable attention kernel that depends on coordinates.
+* **MaxPooling** — supremum functional, O(N)
+* **MaxMeanPooling** — combined max + mean, O(N)
+* **MultiQueryCoordinateAwareAttentionPooling** — K learned query tokens
+  with coordinate-aware keys (bandwidth O(K·d))
+* **AugmentedResidualAttentionPooling** — residual per-point MLP with
+  positional re-injection followed by single-seed cross-attention pooling
+* **MultiQueryAugmentedResidualAttentionPooling** — same residual backbone
+  with K learned query tokens (bandwidth O(K·d))
+* **ScaleAwareMultiQueryAttentionPooling** — scale-aware residual blocks +
+  cross-query self-attention interaction (bandwidth O(K·d))
+* **AugmentedResidualMaxMeanPooling** — residual backbone + max+mean O(N)
+* **DualStreamBottleneckPooling** — dual-functional pooling with specialized
+    projections: integral (mean) + supremum (max), O(N)
 
-Function Space Compatibility
-============================
-
-ALL pooling methods in this module are function space compatible:
-
-1. **Mean pooling (DeepSet)**: z = (1/|Ω|) ∫ φ(u(x), x) dx
-   The canonical PointNet/DeepSets formulation.
-
-2. **Max pooling**: z = sup_{x ∈ Ω} φ(u(x), x)  
-   Supremum over the domain - captures edges/extrema at O(N) cost.
-
-3. **Attention pooling**: z = ∫ α(x) φ(u(x), x) dx where α are attention weights
-   Learned weighted integral.
-
-4. **Coordinate-aware attention**: z = ∫ K(x,x') φ(u(x'), x') dx'
-   Attention weights explicitly depend on spatial coordinates.
-
-Why Small Features Are Hard to Capture
-======================================
-
-The bottleneck for resolving small features (like individual inclusions) is 
-typically NOT the pooling layer but:
-
-1. **Decoder positional encoding bandwidth**: Random Fourier Features with small
-   `fourier_sigma` can only represent low frequencies → blurry output.
-   
-2. **Latent dimension**: Too small latent dim loses fine detail.
-
-3. **Spectral bias**: Neural networks naturally fit low frequencies first 
-   (F-principle). Longer training or frequency-aware losses can help.
-
-Multi-head attention naturally captures multiscale structure - different heads
-can learn to attend at different spatial scales without explicit separation.
+All operators are function space compatible (permutation-invariant,
+mesh-agnostic, converge under refinement).
 """
 
 from __future__ import annotations
 
-from typing import Optional
-import jax
 import jax.numpy as jnp
 import flax.linen as nn
 from functional_autoencoders.util.networks import MLP
@@ -156,95 +136,127 @@ class MaxMeanPooling(nn.Module):
             raise ValueError(f"Unknown combine_mode={self.combine_mode}")
 
 
-# ---------------------------------------------------------------------------
-# Attention-based Pooling
-# ---------------------------------------------------------------------------
+class DualStreamBottleneckPooling(nn.Module):
+    """Dual-functional pooling with specialized projections for max and mean.
 
+    Implements the dual-functional decomposition of permutation-invariant
+    set functions:
 
-class CoordinateAwareAttentionPooling(nn.Module):
-    """Attention pooling that explicitly uses coordinates for function space compatibility.
+    .. math::
 
-    This pooling computes attention weights that depend on both the field values
-    AND the spatial coordinates, making it more suitable for function space
-    formulations where we want to approximate integrals over the domain.
+        z = \\left[\\frac{1}{N}\\sum_{i=1}^{N} G(V_i),\\;
+            \\sup_i W(V_i)\\right]
 
-    Key Difference from Standard Attention:
-    ---------------------------------------
-    - Standard attention: Keys computed from features only → K = MLP(u)
-    - Coordinate-aware: Keys computed from features + coords → K = MLP([u, x])
-    
-    This makes attention weights depend on WHERE in the domain, not just
-    what the field value is.
+    where :math:`V = \\mathrm{MLP}(u)` is a shared pointwise feature
+    backbone, and :math:`G, W` are learned linear projections that
+    specialize the feature view for each functional type:
 
-    The attention mechanism uses:
-    - Query: A learned global query vector (seed)
-    - Keys: Derived from concatenation of positional features and field values
-    - Values: The feature embeddings
+    *   **Integral stream** (:math:`G`): captures smooth, distributed
+        structure via spatial mean.  Features optimized for integration
+        should respond uniformly across the domain.
+    *   **Supremum stream** (:math:`W`): captures localized extrema
+        (inclusions, edges) via spatial max.  Features optimized for
+        supremum should be *peaky* — respond strongly at specific locations.
 
-    Multi-head attention can implicitly capture multiscale structure:
-    - Different heads can learn to attend at different spatial scales
-    - Some heads may focus on local sharp features (edges)
-    - Others may integrate over larger regions (smooth features)
-
-    This happens naturally during training without explicit scale separation.
+    Compared to plain ``MaxMeanPooling`` (which applies both operators
+    to the *same* features, :math:`G = W = I`), the separate projections
+    eliminate the compromise between mean-optimal and max-optimal feature
+    representations.
 
     Parameters
     ----------
-    n_heads : int
-        Number of attention heads.
     mlp_dim : int
-        Hidden dimension for the feature MLP.
+        Hidden feature width used to build pointwise features ``V``.
     mlp_n_hidden_layers : int
-        Number of hidden layers in the feature MLP.
-    use_coord_in_attention : bool
-        If True, explicitly concatenate coordinates into key computation.
-        This makes attention weights spatially-aware.
+        Number of hidden layers used in the pointwise feature MLP.
+    macro_dim : int | None
+        Output channels for integral (mean) stream.
+        If ``None``, uses ``mlp_dim``.
+    micro_dim : int | None
+        Output channels for supremum (max) stream.
+        If ``None``, uses ``mlp_dim``.
+    """
+
+    mlp_dim: int = 128
+    mlp_n_hidden_layers: int = 2
+    macro_dim: int | None = None
+    micro_dim: int | None = None
+
+    @nn.compact
+    def __call__(self, u, x):
+        del x  # Not used directly; positional information is already in `u`.
+
+        macro_dim = self.macro_dim if self.macro_dim is not None else self.mlp_dim
+        micro_dim = self.micro_dim if self.micro_dim is not None else self.mlp_dim
+
+        # Shared pointwise feature backbone V: [B, N, mlp_dim]
+        V = MLP([self.mlp_dim] * self.mlp_n_hidden_layers)(u)
+
+        # Integral stream: specialized projection → mean (smooth structure)
+        V_G = nn.Dense(macro_dim)(V)  # [B, N, macro_dim]
+        Z_G = jnp.mean(V_G, axis=1)  # [B, macro_dim]
+
+        # Supremum stream: specialized projection → max (localized extrema)
+        V_W = nn.Dense(micro_dim)(V)  # [B, N, micro_dim]
+        Z_W = jnp.max(V_W, axis=1)   # [B, micro_dim]
+
+        # Dual-functional latent code
+        return jnp.concatenate([Z_G, Z_W], axis=-1)
+
+
+# ---------------------------------------------------------------------------
+# Multi-query Attention Pooling
+# ---------------------------------------------------------------------------
+
+
+class MultiQueryCoordinateAwareAttentionPooling(nn.Module):
+    """Coordinate-aware attention pooling with multiple learned query tokens.
+
+    This is a Set-Transformer/Perceiver-style cross-attention pooling operator:
+
+        z_k = Attn(q_k, {k_i,v_i}_{i=1..N}),   k=1..K
+
+    where {q_k} are K learned "seed" queries. Compared to the single-seed
+    variants, this increases the information bandwidth of the pooling layer from
+    O(d) to O(K·d) before the final projection to the latent code.
+
+    The operator remains function-space compatible (permutation-invariant and
+    mesh-agnostic) since it is still a learned weighted integral over points for
+    each fixed query token.
     """
 
     n_heads: int = 4
     mlp_dim: int = 128
     mlp_n_hidden_layers: int = 2
+    n_queries: int = 8
     use_coord_in_attention: bool = True
 
     @nn.compact
     def __call__(self, u, x):
-        """
-        Parameters
-        ----------
-        u : jnp.ndarray
-            Input features [batch, n_points, d_in].
-            Note: In PoolingEncoder, this is already concatenated with positional encoding.
-        x : jnp.ndarray
-            Positional encoding of coordinates [batch, n_points, d_pos].
+        if self.n_queries < 1:
+            raise ValueError(f"n_queries must be >= 1, got {self.n_queries}")
 
-        Returns
-        -------
-        z : jnp.ndarray
-            Pooled representation [batch, mlp_dim].
-        """
-        # Project to feature space
+        # Project to per-point feature space
         z = MLP([self.mlp_dim] * self.mlp_n_hidden_layers)(u)  # [B, N, mlp_dim]
 
-        # Learned query seed
-        seed = self.param(
-            "seed",
+        # Learned query seeds (K tokens)
+        seeds = self.param(
+            "seeds",
             nn.initializers.normal(stddev=1.0),
-            (self.mlp_dim,),
+            (self.n_queries, self.mlp_dim),
         )
-        query = seed[None, None, :]  # [1, 1, mlp_dim]
-        query = jnp.broadcast_to(query, (z.shape[0], 1, self.mlp_dim))
+        query = seeds[None, :, :]  # [1, K, D]
+        query = jnp.broadcast_to(query, (z.shape[0], self.n_queries, self.mlp_dim))
 
-        # For coordinate-aware attention, we compute keys from features + coordinates
+        # Coordinate-aware keys
         if self.use_coord_in_attention:
-            # Concatenate features with positional encoding for key computation
             key_input = jnp.concatenate([z, x], axis=-1)
             key = nn.Dense(self.mlp_dim, use_bias=False)(key_input)
         else:
             key = z
-
         value = z
 
-        # Multi-head dot-product attention
+        # Multi-head dot-product attention (cross-attention from K queries to N points)
         if hasattr(nn, "MultiHeadDotProductAttention"):
             pooled = nn.MultiHeadDotProductAttention(
                 num_heads=self.n_heads,
@@ -253,16 +265,15 @@ class CoordinateAwareAttentionPooling(nn.Module):
                 use_bias=False,
                 dropout_rate=0.0,
                 deterministic=True,
-            )(query, key, value)
+            )(query, key, value)  # [B, K, D]
         else:
-            # Fallback: simple scaled dot-product attention
+            # Fallback: simple scaled dot-product attention (multi-query)
             head_dim = self.mlp_dim // self.n_heads
-            scale = head_dim ** -0.5
+            scale = head_dim**-0.5
 
-            # Reshape for multi-head
-            def reshape_heads(x):
-                B, N, D = x.shape
-                return x.reshape(B, N, self.n_heads, head_dim).transpose(0, 2, 1, 3)
+            def reshape_heads(t):
+                B, N, D = t.shape
+                return t.reshape(B, N, self.n_heads, head_dim).transpose(0, 2, 1, 3)
 
             q = reshape_heads(nn.Dense(self.mlp_dim)(query))
             k = reshape_heads(nn.Dense(self.mlp_dim)(key))
@@ -272,69 +283,11 @@ class CoordinateAwareAttentionPooling(nn.Module):
             attn = nn.softmax(attn, axis=-1)
             out = jnp.einsum("bhqk,bhkd->bhqd", attn, v)
 
-            # Reshape back
             B = out.shape[0]
-            pooled = out.transpose(0, 2, 1, 3).reshape(B, 1, self.mlp_dim)
+            pooled = out.transpose(0, 2, 1, 3).reshape(B, self.n_queries, self.mlp_dim)
 
-        return pooled[:, 0, :]
-
-
-class TransformerAttentionPoolingV2(nn.Module):
-    """Enhanced transformer attention pooling with optional coordinate awareness.
-
-    Similar to the original TransformerAttentionPooling but with additional
-    options for function space compatibility.
-
-    Parameters
-    ----------
-    n_heads : int
-        Number of attention heads.
-    mlp_dim : int
-        Hidden dimension for the feature MLP.
-    mlp_n_hidden_layers : int
-        Number of hidden layers in the feature MLP.
-    coord_aware : bool
-        If True, use coordinate-aware attention (recommended for function space).
-    """
-
-    n_heads: int = 4
-    mlp_dim: int = 128
-    mlp_n_hidden_layers: int = 2
-    coord_aware: bool = False
-
-    @nn.compact
-    def __call__(self, u, x):
-        z = MLP([self.mlp_dim] * self.mlp_n_hidden_layers)(u)
-
-        seed = self.param(
-            "seed",
-            nn.initializers.normal(stddev=1.0),
-            (self.mlp_dim,),
-        )
-        s = seed[None, None, :]
-        s = jnp.broadcast_to(s, (z.shape[0], 1, self.mlp_dim))
-
-        if self.coord_aware:
-            # Include coordinate info in keys
-            key_features = jnp.concatenate([z, x], axis=-1)
-            key = nn.Dense(self.mlp_dim)(key_features)
-        else:
-            key = z
-
-        if hasattr(nn, "MultiHeadDotProductAttention"):
-            pooled = nn.MultiHeadDotProductAttention(
-                num_heads=self.n_heads,
-                qkv_features=self.mlp_dim,
-                out_features=self.mlp_dim,
-                use_bias=False,
-                dropout_rate=0.0,
-                deterministic=True,
-            )(s, key, z)
-        else:
-            from functional_autoencoders.util.networks import MultiheadLinearAttentionLayer
-            pooled = MultiheadLinearAttentionLayer(n_heads=self.n_heads)(s, key, z)
-
-        return pooled[:, 0, :]
+        # Flatten K pooled tokens into a single vector
+        return pooled.reshape(pooled.shape[0], -1)
 
 
 # ---------------------------------------------------------------------------
@@ -370,11 +323,11 @@ class AugmentedResidualAttentionPooling(nn.Module):
     Comparison with Transformer/Attention Encoders
     ===============================================
     
-    **Standard Attention Pooling (CoordinateAwareAttentionPooling)**:
+    **Standard Attention Pooling (TransformerAttentionPooling)**:
     - Single MLP: φ(u, x) = MLP([u, pos(x)])
     - No residuals, no re-injection of positional info
     - Positional info can be "washed out" in deep networks
-    
+
     **This Augmented Residual Pooling**:
     - Multi-layer with residuals: φ_L = φ_0 + Σ MLP_l([φ_l, pos(x)])
     - Re-injects positional encoding at each layer
@@ -459,7 +412,7 @@ class AugmentedResidualAttentionPooling(nn.Module):
             if self.use_layer_norm:
                 z = nn.LayerNorm()(z)
 
-        # Attention pooling (same as CoordinateAwareAttentionPooling)
+        # Attention pooling (single-seed cross-attention)
         seed = self.param(
             "seed",
             nn.initializers.normal(stddev=1.0),
@@ -508,6 +461,250 @@ class AugmentedResidualAttentionPooling(nn.Module):
             pooled = out.transpose(0, 2, 1, 3).reshape(B, 1, self.mlp_dim)
 
         return pooled[:, 0, :]
+
+
+class MultiQueryAugmentedResidualAttentionPooling(nn.Module):
+    """Augmented-residual per-point processing + multi-query attention pooling.
+
+    This is the multi-query variant of AugmentedResidualAttentionPooling:
+    - Residual pointwise feature extractor with positional re-injection.
+    - Cross-attention pooling with K learned query tokens (bandwidth O(K·d)).
+    """
+
+    n_heads: int = 4
+    mlp_dim: int = 128
+    n_queries: int = 8
+    n_residual_blocks: int = 3
+    use_coord_in_attention: bool = True
+    use_layer_norm: bool = True
+
+    @nn.compact
+    def __call__(self, u, x):
+        if self.n_queries < 1:
+            raise ValueError(f"n_queries must be >= 1, got {self.n_queries}")
+
+        # Initial projection to hidden dimension
+        z = nn.Dense(self.mlp_dim)(u)  # [B, N, mlp_dim]
+
+        # Residual blocks with positional re-injection
+        for _ in range(self.n_residual_blocks):
+            z_aug = jnp.concatenate([z, x], axis=-1)
+            residual = nn.Dense(self.mlp_dim)(z_aug)
+            residual = nn.gelu(residual)
+            residual = nn.Dense(self.mlp_dim)(residual)
+            z = z + residual
+            if self.use_layer_norm:
+                z = nn.LayerNorm()(z)
+
+        # Learned query seeds (K tokens)
+        seeds = self.param(
+            "seeds",
+            nn.initializers.normal(stddev=1.0),
+            (self.n_queries, self.mlp_dim),
+        )
+        query = seeds[None, :, :]
+        query = jnp.broadcast_to(query, (z.shape[0], self.n_queries, self.mlp_dim))
+
+        # Coordinate-aware keys
+        if self.use_coord_in_attention:
+            key_input = jnp.concatenate([z, x], axis=-1)
+            key = nn.Dense(self.mlp_dim, use_bias=False)(key_input)
+        else:
+            key = z
+        value = z
+
+        # Multi-head attention
+        if hasattr(nn, "MultiHeadDotProductAttention"):
+            pooled = nn.MultiHeadDotProductAttention(
+                num_heads=self.n_heads,
+                qkv_features=self.mlp_dim,
+                out_features=self.mlp_dim,
+                use_bias=False,
+                dropout_rate=0.0,
+                deterministic=True,
+            )(query, key, value)  # [B, K, D]
+        else:
+            head_dim = self.mlp_dim // self.n_heads
+            scale = head_dim**-0.5
+
+            def reshape_heads(t):
+                B, N, D = t.shape
+                return t.reshape(B, N, self.n_heads, head_dim).transpose(0, 2, 1, 3)
+
+            q = reshape_heads(nn.Dense(self.mlp_dim)(query))
+            k = reshape_heads(nn.Dense(self.mlp_dim)(key))
+            v = reshape_heads(nn.Dense(self.mlp_dim)(value))
+
+            attn = jnp.einsum("bhqd,bhkd->bhqk", q, k) * scale
+            attn = nn.softmax(attn, axis=-1)
+            out = jnp.einsum("bhqk,bhkd->bhqd", attn, v)
+
+            B = out.shape[0]
+            pooled = out.transpose(0, 2, 1, 3).reshape(B, self.n_queries, self.mlp_dim)
+
+        return pooled.reshape(pooled.shape[0], -1)
+
+
+class ScaleAwareMultiQueryAttentionPooling(nn.Module):
+    """Scale-aware augmented-residual pooling with cross-query interaction.
+
+    Two extensions over ``MultiQueryAugmentedResidualAttentionPooling``:
+
+    1. **Scale-aware residual blocks** — each residual block receives a
+       *different* linear projection of the positional encoding, effectively
+       learning which frequency bands to attend to at each depth.
+       Mathematically, if ``x_pos = [cos(2πBx), sin(2πBx)]``, then
+       layer ℓ sees ``P_ℓ x_pos`` where ``P_ℓ ∈ ℝ^{D_scale × D_pos}``
+       is a learned projection. This is a learnable multi-resolution
+       decomposition in the Fourier domain.
+
+    2. **Cross-query self-attention** — after the K query tokens aggregate
+       information from the N points via cross-attention, a single
+       self-attention layer lets queries exchange information before
+       forming the latent vector. This replaces K *independent* functionals
+       with K *interacting* functionals:
+           ``z = T ∘ (Φ₁(f), …, Φ_K(f))``
+       where T is a permutation-equivariant map (self-attention) on ℝ^{K×D}.
+
+    Both extensions preserve function-space compatibility (permutation-
+    invariant, mesh-agnostic, convergent under refinement).
+
+    Parameters
+    ----------
+    n_heads : int
+        Number of attention heads for both cross- and self-attention.
+    mlp_dim : int
+        Hidden dimension for residual blocks.
+    n_queries : int
+        Number of learned query tokens (K).
+    n_residual_blocks : int
+        Number of residual blocks (L).
+    scale_dim : int
+        Dimension of per-layer positional projection. If 0, uses the raw
+        positional encoding (equivalent to the base MQAR).
+    use_query_interaction : bool
+        If True, apply self-attention among query outputs.
+    use_coord_in_attention : bool
+        If True, compute keys from features + coordinates.
+    use_layer_norm : bool
+        If True, apply LayerNorm in residual blocks.
+    """
+
+    n_heads: int = 4
+    mlp_dim: int = 128
+    n_queries: int = 8
+    n_residual_blocks: int = 3
+    scale_dim: int = 0
+    use_query_interaction: bool = True
+    use_coord_in_attention: bool = True
+    use_layer_norm: bool = True
+
+    @nn.compact
+    def __call__(self, u, x):
+        if self.n_queries < 1:
+            raise ValueError(f"n_queries must be >= 1, got {self.n_queries}")
+
+        D = self.mlp_dim
+
+        # Initial projection to hidden dimension
+        z = nn.Dense(D)(u)  # [B, N, D]
+
+        # Residual blocks with scale-aware positional re-injection
+        for block_idx in range(self.n_residual_blocks):
+            if self.scale_dim > 0:
+                # Per-layer learned projection of positional encoding
+                x_scale = nn.Dense(
+                    self.scale_dim,
+                    use_bias=False,
+                    name=f"scale_proj_{block_idx}",
+                )(x)  # [B, N, scale_dim]
+            else:
+                x_scale = x  # raw positional encoding
+
+            z_aug = jnp.concatenate([z, x_scale], axis=-1)
+            residual = nn.Dense(D)(z_aug)
+            residual = nn.gelu(residual)
+            residual = nn.Dense(D)(residual)
+            z = z + residual
+            if self.use_layer_norm:
+                z = nn.LayerNorm()(z)
+
+        # Learned query seeds (K tokens)
+        seeds = self.param(
+            "seeds",
+            nn.initializers.normal(stddev=1.0),
+            (self.n_queries, D),
+        )
+        query = jnp.broadcast_to(seeds[None, :, :], (z.shape[0], self.n_queries, D))
+
+        # Coordinate-aware keys
+        if self.use_coord_in_attention:
+            key_input = jnp.concatenate([z, x], axis=-1)
+            key = nn.Dense(D, use_bias=False)(key_input)
+        else:
+            key = z
+        value = z
+
+        # Multi-head cross-attention: queries attend over N points
+        if hasattr(nn, "MultiHeadDotProductAttention"):
+            pooled = nn.MultiHeadDotProductAttention(
+                num_heads=self.n_heads,
+                qkv_features=D,
+                out_features=D,
+                use_bias=False,
+                dropout_rate=0.0,
+                deterministic=True,
+                name="cross_attn",
+            )(query, key, value)  # [B, K, D]
+        else:
+            head_dim = D // self.n_heads
+            scale = head_dim**-0.5
+
+            def reshape_heads(t):
+                B, N, _ = t.shape
+                return t.reshape(B, N, self.n_heads, head_dim).transpose(0, 2, 1, 3)
+
+            q = reshape_heads(nn.Dense(D)(query))
+            k = reshape_heads(nn.Dense(D)(key))
+            v = reshape_heads(nn.Dense(D)(value))
+
+            attn = jnp.einsum("bhqd,bhkd->bhqk", q, k) * scale
+            attn = nn.softmax(attn, axis=-1)
+            out = jnp.einsum("bhqk,bhkd->bhqd", attn, v)
+
+            B_size = out.shape[0]
+            pooled = out.transpose(0, 2, 1, 3).reshape(B_size, self.n_queries, D)
+
+        # Cross-query self-attention interaction
+        if self.use_query_interaction:
+            if hasattr(nn, "MultiHeadDotProductAttention"):
+                pooled = pooled + nn.MultiHeadDotProductAttention(
+                    num_heads=self.n_heads,
+                    qkv_features=D,
+                    out_features=D,
+                    use_bias=False,
+                    dropout_rate=0.0,
+                    deterministic=True,
+                    name="query_self_attn",
+                )(pooled, pooled, pooled)  # [B, K, D]
+            else:
+                head_dim = D // self.n_heads
+                scale = head_dim**-0.5
+                sq = reshape_heads(nn.Dense(D, name="self_q")(pooled))
+                sk = reshape_heads(nn.Dense(D, name="self_k")(pooled))
+                sv = reshape_heads(nn.Dense(D, name="self_v")(pooled))
+                sa = jnp.einsum("bhqd,bhkd->bhqk", sq, sk) * scale
+                sa = nn.softmax(sa, axis=-1)
+                s_out = jnp.einsum("bhqk,bhkd->bhqd", sa, sv)
+                B_size = s_out.shape[0]
+                pooled = pooled + s_out.transpose(0, 2, 1, 3).reshape(
+                    B_size, self.n_queries, D
+                )
+
+            if self.use_layer_norm:
+                pooled = nn.LayerNorm(name="query_ln")(pooled)
+
+        return pooled.reshape(pooled.shape[0], -1)
 
 
 class AugmentedResidualMaxMeanPooling(nn.Module):

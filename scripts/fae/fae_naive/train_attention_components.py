@@ -50,14 +50,19 @@ except ImportError:
     MultiheadAttentionPooling = None
 
 from scripts.fae.fae_naive.attention_pooling import (
-    CoordinateAwareAttentionPooling,
-    TransformerAttentionPoolingV2,
+    MultiQueryCoordinateAwareAttentionPooling,
     MaxPooling,
     MaxMeanPooling,
+    DualStreamBottleneckPooling,
     AugmentedResidualAttentionPooling,
+    MultiQueryAugmentedResidualAttentionPooling,
+    ScaleAwareMultiQueryAttentionPooling,
     AugmentedResidualMaxMeanPooling,
 )
-from scripts.fae.fae_naive.decoder_builders import build_decoder
+from scripts.fae.fae_naive.decoder_builders import (
+    build_decoder,
+    canonicalize_decoder_type,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -251,8 +256,10 @@ def get_pooling_fn(
     mlp_dim: int,
     mlp_n_hidden_layers: int,
     n_heads: int = 4,
-    coord_aware: bool = False,
+    n_queries: int = 8,
     n_residual_blocks: int = 3,
+    scale_dim: int = 0,
+    use_query_interaction: bool = True,
 ):
     """Get pooling function by type.
 
@@ -262,20 +269,23 @@ def get_pooling_fn(
         Pooling type. Options:
         - 'deepset': Mean pooling (canonical DeepSets)
         - 'attention': Multihead attention with learned aggregation
-        - 'coord_aware_attention': Coordinate-aware attention
-        - 'transformer_v2': TransformerV2 with optional coord awareness
+        - 'coord_aware_attention': Single-seed attention (FA package)
+        - 'multi_query_attention': K-query coordinate-aware attention
         - 'max': Max pooling O(N)
         - 'max_mean': Combined max+mean O(N)
+        - 'dual_stream_bottleneck': Dual-stream macro/micro bottleneck O(N)
         - 'augmented_residual': Residual MLP + attention (recommended for detailed features)
+        - 'multi_query_augmented_residual': Residual MLP + K-query attention
         - 'augmented_residual_maxmean': Residual MLP + max+mean O(N)
+        - 'scale_aware_multi_query': Scale-aware residual + cross-query interaction
     mlp_dim : int
         Hidden dimension for MLP.
     mlp_n_hidden_layers : int
         Number of hidden layers.
     n_heads : int
         Number of attention heads (for attention-based pooling).
-    coord_aware : bool
-        Whether to use coordinate-aware attention.
+    n_queries : int
+        Number of learned query tokens (for multi-query pooling types).
     n_residual_blocks : int
         Number of residual blocks (for augmented_residual variants).
 
@@ -304,18 +314,31 @@ def get_pooling_fn(
         else:
             raise ImportError("No attention pooling available in functional_autoencoders")
     elif pooling_type == "coord_aware_attention":
-        return CoordinateAwareAttentionPooling(
+        # Single-seed dot-product attention from the base FA package.
+        # Coordinate information is already concatenated into `u` by
+        # PoolingEncoder, so the standard TransformerAttentionPooling
+        # is effectively coordinate-aware.
+        if TransformerAttentionPooling is not None:
+            return TransformerAttentionPooling(
+                n_heads=n_heads,
+                mlp_dim=mlp_dim,
+                mlp_n_hidden_layers=mlp_n_hidden_layers,
+            )
+        elif MultiheadAttentionPooling is not None:
+            return MultiheadAttentionPooling(
+                n_heads=n_heads,
+                mlp_dim=mlp_dim,
+                mlp_n_hidden_layers=mlp_n_hidden_layers,
+            )
+        else:
+            raise ImportError("No attention pooling available in functional_autoencoders")
+    elif pooling_type == "multi_query_attention":
+        return MultiQueryCoordinateAwareAttentionPooling(
             n_heads=n_heads,
             mlp_dim=mlp_dim,
             mlp_n_hidden_layers=mlp_n_hidden_layers,
+            n_queries=n_queries,
             use_coord_in_attention=True,
-        )
-    elif pooling_type == "transformer_v2":
-        return TransformerAttentionPoolingV2(
-            n_heads=n_heads,
-            mlp_dim=mlp_dim,
-            mlp_n_hidden_layers=mlp_n_hidden_layers,
-            coord_aware=coord_aware,
         )
     elif pooling_type == "max":
         return MaxPooling(
@@ -328,10 +351,24 @@ def get_pooling_fn(
             mlp_n_hidden_layers=mlp_n_hidden_layers,
             combine_mode="concat",  # Output dim = 2*mlp_dim
         )
+    elif pooling_type == "dual_stream_bottleneck":
+        return DualStreamBottleneckPooling(
+            mlp_dim=mlp_dim,
+            mlp_n_hidden_layers=mlp_n_hidden_layers,
+        )
     elif pooling_type == "augmented_residual":
         return AugmentedResidualAttentionPooling(
             n_heads=n_heads,
             mlp_dim=mlp_dim,
+            n_residual_blocks=n_residual_blocks,
+            use_coord_in_attention=True,
+            use_layer_norm=True,
+        )
+    elif pooling_type == "multi_query_augmented_residual":
+        return MultiQueryAugmentedResidualAttentionPooling(
+            n_heads=n_heads,
+            mlp_dim=mlp_dim,
+            n_queries=n_queries,
             n_residual_blocks=n_residual_blocks,
             use_coord_in_attention=True,
             use_layer_norm=True,
@@ -342,11 +379,24 @@ def get_pooling_fn(
             n_residual_blocks=n_residual_blocks,
             use_layer_norm=True,
         )
+    elif pooling_type == "scale_aware_multi_query":
+        return ScaleAwareMultiQueryAttentionPooling(
+            n_heads=n_heads,
+            mlp_dim=mlp_dim,
+            n_queries=n_queries,
+            n_residual_blocks=n_residual_blocks,
+            scale_dim=scale_dim,
+            use_query_interaction=use_query_interaction,
+            use_coord_in_attention=True,
+            use_layer_norm=True,
+        )
     else:
         raise ValueError(
             f"Unknown pooling_type={pooling_type!r}. "
             "Expected one of: 'deepset', 'attention', 'coord_aware_attention', "
-            "'transformer_v2', 'max', 'max_mean', 'augmented_residual', 'augmented_residual_maxmean'"
+            "'multi_query_attention', 'max', 'max_mean', 'dual_stream_bottleneck', "
+            "'augmented_residual', 'multi_query_augmented_residual', "
+            "'augmented_residual_maxmean', 'scale_aware_multi_query'"
         )
 
 
@@ -362,12 +412,9 @@ def build_autoencoder(
     encoder_mlp_layers: int = 2,
     pooling_type: str = "attention",
     n_heads: int = 4,
-    coord_aware: bool = False,
+    n_queries: int = 8,
     n_residual_blocks: int = 3,
     decoder_type: str = "standard",
-    rff_dim: int = 256,
-    rff_sigma: float = 1.0,
-    rff_multiscale_sigmas: str = "",
     wire_first_omega0: float = 10.0,
     wire_hidden_omega0: float = 10.0,
     wire_sigma0: float = 10.0,
@@ -380,13 +427,8 @@ def build_autoencoder(
     denoiser_norm: str = "layernorm",
     denoiser_sampler: str = "ode",
     denoiser_sde_sigma: float = 1.0,
-    denoiser_local_basis_size: int = 64,
-    denoiser_local_sigma: float = 0.08,
-    denoiser_local_low_noise_power: float = 1.0,
-    decoder_use_mmlp: bool = False,
-    mmlp_factors: int = 2,
-    mmlp_activation: str = "tanh",
-    mmlp_gaussian_sigma: float = 1.0,
+    scale_dim: int = 0,
+    use_query_interaction: bool = True,
 ) -> tuple[Autoencoder, dict]:
     """Build a naive FAE with configurable attention pooling.
 
@@ -421,27 +463,17 @@ def build_autoencoder(
         Type of pooling. See get_pooling_fn for options.
     n_heads : int
         Number of attention heads.
-    coord_aware : bool
-        For transformer_v2, whether to use coordinate-aware attention.
+    n_queries : int
+        Number of learned query tokens (for multi-query pooling types).
     n_residual_blocks : int
         Number of residual blocks for augmented_residual pooling types.
     decoder_type : str
-        'standard': NonlinearDecoder (MLP on concat(z, pos)) or MMLP
-            (when ``decoder_use_mmlp=True``)
-        'rff_output': RFF readout on penultimate features for high-freq reconstruction
+        'standard': NonlinearDecoder (MLP on concat(z, pos))
         'wire2d': WIRE2D decoder (complex Gabor/wavelet nonlinearity)
+        'film': DeterministicFiLMDecoder (same backbone as denoiser, no diffusion)
         'denoiser': Diffusion denoiser decoder with x-prediction and v-loss
-        'denoiser_local': Locality-biased diffusion denoiser with fixed Gaussian
-            coordinate basis and lightweight global branch
-    rff_dim : int
-        Number of RFF frequencies D (feature dim = 2D). Only used when
-        decoder_type='rff_output'.
-    rff_sigma : float
-        Std dev for single-scale RFF. Only used when
-        decoder_type='rff_output'.
-    rff_multiscale_sigmas : str
-        Comma-separated sigmas for multi-scale RFF. Overrides rff_sigma.
-        Only used when decoder_type='rff_output'.
+        'denoiser_standard': Denoiser with a standard-decoder-style MLP backbone
+            over concatenated [z, gamma(x), noisy_field, t_embedding]
     wire_first_omega0 : float
         WIRE2D first-layer omega0. Only used when decoder_type='wire2d'.
     wire_hidden_omega0 : float
@@ -455,48 +487,30 @@ def build_autoencoder(
         decoder_type='wire2d'.
     denoiser_time_emb_dim : int
         Time embedding dimension for diffusion denoiser. Only used when
-        decoder_type is a denoiser variant ('denoiser' or 'denoiser_local').
+        decoder_type is a denoiser variant ('denoiser' or 'denoiser_standard').
     denoiser_scaling : float
         Width scaling factor for denoiser channels. Only used when
-        decoder_type is a denoiser variant ('denoiser' or 'denoiser_local').
+        decoder_type is a denoiser variant ('denoiser' or 'denoiser_standard').
     denoiser_diffusion_steps : int
         Number of diffusion steps for denoiser training/sampling. Only used when
-        decoder_type is a denoiser variant ('denoiser' or 'denoiser_local').
+        decoder_type is a denoiser variant ('denoiser' or 'denoiser_standard').
     denoiser_beta_schedule : str
         Time-grid spacing schedule ('cosine' or 'linear'). Only used when
-        decoder_type is a denoiser variant ('denoiser' or 'denoiser_local').
+        decoder_type is a denoiser variant ('denoiser' or 'denoiser_standard').
     denoiser_norm : str
         Denoiser normalization ('layernorm' or 'none'). Only used when
-        decoder_type is a denoiser variant ('denoiser' or 'denoiser_local').
+        decoder_type is a denoiser variant ('denoiser' or 'denoiser_standard').
     denoiser_sampler : str
         Sampling mode ('ode' or 'sde'). Only used when decoder_type is a denoiser
-        variant ('denoiser' or 'denoiser_local').
+        variant ('denoiser' or 'denoiser_standard').
     denoiser_sde_sigma : float
         Noise scale for sde sampler. Only used when decoder_type is a denoiser
-        variant ('denoiser' or 'denoiser_local').
-    denoiser_local_basis_size : int
-        Number of local Gaussian coordinate basis functions. Only used when
-        decoder_type='denoiser_local'.
-    denoiser_local_sigma : float
-        Spatial width of local Gaussian basis functions. Only used when
-        decoder_type='denoiser_local'.
-    denoiser_local_low_noise_power : float
-        Exponent for local branch gate ``(1 - t)^p``. Only used when
-        decoder_type='denoiser_local'.
-    decoder_use_mmlp : bool
-        If True, apply multiplicative hidden blocks for ``standard`` and
-        ``denoiser`` decoders.
-    mmlp_factors : int
-        Number of factors per multiplicative block.
-    mmlp_activation : str
-        Activation for each multiplicative factor.
-    mmlp_gaussian_sigma : float
-        Gaussian bump sigma used when ``mmlp_activation='gaussian'``.
-
+        variant ('denoiser' or 'denoiser_standard').
     Returns
     -------
     Autoencoder, dict : Model and architecture info dict.
     """
+    decoder_type = canonicalize_decoder_type(decoder_type, warn=True)
     key, k1, k2 = jax.random.split(key, 3)
     encoder_sigma_bands = parse_multiscale_sigmas_arg(encoder_multiscale_sigmas)
     decoder_sigma_bands = parse_multiscale_sigmas_arg(decoder_multiscale_sigmas)
@@ -510,9 +524,9 @@ def build_autoencoder(
         multiscale_sigmas=encoder_sigma_bands,
     )
     # Decoder positional encoding:
-    # - standard / rff_output / denoiser / denoiser_local: use RFF positional encoding
-    # - wire2d: use raw coordinates (Identity) as a Fourier alternative
-    if decoder_type == "wire2d":
+    # - standard / denoiser / denoiser_standard: use RFF positional encoding
+    # - wire2d: uses raw coordinates (Identity) as a Fourier alternative
+    if decoder_type in {"wire2d"}:
         decoder_pos_enc = IdentityEncoding()
         decoder_pos_enc_name = "identity"
     else:
@@ -534,8 +548,10 @@ def build_autoencoder(
         mlp_dim=encoder_mlp_dim,
         mlp_n_hidden_layers=encoder_mlp_layers,
         n_heads=n_heads,
-        coord_aware=coord_aware,
+        n_queries=n_queries,
         n_residual_blocks=n_residual_blocks,
+        scale_dim=scale_dim,
+        use_query_interaction=use_query_interaction,
     )
 
     encoder = PoolingEncoder(
@@ -552,9 +568,6 @@ def build_autoencoder(
         out_dim=1,
         features=decoder_features,
         positional_encoding=decoder_pos_enc,
-        rff_dim=rff_dim,
-        rff_sigma=rff_sigma,
-        rff_multiscale_sigmas=rff_multiscale_sigmas,
         wire_first_omega0=wire_first_omega0,
         wire_hidden_omega0=wire_hidden_omega0,
         wire_sigma0=wire_sigma0,
@@ -568,13 +581,6 @@ def build_autoencoder(
         denoiser_norm=denoiser_norm,
         denoiser_sampler=denoiser_sampler,
         denoiser_sde_sigma=denoiser_sde_sigma,
-        denoiser_local_basis_size=denoiser_local_basis_size,
-        denoiser_local_sigma=denoiser_local_sigma,
-        denoiser_local_low_noise_power=denoiser_local_low_noise_power,
-        decoder_use_mmlp=decoder_use_mmlp,
-        mmlp_factors=mmlp_factors,
-        mmlp_activation=mmlp_activation,
-        mmlp_gaussian_sigma=mmlp_gaussian_sigma,
     )
 
     # Determine function space compatibility:
@@ -623,8 +629,8 @@ def build_autoencoder(
         "encoder_mlp_layers": encoder_mlp_layers,
         "pooling_type": pooling_type,
         "n_heads": n_heads,
+        "n_queries": n_queries,
         "n_residual_blocks": n_residual_blocks,
-        "coord_aware": coord_aware,
         "function_space_compatible": fs_compatible,
     }
     # Merge decoder-specific config
@@ -654,7 +660,7 @@ class MSEMetricNaive(Metric):
         return True
 
     def call_batched(self, state, batch, subkey):
-        u_dec, x_dec, u_enc, x_enc = batch
+        u_dec, x_dec, u_enc, x_enc = batch[:4]
         u_enc = jnp.array(u_enc)
         x_enc = jnp.array(x_enc)
         x_dec = jnp.array(x_dec)
@@ -763,7 +769,7 @@ def evaluate_train_reconstruction(
     for i, batch in enumerate(test_dataloader):
         if i >= n_batches:
             break
-        u_dec, x_dec, u_enc, x_enc = batch
+        u_dec, x_dec, u_enc, x_enc = batch[:4]
         u_enc = jnp.array(u_enc)
         x_enc = jnp.array(x_enc)
         x_dec = jnp.array(x_dec)
@@ -821,7 +827,7 @@ def visualize_sample_reconstructions(
     for i, batch in enumerate(test_dataloader):
         if i >= n_batches:
             break
-        u_dec, x_dec, u_enc, x_enc = batch
+        u_dec, x_dec, u_enc, x_enc = batch[:4]
         u_enc = jnp.array(u_enc)
         x_enc = jnp.array(x_enc)
         x_dec = jnp.array(x_dec)
@@ -1024,7 +1030,7 @@ def visualize_physical_space_reconstructions(
     for i, batch in enumerate(test_dataloader):
         if i >= n_batches:
             break
-        u_dec, x_dec, u_enc, x_enc = batch
+        u_dec, x_dec, u_enc, x_enc = batch[:4]
         u_enc = jnp.array(u_enc)
         x_enc = jnp.array(x_enc)
         x_dec = jnp.array(x_dec)
@@ -1283,6 +1289,32 @@ def parse_held_out_times_arg(raw: str, times_normalized: np.ndarray) -> list[int
         if idx not in indices:
             indices.append(idx)
     return indices
+
+
+def parse_int_list_arg(raw: str) -> list[int]:
+    """Parse a comma-separated list of integers (empty string -> [])."""
+    if not raw or raw.strip().lower() in {"none", "null", "no", "false"}:
+        return []
+    values: list[int] = []
+    for token in raw.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        values.append(int(token))
+    return values
+
+
+def parse_float_list_arg(raw: str) -> list[float]:
+    """Parse a comma-separated list of floats (empty string -> [])."""
+    if not raw or raw.strip().lower() in {"none", "null", "no", "false"}:
+        return []
+    values: list[float] = []
+    for token in raw.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        values.append(float(token))
+    return values
 
 
 # ---------------------------------------------------------------------------

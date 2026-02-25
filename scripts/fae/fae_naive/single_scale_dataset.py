@@ -40,7 +40,7 @@ class SingleScaleFieldDataset(Dataset):
     encoder_point_ratio : float
         Fraction of spatial points for encoder.
     masking_strategy : str
-        'random' or 'detail'.
+        'random', 'detail', or 'full_grid'.
     detail_quantile : float
         Quantile for detail masking.
     enc_detail_frac : float
@@ -58,22 +58,28 @@ class SingleScaleFieldDataset(Dataset):
         train: bool = True,
         train_ratio: float = 0.8,
         encoder_point_ratio: float = 0.3,
+        encoder_n_points: Optional[int] = None,
+        decoder_n_points: Optional[int] = None,
         masking_strategy: str = "random",
         detail_quantile: float = 0.85,
         enc_detail_frac: float = 0.05,
         importance_grad_weight: float = 0.5,
         importance_power: float = 1.0,
+        return_decoder_gradients: bool = False,
     ):
         self.npz_path = npz_path
         self.time_index = time_index
         self.train = train
         self.train_ratio = train_ratio
         self.encoder_point_ratio = encoder_point_ratio
+        self.encoder_n_points = int(encoder_n_points) if encoder_n_points is not None else None
+        self.decoder_n_points = int(decoder_n_points) if decoder_n_points is not None else None
         self.masking_strategy = masking_strategy
         self.detail_quantile = detail_quantile
         self.enc_detail_frac = enc_detail_frac
         self.importance_grad_weight = importance_grad_weight
         self.importance_power = importance_power
+        self.return_decoder_gradients = bool(return_decoder_gradients)
 
         # Load data
         self._load_data()
@@ -156,14 +162,25 @@ class SingleScaleFieldDataset(Dataset):
 
     def _split_encoder_decoder_points(self, field: np.ndarray):
         """Split points into encoder/decoder sets."""
-        n_enc = int(self.n_points * self.encoder_point_ratio)
-        n_dec = self.n_points - n_enc
+        if self.encoder_n_points is None:
+            n_enc = int(self.n_points * self.encoder_point_ratio)
+        else:
+            n_enc = int(self.encoder_n_points)
+        n_enc = int(np.clip(n_enc, 1, self.n_points - 1))
+
+        max_dec = self.n_points - n_enc
+        if self.decoder_n_points is None:
+            n_dec = max_dec
+        else:
+            n_dec = int(min(int(self.decoder_n_points), max_dec))
+        n_dec = int(np.clip(n_dec, 1, max_dec))
 
         if self.masking_strategy == "random":
             # Random split
             perm = np.random.permutation(self.n_points)
             enc_idx = perm[:n_enc]
-            dec_idx = perm[n_enc:]
+            remaining = perm[n_enc:]
+            dec_idx = remaining[:n_dec]
 
         elif self.masking_strategy == "detail":
             # Detail-aware split
@@ -195,15 +212,19 @@ class SingleScaleFieldDataset(Dataset):
 
             # Decoder: remaining points (biased toward detail)
             all_idx = np.arange(self.n_points)
-            dec_idx = np.setdiff1d(all_idx, enc_idx)
+            remaining = np.setdiff1d(all_idx, enc_idx)
 
-            # Ensure we have exactly n_dec points
-            if len(dec_idx) > n_dec:
-                dec_idx = np.random.choice(dec_idx, n_dec, replace=False)
-            elif len(dec_idx) < n_dec:
-                # Need more points, sample from encoder
-                extra = np.random.choice(enc_idx, n_dec - len(dec_idx), replace=False)
-                dec_idx = np.concatenate([dec_idx, extra])
+            if remaining.size <= n_dec:
+                dec_idx = remaining
+            else:
+                # Subsample remaining points, biased toward detail if possible.
+                w = importance[remaining].astype(np.float64, copy=False)
+                w = np.clip(w, 0.0, None)
+                if float(w.sum()) > 0:
+                    p = w / w.sum()
+                    dec_idx = np.random.choice(remaining, size=n_dec, replace=False, p=p)
+                else:
+                    dec_idx = np.random.choice(remaining, size=n_dec, replace=False)
 
         else:
             raise ValueError(f"Unknown masking_strategy: {self.masking_strategy}")
@@ -225,14 +246,27 @@ class SingleScaleFieldDataset(Dataset):
         """
         field = self.fields[idx]  # (n_points,)
 
-        # Split points
-        enc_idx, dec_idx = self._split_encoder_decoder_points(field)
+        if self.masking_strategy == "full_grid":
+            enc_idx = np.arange(self.n_points, dtype=np.int32)
+            dec_idx = np.arange(self.n_points, dtype=np.int32)
+        else:
+            # Split points
+            enc_idx, dec_idx = self._split_encoder_decoder_points(field)
 
         u_enc = field[enc_idx, None].astype(np.float32)
         x_enc = self.grid_coords[enc_idx].astype(np.float32)
 
         u_dec = field[dec_idx, None].astype(np.float32)
         x_dec = self.grid_coords[dec_idx].astype(np.float32)
+
+        if self.return_decoder_gradients:
+            field_2d = field.reshape(self.resolution, self.resolution)
+            dx = 1.0 / self.resolution
+            du_dx = (np.roll(field_2d, -1, axis=0) - np.roll(field_2d, 1, axis=0)) / (2 * dx)
+            du_dy = (np.roll(field_2d, -1, axis=1) - np.roll(field_2d, 1, axis=1)) / (2 * dx)
+            grads = np.stack([du_dx.ravel(), du_dy.ravel()], axis=-1).astype(np.float32, copy=False)
+            du_dec = grads[dec_idx].astype(np.float32, copy=False)
+            return u_dec, x_dec, u_enc, x_enc, du_dec
 
         return u_dec, x_dec, u_enc, x_enc
 

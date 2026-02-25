@@ -19,7 +19,9 @@
 # %%
 from __future__ import annotations
 
+import os
 import sys
+import ast
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -36,7 +38,23 @@ if str(path_root) not in sys.path:
     sys.path.insert(0, str(path_root))
 
 from scripts.images.field_visualization import format_for_paper
-from scripts.pca.pca_visualization_utils import parse_args_file
+
+
+def parse_args_file(args_path: Path) -> dict:
+    parsed: dict = {}
+    if not args_path.exists():
+        return parsed
+    for line in args_path.read_text().splitlines():
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        try:
+            parsed[key] = ast.literal_eval(value)
+        except Exception:
+            parsed[key] = value
+    return parsed
 
 print("Imports successful!")
 
@@ -49,7 +67,12 @@ format_for_paper()
 # Point `msbm_dir` at a run directory created by `train_latent_msbm.py` (under `results/`).
 
 # %%
-msbm_dir = Path("/data1/jy384/research/MMSFM/results/2026-02-01T23-00-12-38")
+msbm_dir = Path(
+    os.environ.get(
+        "MSBM_DIR",
+        "/data1/jy384/research/MMSFM/results/2026-02-01T23-00-12-38",
+    )
+)
 
 # Which split to visualize as the latent manifold.
 manifold_split = "test"  # {"train", "test"}
@@ -211,6 +234,14 @@ def _fit_pca_embedding(
     fit = x[idx]
     if extra is not None:
         fit = np.concatenate([fit, extra.reshape(-1, K)], axis=0)
+
+    finite_mask = np.isfinite(fit).all(axis=1)
+    fit = fit[finite_mask]
+    if fit.shape[0] < max(10, dim):
+        raise ValueError(
+            "Not enough finite points to fit PCA embedding. "
+            f"Found {fit.shape[0]} finite rows."
+        )
 
     try:
         from sklearn.decomposition import PCA

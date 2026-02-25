@@ -29,6 +29,7 @@ if _PROJECT_ROOT not in sys.path:
 from functional_autoencoders.datasets import NumpyLoader
 from scripts.fae.multiscale_dataset_naive import (
     MultiscaleFieldDatasetNaive,
+    TimeGroupedBatchSampler,
     load_held_out_data_naive,
     load_training_time_data_naive,
 )
@@ -51,6 +52,8 @@ from scripts.fae.fae_naive.train_attention_components import (
     evaluate_at_times,
     evaluate_train_reconstruction,
     load_dataset_metadata,
+    parse_float_list_arg,
+    parse_int_list_arg,
     parse_held_out_indices_arg,
     parse_held_out_times_arg,
     save_model_artifact,
@@ -64,15 +67,12 @@ from scripts.fae.fae_naive.train_attention_components import (
 
 
 LEGACY_IGNORED_FLAGS: dict[str, bool] = {
-    # value-required flags
+    # value-required flags removed from train_attention.py / train_attention_denoiser.py
     "--loss-type": True,
     "--lambda-grad": True,
     "--freq-weight-power": True,
     "--lambda-residual": True,
     "--residual-sigma": True,
-    "--spectral-n-bins": True,
-    # boolean flags
-    "--track-spectral-metrics": False,
 }
 
 
@@ -178,35 +178,14 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--decoder-type",
         type=str,
-        default="denoiser_local",
-        choices=["denoiser", "denoiser_local"],
-        help="Denoiser decoder architecture.",
+        default="denoiser",
+        choices=["denoiser", "denoiser_standard"],
+        help=(
+            "Denoiser decoder architecture: "
+            "'denoiser' (scaled backbone) or "
+            "'denoiser_standard' (standard-decoder-style MLP backbone)."
+        ),
     )
-    parser.add_argument(
-        "--decoder-use-mmlp",
-        action="store_true",
-        help="Use multiplicative MMLP hidden blocks for --decoder-type=denoiser.",
-    )
-    parser.add_argument(
-        "--mmlp-factors",
-        type=int,
-        default=2,
-        help="Number of multiplicative factors per MMLP hidden block.",
-    )
-    parser.add_argument(
-        "--mmlp-activation",
-        type=str,
-        default="tanh",
-        choices=["tanh", "sigmoid", "gelu", "gaussian"],
-        help="Activation function used inside each MMLP factor.",
-    )
-    parser.add_argument(
-        "--mmlp-gaussian-sigma",
-        type=float,
-        default=1.0,
-        help="Gaussian bump sigma when --mmlp-activation=gaussian.",
-    )
-
     parser.add_argument(
         "--denoiser-time-emb-dim",
         type=int,
@@ -250,9 +229,6 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Denoiser sampling mode.",
     )
     parser.add_argument("--denoiser-sde-sigma", type=float, default=1.0)
-    parser.add_argument("--denoiser-local-basis-size", type=int, default=64)
-    parser.add_argument("--denoiser-local-sigma", type=float, default=0.08)
-    parser.add_argument("--denoiser-local-low-noise-power", type=float, default=1.0)
     parser.add_argument(
         "--denoiser-sample-steps",
         type=int,
@@ -328,18 +304,6 @@ def _build_parser() -> argparse.ArgumentParser:
         default=0.0,
         help="Optional auxiliary velocity anchor weight.",
     )
-    parser.add_argument(
-        "--denoiser-x0-loss-weight",
-        type=float,
-        default=0.0,
-        help="Optional direct x0 anchor loss weight.",
-    )
-    parser.add_argument(
-        "--denoiser-ambient-loss-weight",
-        type=float,
-        default=0.0,
-        help="Optional ambient mean/std anchor loss weight.",
-    )
 
     parser.add_argument("--encoder-mlp-dim", type=int, default=128)
     parser.add_argument("--encoder-mlp-layers", type=int, default=2)
@@ -353,19 +317,84 @@ def _build_parser() -> argparse.ArgumentParser:
             "deepset",
             "attention",
             "coord_aware_attention",
-            "transformer_v2",
+            "multi_query_attention",
             "max",
             "max_mean",
+            "dual_stream_bottleneck",
             "augmented_residual",
+            "multi_query_augmented_residual",
             "augmented_residual_maxmean",
         ],
     )
     parser.add_argument("--n-heads", type=int, default=4)
+    parser.add_argument(
+        "--n-queries",
+        type=int,
+        default=8,
+        help="Number of learned query tokens for multi-query pooling types.",
+    )
     parser.add_argument("--n-residual-blocks", type=int, default=3)
-    parser.add_argument("--coord-aware", action="store_true")
 
     # Masking
     parser.add_argument("--encoder-point-ratio", type=float, default=0.3)
+    parser.add_argument(
+        "--encoder-point-ratio-by-time",
+        type=str,
+        default="",
+        help=(
+            "Comma-separated encoder point ratios per time index. "
+            "Length can be 1, n_times_total (in the npz), or n_times_train (after held-out filtering). "
+            "Overrides --encoder-point-ratio for those times. Requires time-grouped batching."
+        ),
+    )
+    parser.add_argument(
+        "--decoder-point-ratio-by-time",
+        type=str,
+        default="",
+        help=(
+            "Comma-separated decoder point ratios per time index. "
+            "Length can be 1, n_times_total (in the npz), or n_times_train (after held-out filtering). "
+            "Overrides the default decoder complement for those times. Requires time-grouped batching."
+        ),
+    )
+    parser.add_argument(
+        "--encoder-n-points",
+        type=int,
+        default=0,
+        help=(
+            "Fixed number of encoder points (overrides --encoder-point-ratio). "
+            "0 means use --encoder-point-ratio."
+        ),
+    )
+    parser.add_argument(
+        "--decoder-n-points",
+        type=int,
+        default=0,
+        help=(
+            "Fixed number of decoder points used for the reconstruction loss. "
+            "0 means use the full complement of encoder points."
+        ),
+    )
+    parser.add_argument(
+        "--encoder-n-points-by-time",
+        type=str,
+        default="",
+        help=(
+            "Comma-separated encoder point counts per time index. "
+            "Length can be 1, n_times_total (in the npz), or n_times_train (after held-out filtering). "
+            "Requires time-grouped batching."
+        ),
+    )
+    parser.add_argument(
+        "--decoder-n-points-by-time",
+        type=str,
+        default="",
+        help=(
+            "Comma-separated decoder point counts per time index. "
+            "Length can be 1, n_times_total (in the npz), or n_times_train (after held-out filtering). "
+            "Requires time-grouped batching."
+        ),
+    )
     parser.add_argument(
         "--masking-strategy",
         type=str,
@@ -384,6 +413,12 @@ def _build_parser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument("--beta", type=float, default=1e-4)
+    parser.add_argument(
+        "--latent-noise-std",
+        type=float,
+        default=0.0,
+        help="Std of isotropic Gaussian noise injected into latent codes during training (0=off).",
+    )
 
     # Training
     parser.add_argument("--optimizer", type=str, default="adam", choices=["adam", "adamw", "muon"])
@@ -429,66 +464,6 @@ def _validate_args(args: argparse.Namespace, drifting_feature_heads: int) -> Non
             f"{drifting_feature_heads} > {args.latent_dim}."
         )
 
-    if args.mmlp_factors < 1:
-        raise ValueError("--mmlp-factors must be >= 1.")
-    if args.mmlp_gaussian_sigma <= 0:
-        raise ValueError("--mmlp-gaussian-sigma must be > 0.")
-    if args.mmlp_activation != "gaussian" and args.mmlp_gaussian_sigma != 1.0:
-        warnings.warn(
-            "--mmlp-gaussian-sigma is only used when --mmlp-activation=gaussian.",
-            UserWarning,
-        )
-
-    if args.decoder_type == "denoiser" and not args.decoder_use_mmlp:
-        mmlp_cfg_args = []
-        if args.mmlp_factors != 2:
-            mmlp_cfg_args.append("--mmlp-factors")
-        if args.mmlp_activation != "tanh":
-            mmlp_cfg_args.append("--mmlp-activation")
-        if args.mmlp_gaussian_sigma != 1.0:
-            mmlp_cfg_args.append("--mmlp-gaussian-sigma")
-        if mmlp_cfg_args:
-            warnings.warn(
-                f"MMLP arguments {mmlp_cfg_args} are ignored unless --decoder-use-mmlp is set.",
-                UserWarning,
-            )
-
-    if args.decoder_type != "denoiser":
-        mmlp_args_used = []
-        if args.decoder_use_mmlp:
-            mmlp_args_used.append("--decoder-use-mmlp")
-        if args.mmlp_factors != 2:
-            mmlp_args_used.append("--mmlp-factors")
-        if args.mmlp_activation != "tanh":
-            mmlp_args_used.append("--mmlp-activation")
-        if args.mmlp_gaussian_sigma != 1.0:
-            mmlp_args_used.append("--mmlp-gaussian-sigma")
-        if mmlp_args_used:
-            warnings.warn(
-                f"MMLP arguments {mmlp_args_used} are ignored when decoder_type='{args.decoder_type}'.",
-                UserWarning,
-            )
-
-    if args.denoiser_local_basis_size < 1:
-        raise ValueError("--denoiser-local-basis-size must be >= 1.")
-    if args.denoiser_local_sigma <= 0:
-        raise ValueError("--denoiser-local-sigma must be > 0.")
-    if args.denoiser_local_low_noise_power < 0:
-        raise ValueError("--denoiser-local-low-noise-power must be >= 0.")
-    if args.decoder_type != "denoiser_local":
-        denoiser_local_args_used = []
-        if args.denoiser_local_basis_size != 64:
-            denoiser_local_args_used.append("--denoiser-local-basis-size")
-        if args.denoiser_local_sigma != 0.08:
-            denoiser_local_args_used.append("--denoiser-local-sigma")
-        if args.denoiser_local_low_noise_power != 1.0:
-            denoiser_local_args_used.append("--denoiser-local-low-noise-power")
-        if denoiser_local_args_used:
-            warnings.warn(
-                f"Locality denoiser arguments {denoiser_local_args_used} are ignored when decoder_type='{args.decoder_type}'.",
-                UserWarning,
-            )
-
     if args.denoiser_time_emb_dim < 2:
         raise ValueError("--denoiser-time-emb-dim must be >= 2.")
     if args.denoiser_scaling <= 0:
@@ -505,7 +480,6 @@ def _validate_args(args: argparse.Namespace, drifting_feature_heads: int) -> Non
         raise ValueError("--denoiser-eval-sample-steps must be >= 0.")
     if args.denoiser_time_logit_std <= 0:
         raise ValueError("--denoiser-time-logit-std must be > 0.")
-
     if args.drifting_temperature <= 0:
         raise ValueError("--drifting-temperature must be > 0.")
     if args.drifting_feature_heads < 0:
@@ -517,10 +491,6 @@ def _validate_args(args: argparse.Namespace, drifting_feature_heads: int) -> Non
 
     if args.denoiser_velocity_loss_weight < 0:
         raise ValueError("--denoiser-velocity-loss-weight must be >= 0.")
-    if args.denoiser_x0_loss_weight < 0:
-        raise ValueError("--denoiser-x0-loss-weight must be >= 0.")
-    if args.denoiser_ambient_loss_weight < 0:
-        raise ValueError("--denoiser-ambient-loss-weight must be >= 0.")
     if (
         args.drifting_generator_mode == "one_step"
         and args.denoiser_velocity_loss_weight > 0
@@ -529,17 +499,14 @@ def _validate_args(args: argparse.Namespace, drifting_feature_heads: int) -> Non
             "--denoiser-velocity-loss-weight is only supported with "
             "--drifting-generator-mode=diffusion."
         )
-
     if (
         args.drifting_weight
         + args.denoiser_velocity_loss_weight
-        + args.denoiser_x0_loss_weight
-        + args.denoiser_ambient_loss_weight
         <= 0
     ):
         raise ValueError(
-            "At least one of --drifting-weight, --denoiser-velocity-loss-weight, "
-            "--denoiser-x0-loss-weight, or --denoiser-ambient-loss-weight must be > 0."
+            "At least one of --drifting-weight or "
+            "--denoiser-velocity-loss-weight must be > 0."
         )
 
     if args.drifting_generator_mode == "diffusion":
@@ -568,19 +535,6 @@ def _validate_args(args: argparse.Namespace, drifting_feature_heads: int) -> Non
                 f"Arguments {ignored} are ignored when --drifting-generator-mode=one_step.",
                 UserWarning,
             )
-        if (
-            args.decoder_type == "denoiser_local"
-            and args.denoiser_local_low_noise_power > 0
-        ):
-            warnings.warn(
-                "With --decoder-type=denoiser_local and --drifting-generator-mode=one_step, "
-                "generation uses t≈1 and the local branch gate (1 - t)^p can become very small "
-                f"for p={args.denoiser_local_low_noise_power}. This often over-smooths outputs. "
-                "Consider --denoiser-local-low-noise-power=0.0 or using "
-                "--drifting-generator-mode=diffusion.",
-                UserWarning,
-            )
-
     if args.beta != 0.0:
         warnings.warn(
             "--beta applies latent L2 regularization (legacy FAE prior) and is not "
@@ -648,8 +602,6 @@ def main() -> None:
             args.decoder_type,
             args.optimizer,
         ]
-        if args.coord_aware:
-            tags.append("coord_aware")
 
         wandb.init(
             project=args.wandb_project,
@@ -684,8 +636,11 @@ def main() -> None:
     if args.encoder_multiscale_sigmas:
         print(f"  Encoder multiscale sigmas: {args.encoder_multiscale_sigmas}")
     print(f"  Decoder type: {args.decoder_type}")
-    if args.decoder_type == "denoiser":
-        print(f"  Decoder MMLP: {'enabled' if args.decoder_use_mmlp else 'disabled'}")
+    if args.decoder_type == "denoiser_standard":
+        print(
+            "  Decoder backbone: standard-decoder-style MLP "
+            "(concat[z, gamma(x), noisy_field, t_embedding] -> MLP)"
+        )
     if args.drifting_generator_mode == "one_step":
         print(
             "  Decoder: one-step drifting generator "
@@ -707,8 +662,7 @@ def main() -> None:
             f"feature_heads={drifting_feature_heads}, "
             f"dual_norm={not args.drifting_no_dual_normalization}, "
             f"freeze_feature_encoder={not args.drifting_train_feature_encoder}), "
-            f"anchors=(v={args.denoiser_velocity_loss_weight}, "
-            f"x0={args.denoiser_x0_loss_weight}, ambient={args.denoiser_ambient_loss_weight}), "
+            f"anchors=(v={args.denoiser_velocity_loss_weight}), "
             f"latent_reg_beta={args.beta}"
         )
     else:
@@ -721,19 +675,10 @@ def main() -> None:
             f"feature_heads={drifting_feature_heads}, "
             f"dual_norm={not args.drifting_no_dual_normalization}, "
             f"freeze_feature_encoder={not args.drifting_train_feature_encoder}), "
-            f"anchors=(v={args.denoiser_velocity_loss_weight}, "
-            f"x0={args.denoiser_x0_loss_weight}, ambient={args.denoiser_ambient_loss_weight}), "
+            f"anchors=(v={args.denoiser_velocity_loss_weight}), "
             f"latent_reg_beta={args.beta}"
         )
-    if args.decoder_type == "denoiser_local":
-        print(
-            "           "
-            "locality=("
-            f"basis={args.denoiser_local_basis_size}, "
-            f"sigma={args.denoiser_local_sigma}, "
-            f"low_noise_power={args.denoiser_local_low_noise_power})"
-        )
-    print(f"  Pooling: {args.pooling_type}" + (" (coord-aware)" if args.coord_aware else ""))
+    print(f"  Pooling: {args.pooling_type}")
     print(f"  Optimizer: {args.optimizer}")
     if args.optimizer in {"adamw", "muon"}:
         print(f"  Weight decay: {args.weight_decay}")
@@ -749,6 +694,28 @@ def main() -> None:
 
     print("\nLoading dataset ...")
     held_out_indices: Optional[list[int]] = None
+    encoder_n_points = args.encoder_n_points if args.encoder_n_points > 0 else None
+    decoder_n_points = args.decoder_n_points if args.decoder_n_points > 0 else None
+    encoder_n_points_by_time = (
+        parse_int_list_arg(args.encoder_n_points_by_time)
+        if args.encoder_n_points_by_time
+        else None
+    )
+    decoder_n_points_by_time = (
+        parse_int_list_arg(args.decoder_n_points_by_time)
+        if args.decoder_n_points_by_time
+        else None
+    )
+    encoder_point_ratio_by_time = (
+        parse_float_list_arg(args.encoder_point_ratio_by_time)
+        if args.encoder_point_ratio_by_time
+        else None
+    )
+    decoder_point_ratio_by_time = (
+        parse_float_list_arg(args.decoder_point_ratio_by_time)
+        if args.decoder_point_ratio_by_time
+        else None
+    )
     if args.training_mode == "single_scale":
         meta = load_single_scale_metadata(args.data_path)
         print(f"Dataset: {args.data_path}")
@@ -762,6 +729,8 @@ def main() -> None:
             train=True,
             train_ratio=args.train_ratio,
             encoder_point_ratio=args.encoder_point_ratio,
+            encoder_n_points=encoder_n_points,
+            decoder_n_points=decoder_n_points,
             masking_strategy=args.masking_strategy,
             detail_quantile=args.detail_quantile,
             enc_detail_frac=args.enc_detail_frac,
@@ -779,6 +748,8 @@ def main() -> None:
             train=False,
             train_ratio=args.train_ratio,
             encoder_point_ratio=args.encoder_point_ratio,
+            encoder_n_points=encoder_n_points,
+            decoder_n_points=decoder_n_points,
             masking_strategy=eval_masking_strategy,
             detail_quantile=args.detail_quantile,
             enc_detail_frac=args.enc_detail_frac,
@@ -806,6 +777,12 @@ def main() -> None:
             train=True,
             train_ratio=args.train_ratio,
             encoder_point_ratio=args.encoder_point_ratio,
+            encoder_point_ratio_by_time=encoder_point_ratio_by_time,
+            decoder_point_ratio_by_time=decoder_point_ratio_by_time,
+            encoder_n_points=encoder_n_points,
+            decoder_n_points=decoder_n_points,
+            encoder_n_points_by_time=encoder_n_points_by_time,
+            decoder_n_points_by_time=decoder_n_points_by_time,
             masking_strategy=args.masking_strategy,
             detail_quantile=args.detail_quantile,
             enc_detail_frac=args.enc_detail_frac,
@@ -823,6 +800,12 @@ def main() -> None:
             train=False,
             train_ratio=args.train_ratio,
             encoder_point_ratio=args.encoder_point_ratio,
+            encoder_point_ratio_by_time=encoder_point_ratio_by_time,
+            decoder_point_ratio_by_time=decoder_point_ratio_by_time,
+            encoder_n_points=encoder_n_points,
+            decoder_n_points=decoder_n_points,
+            encoder_n_points_by_time=encoder_n_points_by_time,
+            decoder_n_points_by_time=decoder_n_points_by_time,
             masking_strategy=eval_masking_strategy,
             detail_quantile=args.detail_quantile,
             enc_detail_frac=args.enc_detail_frac,
@@ -831,18 +814,49 @@ def main() -> None:
             held_out_indices=held_out_indices,
         )
 
-    train_loader = NumpyLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        drop_last=True,
+    use_time_grouped_batches = (
+        args.training_mode == "multi_scale"
+        and (
+            bool(args.encoder_n_points_by_time)
+            or bool(args.decoder_n_points_by_time)
+            or bool(args.encoder_point_ratio_by_time)
+            or bool(args.decoder_point_ratio_by_time)
+        )
     )
-    test_loader = NumpyLoader(
-        test_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        drop_last=True,
-    )
+    if use_time_grouped_batches:
+        train_loader = NumpyLoader(
+            train_dataset,
+            batch_sampler=TimeGroupedBatchSampler(
+                train_dataset,
+                batch_size=args.batch_size,
+                shuffle=True,
+                drop_last=True,
+                seed=args.seed,
+            ),
+        )
+        test_loader = NumpyLoader(
+            test_dataset,
+            batch_sampler=TimeGroupedBatchSampler(
+                test_dataset,
+                batch_size=args.batch_size,
+                shuffle=False,
+                drop_last=True,
+                seed=args.seed,
+            ),
+        )
+    else:
+        train_loader = NumpyLoader(
+            train_dataset,
+            batch_size=args.batch_size,
+            shuffle=True,
+            drop_last=True,
+        )
+        test_loader = NumpyLoader(
+            test_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            drop_last=True,
+        )
     print(f"  Train samples: {len(train_dataset)}  |  Test samples: {len(test_dataset)}")
 
     # Load inverse-transform metadata for physical-space visualizations
@@ -864,7 +878,7 @@ def main() -> None:
         encoder_mlp_layers=args.encoder_mlp_layers,
         pooling_type=args.pooling_type,
         n_heads=args.n_heads,
-        coord_aware=args.coord_aware,
+        n_queries=args.n_queries,
         n_residual_blocks=args.n_residual_blocks,
         decoder_type=args.decoder_type,
         denoiser_time_emb_dim=args.denoiser_time_emb_dim,
@@ -874,13 +888,6 @@ def main() -> None:
         denoiser_norm=args.denoiser_norm,
         denoiser_sampler=args.denoiser_sampler,
         denoiser_sde_sigma=args.denoiser_sde_sigma,
-        denoiser_local_basis_size=args.denoiser_local_basis_size,
-        denoiser_local_sigma=args.denoiser_local_sigma,
-        denoiser_local_low_noise_power=args.denoiser_local_low_noise_power,
-        decoder_use_mmlp=args.decoder_use_mmlp,
-        mmlp_factors=args.mmlp_factors,
-        mmlp_activation=args.mmlp_activation,
-        mmlp_gaussian_sigma=args.mmlp_gaussian_sigma,
     )
 
     architecture_info["training_objective"] = "drifting_feature_space"
@@ -897,6 +904,7 @@ def main() -> None:
     architecture_info["drifting_one_step_noise_scale"] = (
         args.drifting_one_step_noise_scale
     )
+    architecture_info["latent_noise_std"] = args.latent_noise_std
 
     save_model_info(paths, architecture_info, args)
 
@@ -913,9 +921,8 @@ def main() -> None:
         drifting_dual_normalization=(not args.drifting_no_dual_normalization),
         drifting_weight=args.drifting_weight,
         velocity_anchor_weight=args.denoiser_velocity_loss_weight,
-        x0_anchor_weight=args.denoiser_x0_loss_weight,
-        ambient_anchor_weight=args.denoiser_ambient_loss_weight,
         freeze_feature_encoder=(not args.drifting_train_feature_encoder),
+        latent_noise_std=args.latent_noise_std,
     )
     if args.drifting_generator_mode == "one_step":
         print(
@@ -1037,7 +1044,6 @@ def main() -> None:
         vis_interval=args.vis_interval,
         save_best_model=args.save_best_model,
         best_model_path=best_model_path,
-        track_spectral=False,
         optimizer_config=optimizer_config,
     )
 

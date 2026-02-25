@@ -206,7 +206,7 @@ class MSEMetricNaive(Metric):
 
     def call_batched(self, state, batch, subkey):
         """Compute MSE for a batch with 2D coords for both encoder and decoder."""
-        u_dec, x_dec, u_enc, x_enc = batch
+        u_dec, x_dec, u_enc, x_enc = batch[:4]
 
         # Convert to JAX arrays
         u_enc = jnp.array(u_enc)
@@ -313,7 +313,7 @@ def evaluate_train_reconstruction(
     for i, batch in enumerate(test_dataloader):
         if i >= n_batches:
             break
-        u_dec, x_dec, u_enc, x_enc = batch
+        u_dec, x_dec, u_enc, x_enc = batch[:4]
         u_enc = jnp.array(u_enc)
         x_enc = jnp.array(x_enc)
         x_dec = jnp.array(x_dec)
@@ -353,7 +353,7 @@ def visualize_sample_reconstructions(
     for i, batch in enumerate(test_dataloader):
         if i >= n_batches:
             break
-        u_dec, x_dec, u_enc, x_enc = batch
+        u_dec, x_dec, u_enc, x_enc = batch[:4]
         u_enc = jnp.array(u_enc)
         x_enc = jnp.array(x_enc)
         x_dec = jnp.array(x_dec)

@@ -146,10 +146,9 @@ def get_drifting_denoiser_loss_fn(
     drifting_n_feature_heads: int = 4,
     drifting_dual_normalization: bool = True,
     drifting_weight: float = 1.0,
-    x0_anchor_weight: float = 0.0,
     velocity_anchor_weight: float = 0.0,
-    ambient_anchor_weight: float = 0.0,
     freeze_feature_encoder: bool = True,
+    latent_noise_std: float = 0.0,
 ) -> Callable:
     """Build drifting denoiser loss.
 
@@ -181,20 +180,14 @@ def get_drifting_denoiser_loss_fn(
         raise ValueError("drifting_n_feature_heads must be >= 1.")
     if drifting_weight < 0:
         raise ValueError("drifting_weight must be >= 0.")
-    if x0_anchor_weight < 0 or velocity_anchor_weight < 0 or ambient_anchor_weight < 0:
-        raise ValueError("Anchor weights must be >= 0.")
+    if velocity_anchor_weight < 0:
+        raise ValueError("velocity_anchor_weight must be >= 0.")
     if generator_mode == "one_step" and velocity_anchor_weight > 0:
         raise ValueError(
             "velocity_anchor_weight is only defined for generator_mode='diffusion'."
         )
-    if drifting_weight + x0_anchor_weight + velocity_anchor_weight + ambient_anchor_weight <= 0:
-        raise ValueError("At least one of drifting/anchor weights must be > 0.")
-
-    def _field_stats(field: jax.Array) -> tuple[jax.Array, jax.Array]:
-        mean = jnp.mean(field, axis=1)
-        centered = field - mean[:, None, :]
-        std = jnp.sqrt(jnp.mean(centered**2, axis=1) + 1e-6)
-        return mean, std
+    if drifting_weight + velocity_anchor_weight <= 0:
+        raise ValueError("At least one of drifting_weight or velocity_anchor_weight must be > 0.")
 
     def _encode_features(
         encoder_params,
@@ -215,9 +208,9 @@ def get_drifting_denoiser_loss_fn(
 
     def loss_fn(params, key, batch_stats, u_enc, x_enc, u_dec, x_dec):
         if generator_mode == "one_step":
-            key, enc_dropout_key, gen_key = jax.random.split(key, 3)
+            key, enc_dropout_key, gen_key, latent_noise_key = jax.random.split(key, 4)
         else:
-            key, enc_dropout_key, t_key, noise_key = jax.random.split(key, 4)
+            key, enc_dropout_key, t_key, noise_key, latent_noise_key = jax.random.split(key, 5)
 
         latents, encoder_updates = _call_autoencoder_fn(
             params=params,
@@ -229,6 +222,12 @@ def get_drifting_denoiser_loss_fn(
             dropout_key=enc_dropout_key,
         )
 
+        if latent_noise_std > 0.0:
+            latent_noise = jax.random.normal(latent_noise_key, latents.shape)
+            latents_for_decoder = latents + latent_noise_std * latent_noise
+        else:
+            latents_for_decoder = latents
+
         decoder_variables = {
             "params": params["decoder"],
             "batch_stats": _get_stats_or_empty(batch_stats, "decoder"),
@@ -236,7 +235,7 @@ def get_drifting_denoiser_loss_fn(
         if generator_mode == "one_step":
             x_pred = autoencoder.decoder.apply(
                 decoder_variables,
-                latents,
+                latents_for_decoder,
                 x_dec,
                 key=gen_key,
                 noise_scale=one_step_noise_scale,
@@ -259,7 +258,7 @@ def get_drifting_denoiser_loss_fn(
             noise = jax.random.normal(noise_key, u_dec.shape)
             (x_pred, z_t), decoder_updates = autoencoder.decoder.apply(
                 decoder_variables,
-                latents,
+                latents_for_decoder,
                 x_dec,
                 u_dec,
                 t,
@@ -305,25 +304,9 @@ def get_drifting_denoiser_loss_fn(
         else:
             velocity_loss = jnp.asarray(0.0, dtype=u_dec.dtype)
 
-        if x0_anchor_weight > 0.0:
-            x0_loss = jnp.mean((x_pred - u_dec) ** 2)
-        else:
-            x0_loss = jnp.asarray(0.0, dtype=u_dec.dtype)
-
-        if ambient_anchor_weight > 0.0:
-            pred_mean, pred_std = _field_stats(x_pred)
-            target_mean, target_std = _field_stats(u_dec)
-            ambient_loss = jnp.mean((pred_mean - target_mean) ** 2) + jnp.mean(
-                (pred_std - target_std) ** 2
-            )
-        else:
-            ambient_loss = jnp.asarray(0.0, dtype=u_dec.dtype)
-
         recon_loss = (
             drifting_weight * drifting_loss
             + velocity_anchor_weight * velocity_loss
-            + x0_anchor_weight * x0_loss
-            + ambient_anchor_weight * ambient_loss
         )
         latent_reg = jnp.mean(beta * jnp.sum(latents**2, axis=-1))
         total_loss = recon_loss + latent_reg

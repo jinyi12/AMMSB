@@ -30,12 +30,12 @@ REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from scripts.fae.fae_naive.train_latent_msbm import (
-    _NoopTimeModule,
-    _build_attention_fae_from_checkpoint,
-    _decode_latent_knots_to_fields,
-    _load_fae_checkpoint,
-    _make_fae_apply_fns,
+from scripts.fae.fae_naive.fae_latent_utils import (
+    NoopTimeModule,
+    build_attention_fae_from_checkpoint,
+    decode_latent_knots_to_fields,
+    load_fae_checkpoint,
+    make_fae_apply_fns,
 )
 from scripts.utils import get_device
 
@@ -212,7 +212,11 @@ def main() -> None:
     # -----------------------------------------------------------------------
     args_path = run_dir / "args.txt"
     if not args_path.exists():
-        raise FileNotFoundError(f"Missing args.txt in {run_dir}")
+        try: 
+            # Fallback to old naming convention
+            args_path = run_dir / "args.json"
+        except Exception:
+            raise FileNotFoundError(f"Missing args.txt in {run_dir}")
 
     train_cfg = parse_args_file(args_path)
     print(f"Loaded training config from {args_path}")
@@ -259,8 +263,8 @@ def main() -> None:
         )
 
     agent = LatentMSBMAgent(
-        encoder=_NoopTimeModule(),
-        decoder=_NoopTimeModule(),
+        encoder=NoopTimeModule(),
+        decoder=NoopTimeModule(),
         latent_dim=latent_dim,
         zt=list(map(float, zt.tolist())),
         initial_coupling=str(train_cfg.get("initial_coupling", "paired")),
@@ -528,9 +532,9 @@ def main() -> None:
         if not fae_checkpoint_path.exists():
             print(f"Warning: FAE checkpoint not found at {fae_checkpoint_path}, skipping decoding.")
         else:
-            ckpt = _load_fae_checkpoint(fae_checkpoint_path)
-            autoencoder, fae_params, fae_batch_stats, _ = _build_attention_fae_from_checkpoint(ckpt)
-            _, decode_fn = _make_fae_apply_fns(
+            ckpt = load_fae_checkpoint(fae_checkpoint_path)
+            autoencoder, fae_params, fae_batch_stats, _ = build_attention_fae_from_checkpoint(ckpt)
+            _, decode_fn = make_fae_apply_fns(
                 autoencoder,
                 fae_params,
                 fae_batch_stats,
@@ -544,7 +548,7 @@ def main() -> None:
 
             if args.direction in ("forward", "both") and "latent_forward_full" in artifacts:
                 print("  Decoding forward trajectory...")
-                fields_f = _decode_latent_knots_to_fields(
+                fields_f = decode_latent_knots_to_fields(
                     latent_knots=full_traj_f_np,
                     grid_coords=grid_coords,
                     decode_fn=decode_fn,
@@ -555,7 +559,7 @@ def main() -> None:
 
             if args.direction in ("backward", "both") and "latent_backward_full" in artifacts:
                 print("  Decoding backward trajectory...")
-                fields_b = _decode_latent_knots_to_fields(
+                fields_b = decode_latent_knots_to_fields(
                     latent_knots=full_traj_b_np,
                     grid_coords=grid_coords,
                     decode_fn=decode_fn,
