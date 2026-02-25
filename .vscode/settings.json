@@ -1,5 +1,17 @@
 {
     "python-envs.defaultEnvManager": "ms-python.python:conda",
     "python-envs.defaultPackageManager": "ms-python.python:conda",
-    "python-envs.pythonProjects": []
+    "python.defaultInterpreterPath": "/home/jy384/miniconda3/envs/3MASB/bin/python",
+    "python.terminal.activateEnvironment": false,
+    "terminal.integrated.profiles.linux": {
+        "bash (3MASB)": {
+            "path": "bash",
+            "args": [
+                "-l",
+                "-c",
+                "eval \"$(/home/jy384/miniconda3/bin/conda shell.bash hook)\" && conda activate 3MASB && exec bash -l"
+            ]
+        }
+    },
+    "terminal.integrated.defaultProfile.linux": "bash (3MASB)"
 }

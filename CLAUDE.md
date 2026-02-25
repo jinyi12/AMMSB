@@ -1,17 +1,20 @@
 # MMSFM — Agent Instructions
 
-Multi-Marginal Stochastic Flow Matching for high-dimensional snapshot data. This repo contains the ICML 2025 paper implementation plus experimental extensions (FAE-based latent flow, spectral bias mitigation, diffusion denoisers).
+Coupled Functional Autoencoding and Latent Multi-Marginal Schrödinger Bridge Matching for Multiscale Random Fields. This repo contains the ICML 2025 MMSFM paper implementation plus FAE-based latent MSBM extensions.
 
 ## Architecture
 
 | Module | Role | Notes |
 |--------|------|-------|
-| `mmsfm/` | Core package | Flow matching, OT sampler, models, latent flow/MSBM |
+| `mmsfm/` | Core package | Flow matching, OT sampler, models, latent MSBM |
+| `mmsfm/latent_msbm/` | Latent-space MSBM | Agent, coupling, policy, SDE |
 | `functional_autoencoders/` | FAE framework (submodule) | **Do not modify directly** — treat as external dependency |
 | `MSBM/` | Schrödinger Bridge Matching (submodule) | Separate git repo |
 | `scripts/fae/` | FAE training scripts | Dataset loaders, W&B trainer |
-| `scripts/fae/fae_naive/` | Experiment implementations | Decoders, losses, metrics, training entry points |
+| `scripts/fae/fae_naive/` | Experiment implementations | Decoders, losses, training entry points |
+| `scripts/fae/tran_evaluation/` | Evaluation pipeline | 7-phase Tran-aligned metrics |
 | `tests/` | Test suite | Run with `pytest tests/` |
+| `archive/` | Dated archives | Legacy code preserved by date |
 
 See [docs/architecture.md](docs/architecture.md) for detailed module map and data flow.
 
@@ -28,7 +31,7 @@ See [docs/conventions.md](docs/conventions.md) for full details. Critical rules:
 ## Environment
 
 ```bash
-conda activate mmsfmvenv   # or ./mmsfmvenv
+conda activate 3MASB
 # FAE scripts use JAX — set backend:
 JAX_PLATFORM_NAME=cpu python ...   # for CPU
 ```

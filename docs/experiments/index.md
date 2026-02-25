@@ -13,6 +13,8 @@
 | Experiment | Script | Description |
 |-----------|--------|-------------|
 | Standard FAE | `scripts/fae/fae_naive/train_attention.py` | Unified training (phases A-C), spectral bias mitigation |
+| Spectral diagnostic (FAE) | `scripts/fae/fae_naive/analyze_dataset_spectral.py` | PSD-based frequency support summary + MFN `B0` recommendation (see `docs/experiments/mfn_fixed_frequencies.md`) |
+| SIREN vs MFN note | `docs/experiments/siren_vs_mfn_multiscale.md` | Mathematical comparison + suggested next steps for multiscale data |
 | Diffusion denoiser | `scripts/fae/fae_naive/train_attention_denoiser.py` | Diffusion-based denoiser decoder |
 | Drifting denoiser | `scripts/fae/fae_naive/train_attention_drifting_denoiser.py` | Drifting denoiser variant |
 | Latent MSBM (FAE) | `scripts/fae/fae_naive/train_latent_msbm.py` | MSBM in FAE latent space |
@@ -22,12 +24,10 @@
 | Decoder | Module | Notes |
 |---------|--------|-------|
 | Standard MLP | (built-in FAE) | Default decoder |
-| Fourier-enhanced | `fourier_enhanced_decoder.py` | Random Fourier Features output layer |
-| MLP decoder | `mmlp_decoder.py` | Custom MLP variant |
 | Wire2D | `wire2d_decoder.py` | Wire implicit neural representation |
-| Diffusion denoiser | `diffusion_denoiser_decoder.py` | Score-based denoising with 1-NFE support |
-| Diffusion locality | `diffusion_locality_denoiser_decoder.py` | Locality-aware denoising |
-| PointNet denoiser | `diffusion_pointnet.py` | PointNet-style denoiser variant |
+| Residual MFN | *(archived)* | Fixed or learned frequency banks — see `archive/2026-02-22_mfn_archive/` |
+| Diffusion denoiser (`denoiser`) | `diffusion_denoiser_decoder.py` | Scaled denoiser backbone |
+| Diffusion denoiser (`denoiser_standard`) | `diffusion_denoiser_decoder.py` | Standard-decoder-style MLP backbone |
 
 ## Loss Functions
 
