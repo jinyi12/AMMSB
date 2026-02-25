@@ -1,0 +1,650 @@
+\newif\ifsiam
+\IfFileExists{siamart250211.cls}{
+  \siamtrue
+  \documentclass[review,onefignum,onetabnum]{siamart250211}
+}{
+  \siamfalse
+  \documentclass[11pt]{article}
+}
+
+% NOTE: The SIAM class defines its own page layout; avoid overriding it with geometry.
+
+\usepackage{amsmath,amsfonts,amssymb,mathtools}
+% The SIAM class already provides theorem infrastructure; only load amsthm in fallback (article) mode.
+\ifsiam\else
+\usepackage{amsthm}
+\newtheorem{proposition}{Proposition}
+\fi
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{graphicx}
+\usepackage{url}
+% For \path used in tables
+\usepackage{hyperref}
+
+\ifsiam\else
+\newenvironment{keywords}{\paragraph{Keywords.}}{}
+\newenvironment{AMS}{\paragraph{AMS subject classifications.}}{}
+\fi
+
+% --------------------------
+% Notation
+% --------------------------
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\N}{\mathbb{N}}
+\newcommand{\cX}{\mathcal{X}}
+\newcommand{\KL}{\operatorname{KL}}
+\newcommand{\Var}{\operatorname{Var}}
+\newcommand{\Law}{\operatorname{Law}}
+\newcommand{\argmin}{\operatornamewithlimits{arg\,min}}
+\newcommand{\diag}{\operatorname{diag}}
+\newcommand{\Tr}{\operatorname{Tr}}
+\newcommand{\supp}{\operatorname{supp}}
+\newcommand{\dd}{\,\mathrm{d}}
+\newcommand{\1}{\mathbf{1}}
+
+\newcommand{\cU}{\mathcal{U}}
+\newcommand{\cZ}{\mathcal{Z}}
+\newcommand{\cN}{\mathcal{N}}
+\newcommand{\cP}{\mathcal{P}}
+\newcommand{\cL}{\mathcal{L}}
+\newcommand{\cM}{\mathcal{M}}
+\newcommand{\cJ}{\mathcal{J}}
+\newcommand{\cE}{\mathcal{E}}
+\newcommand{\cD}{\mathcal{D}}
+\newcommand{\cF}{\mathcal{F}}
+\newcommand{\cH}{\mathcal{H}}
+
+% Backward-drift parameters (distinct from encoder parameters \phi)
+\newcommand{\bphi}{\varphi}
+
+\title{Coupled Functional Autoencoding and Latent Multi-Marginal Schr\"odinger Bridge Matching for Multiscale Random Fields}
+
+\author{Anonymous Authors}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We study multiscale random fields observed at discrete filtering levels through a generally non-injective coarse-graining operator, where only \emph{marginal} snapshot ensembles are available at each level and no sample-wise correspondences across scales are exploited. This marginals-only regime arises in destructive measurement settings and in pipelines that retain only aggregated statistics, and it constitutes the weakest data assumption under which the reverse (coarse-to-fine) generative problem can be meaningfully posed; even if forward pairings are available, non-injectivity precludes a deterministic inverse. Given empirical marginals $\{\mu_i\}_{i=0}^M$ on a function space $\cU$, our goal is to infer a stochastic evolution consistent with all intermediate marginals and to generate multiscale field trajectories with realistic fine-scale structure.
+
+We propose a modular framework trained sequentially with two stages. In the \emph{representation stage}, we learn an encoder $\cE_\phi:\cU\to\cZ\simeq\R^{d_z}$ and a stochastic, latent-conditioned decoder $\cD^{\mathrm{den}}_\psi$ by extending the functional autoencoder (FAE) of Bunker et al.~\cite{bunker2025fae}: function-space decoding is formulated as a conditional denoising diffusion process~\cite{zhao2025epsilonvae} that iteratively refines reconstructions and mitigates oversmoothing. The decoder is implemented as a coordinate-based network enabling resolution-independent evaluation. In the \emph{latent transport stage}, we fit a latent multi-marginal Schr\"odinger bridge matching (MSBM) model~\cite{park2025msbm} to the induced latent marginals $\nu_i=(\cE_\phi)_\#\mu_i$, learning continuous-time latent diffusion dynamics that satisfy all marginal constraints and thereby reconstruct a plausible joint law over scales from (possibly unpaired) snapshots.
+\end{abstract}
+
+
+\begin{keywords}
+multiscale random fields, functional autoencoders, multi-marginal Schr\"odinger bridge matching, latent stochastic dynamics, conditional denoising decoder
+\end{keywords}
+
+\begin{AMS}
+65C35, 60H10, 68T07, 74A40
+\end{AMS}
+
+\section{Introduction}\label{sec:intro}
+Many multiscale systems are naturally represented as random fields whose statistical structure varies across a hierarchy of length scales. A canonical construction is a filtering ladder: starting from a fine-scale field $U_0$, one applies spatial filters of increasing strength to obtain smoother mesoscale fields $U_i=\cF_{H_i}U_0$, $i=1,\dots,M$~\cite{tran2016stochastic}. When a common realization of $U_0$ is available, this forward procedure yields jointly paired samples $(U_0,\dots,U_M)$. The generative task considered here, however, runs in the \emph{reverse} direction: given coarser information, we seek to synthesize fine-scale structure consistent with it. In this direction there is no deterministic correspondence, because each filtering operator is typically non-injective; equivalently, the regular conditional law $\Law(U_0\mid U_i)$ is non-degenerate and coarse-scale observations admit many compatible fine-scale realizations. Motivated both by this intrinsic indeterminacy and by practical settings where pairing is unavailable (destructive measurements, independently collected scale-wise datasets, or pipelines retaining only aggregated statistics), we formulate the problem in a \emph{marginals-only} regime: we assume access only to marginal ensembles at each filtering level and infer inter-scale couplings from these marginals.
+
+
+This manuscript develops a two-stage modular methodology that decouples (i) representation learning on function space, including the recovery of fine-scale structure through iterative denoising, and (ii) stochastic latent dynamics consistent with multiple snapshot constraints. As a representation module we extend the functional autoencoder (FAE) introduced by Bunker et al.~\cite{bunker2025fae} by replacing the conventional single-step decoder with a conditional denoising decoder inspired by the ``denoising as decoding'' paradigm~\cite{zhao2025epsilonvae}. Specifically, the encoder $\cE_\phi:\cU\to\cZ$ is defined as a measurable map from the ambient function space $\cU$ to a Euclidean latent space $\cZ\simeq\R^{d_z}$, and the decoder $\cD^{\mathrm{den}}_\psi$ recovers the target field by solving a reverse SDE conditioned on the latent code $z=\cE_\phi(u)$, iteratively transforming draws from a reference measure into function-space reconstructions. The decoder is realized as a coordinate-based network that accepts arbitrary query points in $\Omega$, ensuring that the reconstruction map is compatible with the continuum formulation and transfers across mesh resolutions. After pretraining the FAE, we treat $(\cE_\phi,\cD^{\mathrm{den}}_\psi)$ as fixed; the methodological contributions of the present work concern the subsequent learning of a multi-marginal Schr\"odinger bridge in latent space and the generation of multiscale field trajectories. Given encoded snapshot marginals $\nu_i=(\cE_\phi)_\#\mu_i$, we then fit a continuous-time latent diffusion whose observation-time marginals match $\{\nu_i\}_{i=0}^M$ via multi-marginal Schr\"odinger bridge matching (MSBM)~\cite{park2025msbm}.
+
+\subsection{Problem statement}
+Let $\Omega\subset\R^{d_x}$ be a periodic spatial domain and let $\cU$ be a separable Hilbert space of fields on $\Omega$ (e.g., $\cU=L_{\mathrm{per}}^2(\Omega;\R^{d_u})$, cf.~\eqref{eq:function_space}). We are given discrete filtering levels $\tau_0<\tau_1<\cdots<\tau_M$ and, at each level, an ensemble of samples
+\begin{equation}
+u_i^{(n)} \sim \mu_i \in \cP(\cU),
+\qquad i=0,\dots,M,
+\qquad n=1,\dots,N_i,
+\label{eq:data_marginals}
+\end{equation}
+where $\mu_i$ denotes the field marginal at scale $\tau_i$. Even when the forward filtering ladder produces jointly paired realizations $(U_0,\dots,U_M)$, we deliberately discard this pairing and treat the collections $\{u_i^{(n)}\}_{n=1}^{N_i}$ as independent across $i$. This deliberate weakening targets the observation regime for which the method is designed and ensures applicability when joint samples are genuinely unavailable (e.g., destructive measurements or independently collected scale-specific datasets). Accordingly, the joint law on $\cU^{M+1}$ is unobserved. Our goal is to learn a generative model that produces a continuous-scale trajectory $\tau\mapsto \widehat U(\tau)\in\cU$ such that $\widehat U(\tau_i)$ matches $\mu_i$ for all $i$ (up to sampling error), while also reproducing statistics of interest (first-order, second-order, and spectral properties).
+
+To this end, we seek an encoder--decoder pair
+\begin{equation}
+\cE_\phi:\cU\to\cZ,\qquad \cD^{\mathrm{den}}_\psi:\cZ\to\cU,
+\label{eq:fae_maps_intro}
+\end{equation}
+with $d_z\ll \dim(\text{any discretization of }\cU)$, where $\cD^{\mathrm{den}}_\psi$ denotes a conditional denoising decoder that recovers the target field by iteratively refining draws from a reference measure conditioned on the latent code $z\in\cZ$. The learned latent representation should (i) remain meaningful across discretizations, and (ii) expose a latent geometry in which a diffusion model can capture cross-scale variation without introducing mesh-dependent artifacts. On this latent space we then learn a diffusion process $t\mapsto Z_t$ whose observation-time marginals match the encoded distributions $\nu_i=(\cE_\phi)_\#\mu_i$ (Section~\ref{sec:msbm}). Decoding latent trajectories via $\cD^{\mathrm{den}}_\psi$ yields generated field trajectories for analysis and downstream use.
+
+\subsection{Contributions}
+The manuscript makes four contributions. First, we formulate snapshot ensembles across a filtering ladder as a family of measures $\{\mu_i\}_{i=0}^M\subset\cP(\cU)$ and emphasize the distinction between the observed marginals and the unobserved joint law over scales~\cite{tran2016stochastic}. Second, we extend the FAE framework by replacing deterministic decoding with a conditional denoising diffusion decoder~\cite{zhao2025epsilonvae} realized through a coordinate-based network architecture~\cite{qi2017pointnet}, yielding a function-space autoencoder whose decoder solves a latent-conditioned reverse SDE and whose reconstruction quality is compatible with the continuum formulation. Third, we introduce a decoupled FAE--MSBM construction in which a resolution-consistent encoder defines latent marginals $\nu_i=(\cE_\phi)_\#\mu_i$, and MSBM~\cite{park2025msbm} fits a single time-inhomogeneous latent diffusion whose observation-time marginals match all $\{\nu_i\}_{i=0}^M$ simultaneously, with computationally tractable objectives based on time-changed Brownian bridge sampling and closed-form drift regression targets expressed via the integrated variance $\Gamma$. Finally, we present an evaluation protocol aligned with Tran-style first-order, second-order, and spectral diagnostics~\cite{tran2016stochastic}.
+
+\subsection{Organization}
+Section~\ref{sec:related} reviews relevant work. Section~\ref{sec:setting} defines the multiscale function-space setting. Section~\ref{sec:method} presents the two-stage framework: the FAE with denoising decoder (Sections~\ref{sec:fae}--\ref{sec:denoise}) and the latent multi-marginal Schr\"odinger bridge (Section~\ref{sec:msbm}). Section~\ref{sec:alg} gives training and sampling algorithms. Section~\ref{sec:exp} describes the numerical protocol and experimental setup. Section~\ref{sec:disc} discusses limitations and Section~\ref{sec:conc} concludes.
+
+\section{Related Work}\label{sec:related}
+
+Bunker et al.~\cite{bunker2025fae} introduce the functional autoencoder (FAE), a deterministic regularized autoencoder posed directly on an underlying function space $(\cU,\|\cdot\|_{\cU})$. Given a latent space $\cZ=\R^{d_z}$ and measurable maps $\cE_\phi:\cU\to\cZ$, $\cD_\psi:\cZ\to\cU$, the parameters are learned by minimizing the regularized reconstruction functional
+\begin{equation}
+\cJ_{\beta}^{\mathrm{FAE}}(\phi,\psi)
+= \E_{U\sim\Upsilon}\!\left[
+\frac12\|\cD_\psi(\cE_\phi(U)) - U\|_{\cU}^2
++ \beta\|\cE_\phi(U)\|_2^2
+\right],
+\label{eq:fae_rec_loss_related}
+\end{equation}
+for a training distribution $\Upsilon\in\cP(\cU)$ with finite second moment and a regularization parameter $\beta\ge 0$. A distinguishing feature of FAE is that the misfit is defined in the continuum norm on $\cU$, so that discretizations enter only through consistent numerical approximations of $\|\cdot\|_{\cU}$. This viewpoint enables encoder--decoder constructions that transfer across mesh resolutions; see~\cite{bunker2025fae} for architectural and algorithmic details. In this manuscript we use a pretrained FAE as a representation layer: the encoder induces latent snapshot marginals $\nu_i=(\cE_\phi)_\#\mu_i$, and the stochastic dynamics model is learned separately in $\cZ$.
+
+Zhao et al.~\cite{zhao2025epsilonvae} propose $\epsilon$-VAE, which replaces the conventional single-step decoder in visual autoencoders with a conditional diffusion process that iteratively denoises noise into a reconstruction guided by the encoder latent. Their work demonstrates that this ``denoising as decoding'' paradigm yields superior reconstruction fidelity compared to deterministic decoders, particularly at high compression rates, while requiring only one to three reverse-time steps in the rectified flow parametrization~\cite{lipman2023flow}. We adapt this principle to the function-space setting: rather than operating on fixed-resolution pixel grids, our denoising decoder is realized as a coordinate-based network~\cite{qi2017pointnet} that accepts arbitrary query points in $\Omega$ and produces pointwise field predictions conditioned on the latent code and the current denoising state. This ensures that the decoder defines a map from $\cZ$ to the space of continuous functions on $\Omega$, preserving the resolution-independence guarantees of the FAE framework~\cite{bunker2025fae}.
+
+The Schr\"odinger bridge problem is an entropy-regularized optimal transport problem on path space~\cite{schrodinger1931,leonard2013survey}. In its diffusion form, one seeks a controlled diffusion whose path measure is closest in relative entropy to a chosen reference process while matching prescribed marginal constraints at specified times. Recent matching approaches train parameterized drift fields by regressing against tractable bridge targets under the reference diffusion, often within an iterative Markovian fitting (IMF) framework~\cite{shi2024sbm}. Park and Lee~\cite{park2025msbm} extend this philosophy to the multi-marginal setting by enforcing multiple intermediate constraints through an interval-wise construction: local bridge sampling and regression are performed on each time interval between consecutive observation times, while a single globally defined drift is shared across all intervals to ensure a coherent diffusion over the entire horizon. Conceptually, their MSBM can be viewed as an IMF-style procedure for approximating the entropic projection of a reference diffusion onto the set of path measures satisfying a family of observation-time marginal constraints. Our work adopts the same organizing principle but operates in a learned latent space: we first define $\nu_i=(\cE_\phi)_\#\mu_i$ using a resolution-consistent encoder, and then apply MSBM in $\cZ\simeq\R^{d_z}$ to obtain a globally consistent latent diffusion whose observation-time marginals match all encoded distributions.
+
+
+\section{Multiscale Function-Space Setting}\label{sec:setting}
+\subsection{Domain and field space}
+Let $\Omega\subset\R^{d_x}$ be a periodic domain. We consider fields $u:\Omega\to\R^{d_u}$ and define the Hilbert space
+\begin{equation}
+\cU := L_{\mathrm{per}}^2(\Omega;\R^{d_u}),\qquad
+\|u\|_{\cU}^2 := \int_{\Omega} \|u(\mathbf{x})\|_2^2 \dd \mathbf{x}.
+\label{eq:function_space}
+\end{equation}
+For coarse scales obtained by spatial smoothing, typical samples are smoother than $L^2$ and may be viewed in $H^1_{\mathrm{per}}(\Omega)$, but we use \eqref{eq:function_space} as the common ambient space. When data are represented through point evaluations $\{(\mathbf{x}_j,u(\mathbf{x}_j))\}_{j=1}^{N_p}$, the squared $\cU$-norm is approximated by the normalised sum
+\begin{equation}
+\|u\|_{N_p}^2 := \frac{1}{N_p}\sum_{j=1}^{N_p} \|u(\mathbf{x}_j)\|_2^2.
+\label{eq:disc_norm}
+\end{equation}
+For evaluation points drawn uniformly from $\Omega$ (or placed on a uniform grid), $\|u\|_{N_p}^2$ is a consistent Monte Carlo (respectively, quadrature) approximation to $|\Omega|^{-1}\|u\|_{\cU}^2$; the constant prefactor $|\Omega|^{-1}$ is absorbed into the loss weighting and does not affect the minimiser. Because~\eqref{eq:disc_norm} depends on the point evaluations but not on a fixed grid topology, it applies equally to uniform meshes, irregular point clouds, and the complement-masked subsets used in training (Appendix~\ref{app:fae_mask}).
+
+\subsection{Filtering-based multiscale construction}
+We model scale variation by a family of filtering operators acting on the ambient function space, following the mesoscopic filtering framework of Tran et al.~\cite{tran2016stochastic}. Let $\{\rho_H\}_{H>0}\subset L^1_{\mathrm{per}}(\Omega)$ be a family of periodic kernels satisfying
+\begin{equation}
+\int_{\Omega}\rho_H(\mathbf{r})\,\dd \mathbf{r}=1,
+\label{eq:kernel_normalization}
+\end{equation}
+with $\sup_{H>0}\|\rho_H\|_{L^1(\Omega)}<\infty$. For each $H>0$, define the linear operator $\cF_H:\cU\to\cU$ by periodic convolution,
+\begin{equation}
+(\cF_H u)(\mathbf{x}) := \int_{\Omega} \rho_H(\mathbf{r})\,u(\mathbf{x}-\mathbf{r})\,\dd \mathbf{r}
+\;=\;(\rho_H*u)(\mathbf{x}).
+\label{eq:filter_operator}
+\end{equation}
+By Young's inequality, $\cF_H$ is bounded on $\cU$ with $\|\cF_H u\|_{\cU}\le \|\rho_H\|_{L^1(\Omega)}\|u\|_{\cU}$. Moreover, if $\rho_H$ possesses weak derivatives in $L^1(\Omega)$, then $\cF_H$ is smoothing in the sense that $\cF_H:L^2(\Omega)\to H^1_{\mathrm{per}}(\Omega)$ and $\|\nabla(\cF_H u)\|_{L^2}\le \|\nabla\rho_H\|_{L^1}\|u\|_{L^2}$, with analogous estimates for higher Sobolev regularity under stronger assumptions on $\rho_H$.
+
+Let $(\Xi,\mathcal{A},\mathbb{P})$ be a probability space and let $U_0:\Xi\to\cU$ be a square-integrable random field. For an increasing family of filter scales $0<H_0<\cdots<H_M$, define the induced multiscale fields and their marginal laws by
+\begin{equation}
+U_i := \cF_{H_i}U_0,\qquad \mu_i := \Law(U_i)\in\cP(\cU),\qquad i=0,\dots,M.
+\label{eq:filter_ladder}
+\end{equation}
+Since $\cF_{H_i}$ is continuous (hence Borel measurable) on $\cU$, the pushforward $\Law(U_i)=(\cF_{H_i})_\#\Law(U_0)$ is well-defined, and $\E\|U_i\|_{\cU}^2\le \|\rho_{H_i}\|_{L^1(\Omega)}^2\,\E\|U_0\|_{\cU}^2$, so $\mu_i$ has finite second moment whenever $\mu_0$ does. The normalization~\eqref{eq:kernel_normalization} implies preservation of spatial averages: for $u\in L^1(\Omega)$, $\int_\Omega (\cF_H u)=\int_\Omega u$. This property underlies the consistency discussion in Tran et al.~\cite{tran2016stochastic}, where convolution with a normalized kernel defines mesoscopic fields without altering volume-averaged quantities relevant to homogenized properties.
+
+\subsection{Statistical setting: marginals-only observation regime}\label{sec:stat_setting}
+The statistical input to our method consists of marginal ensembles at each filtering level, and the algorithm uses no information beyond these marginals. For each $i\in\{0,\dots,M\}$ we observe i.i.d.\ samples $\{u_i^{(n)}\}_{n=1}^{N_i}$ with common law $\mu_i\in\cP(\cU)$. The empirical marginal at scale index $\tau_i$ is
+\begin{equation}
+\widehat\mu_i^{N_i} := \frac{1}{N_i}\sum_{n=1}^{N_i}\delta_{u_i^{(n)}}.
+\label{eq:empirical_mu}
+\end{equation}
+
+\paragraph{Remark (paired forward construction and non-injectivity).}
+When data are generated by the filtering ladder~\eqref{eq:filter_ladder}, applying $\cF_{H_i}$ to a common realization $U_0$ produces a jointly paired tuple $(U_0,\dots,U_M)$; forward sample-wise correspondences are therefore available in principle. We nonetheless adopt the weaker marginals-only formulation because the generative task of interest is the \emph{reverse} (coarse-to-fine) direction. In this direction there is no deterministic inverse: the filtering operator $\cF_{H_i}$ is non-injective, so the regular conditional law of $U_0$ given $U_i=\cF_{H_i}U_0$ is generically non-degenerate and coarse-scale observations admit many compatible fine-scale realizations. The marginals-only formulation therefore captures the intrinsic indeterminacy of coarse-to-fine synthesis while strictly generalizing the paired setting. It also ensures applicability to regimes in which joint samples are genuinely unavailable, e.g., destructive measurements or independently collected scale-specific datasets~\cite{tran2016stochastic}.
+
+Under this view, the unknown object underlying trajectory inference is a coupling
+\begin{equation}
+\Pi \in \cP(\cU^{M+1})
+\label{eq:joint_law}
+\end{equation}
+whose $i$th marginal equals $\mu_i$. Such couplings exist (e.g., the product measure $\mu_0\otimes\cdots\otimes\mu_M$), yet remains unidentified by the marginals alone. Optimizing for a plausible coupling from $\{\mu_i\}_{i=0}^M$ is the central inference problem addressed by the latent Schr\"odinger bridge construction developed in Section~\ref{sec:msbm}.
+
+
+\section{Proposed Framework}\label{sec:method}
+
+\subsection{Overview and notation}\label{sec:overview}
+
+Our method consists of two stages, trained sequentially with no joint parameter optimization. We reserve $\mathbf{x}\in\Omega$ for spatial coordinates, $\tau\in[0,1]$ for physical scale, $t\in[0,T]$ for latent bridge time, $s\in(0,1)$ for the denoising-time variable internal to the decoder $\cD^{\mathrm{den}}_\psi$, and write $Z_t(\omega)=\omega(t)$ for the coordinate process on the canonical path space $C([0,T];\cZ)$.
+
+In the \emph{representation stage}, we train a functional autoencoder with a denoising decoder $({\cE_\phi,\cD^{\mathrm{den}}_\psi})$, extending the FAE framework of Bunker et al.~\cite{bunker2025fae}. The encoder $\cE_\phi:\cU\to\cZ$ and decoder $\cD^{\mathrm{den}}_\psi:\cZ\times C([0,1];\cU)\to\cU$ are Borel-measurable maps between Polish spaces, where $\cZ=\R^{d_z}$. Rather than recovering the target field through a single deterministic map $z\mapsto\cD_\psi(z)$ as in the original FAE, the decoder solves a latent-conditioned reverse SDE: given a latent code $z\in\cZ$ and a draw from a reference measure on $\cU$, it iteratively denoises the initial draw to produce a reconstruction that concentrates near the data manifold. This ``denoising as decoding'' formulation, inspired by~\cite{zhao2025epsilonvae}, enables the decoder to recover localized fine-scale features that single-step reconstructions tend to attenuate. The decoder is realized as a coordinate-based network that accepts arbitrary query points in $\Omega$, ensuring compatibility with the continuum function-space formulation and enabling resolution-independent evaluation (see Section~\ref{sec:fae} for the precise objective and Section~\ref{sec:denoise} for the SDE formulation). After pretraining, the encoder induces latent marginals via the pushforward measures
+\begin{equation}
+\nu_i := (\cE_\phi)_\#\mu_i \in \cP(\cZ),\qquad i=0,\dots,M.
+\label{eq:latent_marginals}
+\end{equation}
+Throughout the subsequent construction, $\phi,\psi$ are held fixed; no gradients from the bridging stage are propagated through $(\cE_\phi,\cD^{\mathrm{den}}_\psi)$.
+
+In the \emph{latent transport stage}, given $\{\nu_i\}_{i=0}^M$, we learn a path law $\mathbb{P}$ on $(C([0,T];\cZ),\mathcal{B})$ such that
+\begin{equation}
+(Z_{t_i})_\#\mathbb{P} = \nu_i,\qquad i=0,\dots,M,
+\label{eq:mm_constraints}
+\end{equation}
+where $\{t_i\}$ are observation times associated with filtering levels via the scale--time map introduced below. Under the snapshot regime of Section~\ref{sec:stat_setting}, the marginal constraints~\eqref{eq:mm_constraints} leave the full path measure $\mathbb{P}$ underdetermined: the inter-time couplings are latent degrees of freedom at the level of path space. We infer a latent path measure $\mathbb{P}^\star\in\cP(C([0,T];\cZ))$ by solving a multi-marginal Schr\"odinger bridge problem (Section~\ref{sec:msbm}) with reference diffusion law $\mathbb{Q}$, approximated via the MSBM construction in \cite{park2025msbm}; the implied adjacent-time couplings are the two-time marginals of $\mathbb{P}^\star$.
+
+The FAE enables both dimensionality reduction and a mesh-independent, function-level coordinate chart on the data distribution~\cite{bunker2025fae}: under approximate injectivity and local bi-Lipschitz regularity of $\cE_\phi$ on the support of the data, latent Euclidean geometry is a controlled distortion of the intrinsic geometry of the data manifold, so that reference diffusions are canonical and entropic optimal transport constructions are computationally tractable. Decoding a latent bridge path $\{Z_t\}$ via $\cD^{\mathrm{den}}_\psi$ yields a path in $\cU$ that remains close to the data support provided $\{Z_t\}$ remains in the encoder image.
+
+To relate physical scale to bridge time, we fix a strictly increasing measurable bijection $\cM_{\tau\to t}:[0,1]\to[0,T]$ with measurable inverse $\cM_{t\to\tau}$ and set
+\begin{equation}
+t=\cM_{\tau\to t}(\tau),\qquad
+\tau=\cM_{t\to\tau}(t),\qquad
+t_i=\cM_{\tau\to t}(\tau_i).
+\label{eq:time_map}
+\end{equation}
+Sampling proceeds by drawing a latent trajectory $Z_{[0,T]}$ from the learned bridge law and then decoding pointwise: for each $\tau$, the transported latent $Z_{\cM_{\tau\to t}(\tau)}$ is passed to the denoising decoder $\cD^{\mathrm{den}}_\psi$, which iteratively refines a draw from the reference measure on $\cU$ to produce the reconstructed field $u(\cdot,\tau)$.
+
+
+\subsection{Functional autoencoder with denoising decoder}\label{sec:fae}
+We build on the FAE framework of Bunker et al.~\cite{bunker2025fae}, whose central idea is to define the encoder and decoder as continuum maps on a function space and to train them with losses that admit resolution-consistent numerical approximations. Our extension replaces the single-step deterministic decoder with a conditional denoising decoder, yielding a representation module that combines the function-space compatibility of FAE with the iterative refinement capacity of diffusion-based decoding~\cite{zhao2025epsilonvae}.
+
+The encoder $\cE_\phi:\cU\to\cZ$ maps a field $u\in\cU$ to a latent code $z=\cE_\phi(u)\in\cZ$, where $\cZ=\R^{d_z}$. The decoder $\cD^{\mathrm{den}}_\psi$ is a coordinate-based network, such as a PointNet~\cite{qi2017pointnet}: given a latent code $z$, a set of query coordinates $X_{\mathrm{dec}}=\{\mathbf{x}_j\}_{j\in\mathcal{I}_{\mathrm{dec}}}\subset\Omega$, a noisy field observation $\widetilde u_s$ at denoising time $s\in(0,1)$, the network predicts pointwise field values at each query coordinate. This coordinate-based architecture ensures that the decoder defines a map from $\cZ$ to the space of functions on $\Omega$---rather than to a fixed-dimensional vector---so that the reconstruction is compatible with the continuum formulation and transfers across mesh resolutions. The denoising mechanism is described in Section~\ref{sec:denoise}.
+
+The training distribution is a convex mixture of selected scale marginals,
+\begin{equation}
+\overline\mu := \sum_{i\in\mathcal{I}_{\mathrm{train}}} w_i \mu_i,\qquad w_i\ge 0,\qquad \sum_{i\in\mathcal{I}_{\mathrm{train}}} w_i = 1,
+\label{eq:mu_bar}
+\end{equation}
+and the base FAE objective, which governs encoder training and provides the reconstruction target for the denoising decoder, is
+\begin{equation}
+\cJ_{\beta}^{\mathrm{FAE}}(\phi,\psi)
+=
+\E_{U\sim \overline\mu}\left[
+\frac{1}{2}\|\cD^{\mathrm{den}}_\psi(\cE_\phi(U)) - U\|_{\cU}^2
+\;+\beta\|\cE_\phi(U)\|_2^2
+\right].
+\label{eq:fae_obj_cont}
+\end{equation}
+Here $\|\cdot\|_{\cU}$ denotes the continuum $L^2(\Omega)$-norm \eqref{eq:function_space}; when $U$ is available only through point samples, the misfit term is evaluated using the resolution-consistent discrete norm \eqref{eq:disc_norm} (or its weighted quadrature analogue), as described in Section~\ref{sec:setting}. 
+To promote robustness to missing and irregular samples, we adopt the complement-masking protocol of~\cite{bunker2025fae}, in which the encoder and decoder are fed disjoint subsets of evaluation points; details are given in Appendix~\ref{app:fae_mask}.
+
+
+\subsection{Latent multi-marginal Schr\"odinger bridge}\label{sec:msbm}
+
+With the observation-time set $\mathcal{T}=\{t_0,\dots,t_M\}$ and latent marginals $\{\nu_i\}_{i=0}^M\subset\cP(\cZ)$ as defined in Section~\ref{sec:overview}, we now specify the reference dynamics and formulate the bridge problem. Let $\mathbb{Q}\in\cP(C([0,T];\cZ))$ denote the path measure of the reference diffusion
+\begin{equation}
+  \dd Y_t = \sigma(t)\dd W_t,
+  \label{eq:ref_sde}
+\end{equation}
+with $W_t$ a standard Brownian motion in $\R^{d_z}$ and scalar variance schedule $\sigma:[0,T]\to(0,\infty)$; $Y=(Y_t)_{t\in[0,T]}$ denotes the process under $\mathbb{Q}$ and differs in notation from the controlled latent process $Z$ introduced below in~\eqref{eq:controlled_sde}. As finer scales (corresponding to earlier bridge times under the map~\eqref{eq:time_map}) exhibit greater spatial variability, while coarser scales are smoother, we therefore employ an exponentially contracting schedule that allocates larger diffusivity to the fine-scale regime:
+\begin{equation}
+  \sigma(t)=\sigma_0\exp\!\left(-\lambda t/t_{\mathrm{ref}}\right),
+  \label{eq:sigma_exp}
+\end{equation}
+and define the integrated variance
+\begin{equation}
+  \Gamma(a,b):=\int_a^b \sigma(u)^2\,\dd u,
+  \label{eq:gamma_def}
+\end{equation}
+such that the transition density of~\eqref{eq:ref_sde} from time~$s$ to time~$t>s$ is Gaussian with variance $\Gamma(s,t)$ and denote $q_{s,t}(y_t\mid y_s)$ for this density. (Pinned?) Reference bridges over intervals $[t_i,t_{i+1}]$ therefore admit closed-form Gaussian conditioning identities (Appendix~\ref{app:gamma}).
+
+The multi-marginal Schr\"odinger bridge problem (mmSB) seeks the path measure closest to $\mathbb{Q}$ that satisfies all snapshot constraints:
+\begin{equation}
+\mathbb{P}^\star
+=
+\argmin_{\substack{\mathbb{P}\in\cP(C([0,T];\cZ))\\[2pt](Z_{t_i})_\#\mathbb{P}=\nu_i,\ i=0,\dots,M}}
+\KL(\mathbb{P}\,\|\,\mathbb{Q}).
+\label{eq:msbp}
+\end{equation}
+Since the feasible set is convex and $\mathrm{KL}(\cdot\|\mathbb{Q})$ is strictly convex on measures absolutely continuous with respect to $\mathbb{Q}$, the minimizer is unique when it exists~\cite{park2025msbm}.
+
+This entropic projection is approximated via iterative Markovian fitting (IMF), which alternates reciprocal and Markov projections~\cite{park2025msbm}. The reciprocal projection $\mathcal{R}(\mathbb{P},\mathcal{T})$ replaces the inter-observation dynamics with reference bridges conditioned on the current multi-time coupling, enforcing the snapshot constraints exactly; the Markov projection $\mathcal{M}$ then recovers a globally defined SDE whose one-time marginals match those of the reciprocal law. Appendix~\ref{app:imf_projections} records the formal definitions and their connection to the drift-matching losses below.
+
+Park and Lee~\cite{park2025msbm} develop Multi-Marginal Schr\"odinger Bridge Matching (MSBM), a scalable instance of this IMF scheme that couples local reciprocal updates between adjacent snapshots with a \emph{shared} Markovian control field. We adopt MSBM for solving~\eqref{eq:msbp} in the latent space induced by the encoder.
+
+
+\noindent\textbf{Latent multi-marginal Schr\"odinger bridge matching.}
+We follow the multi-marginal Schr\"odinger bridge matching (MSBM) formulation of Park and Lee~\cite{park2025msbm} and learn Markovian projection drifts by least-squares regression onto drift targets computed from the (non-Markovian) reciprocal projection.
+Let $\mathcal{T}=\{t_0,\ldots,t_M\}$ be the snapshot times and let $\mathbb{Q}$ denote the reference diffusion in~\eqref{eq:ref_sde}.
+Given an endpoint coupling $\Pi_{\mathcal{T}}$ on $\mathbf{X}_{\mathcal{T}}=(X_{t_0},\ldots,X_{t_M})$, the reciprocal projection is the bridge-mixture path measure
+\[
+\Pi \;:=\; \Pi_{\mathcal{T}}\,\mathbb{Q}_{\mid \mathcal{T}},
+\]
+i.e., we first draw $\mathbf{X}_{\mathcal{T}}\sim\Pi_{\mathcal{T}}$ and then draw a path from the corresponding bridge under the reference path measure $\mathbb{Q}$.
+For $t\in[0,T]$, let $\Pi_{t,\beta}$ denote the two-time marginal of $\Pi$ at $(t,\beta_{\mathcal{T}}(t))$ and $\Pi_{\gamma,t}$ the two-time marginal at $(\gamma_{\mathcal{T}}(t),t)$, where $\beta_{\mathcal{T}}(t)$ and $\gamma_{\mathcal{T}}(t)$ are the next and previous snapshot times relative to $t$: 
+\begin{equation}\label{eq:beta_gamma}
+\beta_{\mathcal{T}}(t):=\min\{u\in\mathcal{T}:u>t\},\qquad
+\gamma_{\mathcal{T}}(t):=\max\{u\in\mathcal{T}:u<t\}.
+\end{equation}
+
+We parameterize the forward-time Markov drift by $v_\theta:[0,T]\times\mathbb{R}^d\to\mathbb{R}^d$ and define the associated controlled diffusion
+\begin{equation}\label{eq:controlled_sde}
+    dZ_t = v_\theta(t,Z_t)\,dt + \sigma(t)\,dW_t,\qquad Z_0\sim\nu_0.
+\end{equation}
+Similarly, we parameterize the backward-time Markov drift by $u_\bphi$ and write the backward dynamics in the original time parameterization as
+\begin{equation}\label{eq:controlled_sde_backward}
+    dZ^{\leftarrow}_t = u_\bphi(t,Z^{\leftarrow}_t)\,dt + \sigma(t)\,d\bar W_t,\qquad Z^{\leftarrow}_T\sim\nu_M.
+\end{equation}
+
+For $t\in[t_{i-1},t_i)$, the reciprocal property implies that the conditional law of $X_t$ given $\mathbf{X}_{\mathcal{T}}$ depends on $\mathbf{X}_{\mathcal{T}}$ only through the adjacent pair $(X_{t_{i-1}},X_{t_i})$.
+Accordingly, the forward drift target at time $t$ is the bridge correction induced by the reference transition density of~$\mathbb{Q}$,
+\begin{equation}\label{eq:bridge_target}
+\widehat v\!\left(t,X_t,X_{\beta_{\mathcal{T}}(t)}\right)
+:=\sigma(t)^2\nabla_x \log \mathbb{Q}_{\beta_{\mathcal{T}}(t)\mid t}\!\left(X_{\beta_{\mathcal{T}}(t)}\mid x\right)\Big|_{x=X_t}.
+\end{equation}
+For the time-inhomogeneous Brownian reference~\eqref{eq:ref_sde}, $\mathbb{Q}_{t_2\mid t_1}$ is Gaussian with variance
+$\Gamma(t_1,t_2):=\int_{t_1}^{t_2}\sigma(s)^2\,ds$, which yields the closed-form target
+\begin{equation}\label{eq:bridge_target_closed_form}
+\widehat v\!\left(t,X_t,X_{\beta_{\mathcal{T}}(t)}\right)
+= \sigma(t)^2\,\frac{X_{\beta_{\mathcal{T}}(t)}-X_t}{\Gamma(t,\beta_{\mathcal{T}}(t))}.
+\end{equation}
+The analogous backward target uses the previous snapshot time,
+\begin{equation}\label{eq:bridge_target_bwd}
+\widehat u\!\left(t,X_t,X_{\gamma_{\mathcal{T}}(t)}\right)
+:=\sigma(t)^2\nabla_x \log \mathbb{Q}_{t\mid \gamma_{\mathcal{T}}(t)}\!\left(x\mid X_{\gamma_{\mathcal{T}}(t)}\right)\Big|_{x=X_t}
+= \sigma(t)^2\,\frac{X_{\gamma_{\mathcal{T}}(t)}-X_t}{\Gamma(\gamma_{\mathcal{T}}(t),t)}.
+\end{equation}
+
+\noindent\textbf{Drift-matching objectives.}
+We train $v_\theta$ by matching it to the forward target under the reciprocal mixture,
+\begin{equation}\label{eq:msbm_ls_forward}
+\mathcal{L}_f(\theta,\mathcal{T},\Pi_{\mathcal{T}})
+:=\int_0^T \mathbb{E}_{\Pi_{t,\beta}}\!\left[
+\left\|\widehat v\!\left(t,X_t,X_{\beta_{\mathcal{T}}(t)}\right)-v_\theta(t,X_t)\right\|^2
+\right]dt.
+\end{equation}
+Similarly, we train $u_\bphi$ via
+\begin{equation}\label{eq:msbm_ls_backward}
+\mathcal{L}_b(\bphi,\mathcal{T},\Pi_{\mathcal{T}})
+:=\int_0^T \mathbb{E}_{\Pi_{\gamma,t}}\!\left[
+\left\|\widehat u\!\left(t,X_t,X_{\gamma_{\mathcal{T}}(t)}\right)-u_\bphi(t,X_t)\right\|^2
+\right]dt.
+\end{equation}
+Finally, in all experiments we set $\sigma(t)=\sigma_0\exp(\lambda t)$ so $\Gamma(t_1,t_2)=\frac{\sigma_0^2}{2\lambda}\left(e^{2\lambda t_2}-e^{2\lambda t_1}\right)$.
+
+
+Following Park and Lee~\cite[Algorithm~1]{park2025msbm}, the losses
+are decomposed over the observation grid by exploiting the reciprocal
+factorization~\eqref{eq:reciprocal_projection_app}: for each adjacent
+pair $\mathcal{T}_i:=\{t_{i-1},t_i\}$, $i=1,\dots,M$, the reference
+bridge $\mathbb{Q}_{\mid\mathcal{T}_i}$ is independent of the
+remaining intervals and the coupling on $\mathcal{T}_i$ is the
+two-time marginal $\Pi_{\mathcal{T}_i}$ of the current iterate.  The
+aggregate objectives are
+\begin{equation}
+  \tilde{\mathcal{L}}(\theta)
+  =\sum_{i=1}^{M}
+    \mathcal{L}_f\!\left(\theta,\,\mathcal{T}_i,\,
+      \Pi_{\mathcal{T}_i}\right),
+  \qquad
+  \tilde{\mathcal{L}}(\bphi)
+  =\sum_{i=1}^{M}
+    \mathcal{L}_b\!\left(\bphi,\,\mathcal{T}_i,\,
+      \Pi_{\mathcal{T}_i}\right),
+  \label{eq:aggregate_losses}
+\end{equation}
+with a single $v_\theta$ (resp.\ $u_\bphi$) shared across all $i$, so
+that the trained model defines a globally valid drift on $[0,T]$
+rather than a stitched collection of segment-wise bridges.
+
+The forward and backward fields are updated \emph{alternately}, not
+jointly, following~\cite[Algorithm~1]{park2025msbm}.  At each outer
+iteration: (i)~the backward control is refit by minimizing
+$\tilde{\mathcal{L}}(\bphi)$ under the current couplings
+$\{\Pi_{\mathcal{T}_i}\}$; (ii)~for each sub-interval $[t_{i-1},t_i]$,
+the updated backward SDE is simulated from samples of $\nu_i$ to time
+$t_{i-1}$, and the resulting endpoints are re-paired with the empirical
+samples from~$\nu_{i-1}$ via mini-batch optimal transport assignment,
+yielding a refreshed coupling $\Pi_{\mathcal{T}_i}$; (iii)~the forward
+control is refit by minimizing $\tilde{\mathcal{L}}(\theta)$ under the
+refreshed couplings; (iv)~an analogous forward simulation and
+re-pairing step updates the couplings once more.  Steps (i)--(iv) are
+repeated until convergence.  Because each sub-interval loss can be
+computed independently, the inner regressions are parallelizable across
+intervals~\cite{park2025msbm}.  The shared parametrization further
+ensures that the one-time marginals of the learned diffusion form a
+globally consistent flow through all snapshot times $\mathcal{T}$;
+indeed, whenever $\KL(\mathbb{P}^\star\|\mathbb{Q})<\infty$ the
+minimizer $\mathbb{P}^\star$ is absolutely continuous with respect to
+$\mathbb{Q}$ and thus inherits almost-sure path continuity.
+
+
+\subsection{Denoising decoder: SDE formulation}\label{sec:denoise}
+We now describe the denoising mechanism internal to the decoder $\cD^{\mathrm{den}}_\psi$. The construction follows the ``denoising as decoding'' paradigm introduced by Zhao et al.~\cite{zhao2025epsilonvae} in the image setting, adapted here to the function-space context of FAE. Rather than recovering the target field through a single deterministic map, the decoder defines a conditional stochastic process on the space of pointwise field values whose reverse-time dynamics are conditioned on the latent code $z=\cE_\phi(u)$ and whose terminal law concentrates on the clean field.
+
+Let $u:\Omega\to\R^{d_u}$ denote the clean target field evaluated at a finite set of query coordinates $X_{\mathrm{dec}}=\{\mathbf{x}_j\}_{j\in\mathcal{I}_{\mathrm{dec}}}\subset\Omega$, and let $z\in\cZ$ be the corresponding latent code. We define a forward interpolation process indexed by a denoising time $s\in[0,1]$, where $s=0$ corresponds to the clean field and $s=1$ to pure noise. Following the rectified flow parametrization~\cite{lipman2023flow}, the forward process at the evaluation sites is
+\begin{equation}
+\widetilde u_s = (1-s)\,u + s\,\epsilon,\qquad \epsilon\sim\cN(0,I_{d_u|\mathcal{I}_{\mathrm{dec}}|}),
+\label{eq:denoise_mix}
+\end{equation}
+so that $\widetilde u_0=u$ and $\widetilde u_1\sim\cN(0,I)$. The conditional velocity field governing the transport from noise to data is $v(s)=(\widetilde u_s - u)/s = \epsilon - u$, which is constant along each interpolant path. The decoder network $\cD^{\mathrm{den}}_\psi(\widetilde u_s, s, X_{\mathrm{dec}}; z)$ is trained to approximate this conditional velocity, yielding a predicted velocity $\widehat v$ and an implied clean-field estimate
+\begin{equation}
+\widehat u = \widetilde u_s - s\,\widehat v.
+\label{eq:x0_estimate}
+\end{equation}
+
+The decoder training objective combines a velocity-matching loss with a reconstruction loss and an ambient statistics penalty:
+\begin{align}
+\cL_{\mathrm{den}}(\psi)
+&=
+\E_{s\sim\pi(s),\,\epsilon\sim\cN(0,I)}\bigg[
+\lambda_v\,\|v - \widehat v\|_{N_{\mathrm{dec}}}^2
++ \lambda_{x_0}\,\|u - \widehat u\|_{N_{\mathrm{dec}}}^2 \nonumber\\
+&\quad
++ \lambda_{\mathrm{amb}}\left(
+\|\mathrm{m}(\widehat u) - \mathrm{m}(u)\|_2^2
++ \|\mathrm{s}(\widehat u) - \mathrm{s}(u)\|_2^2
+\right)
+\bigg],
+\label{eq:lden}
+\end{align}
+where $\|\cdot\|_{N_{\mathrm{dec}}}$ denotes the normalised-sum norm~\eqref{eq:disc_norm} evaluated on the $|\mathcal{I}_{\mathrm{dec}}|$ decoder query points, $\mathrm{m}(\cdot)$ and $\mathrm{s}(\cdot)$ denote the spatial mean and standard deviation over the query points, $\pi(s)$ is a sampling distribution on $(0,1)$, and $\lambda_v,\lambda_{x_0},\lambda_{\mathrm{amb}}\ge 0$ are weighting coefficients. The velocity-matching term is equivalent, up to time-dependent reweighting, to the score-matching objective of the reverse-time SDE associated with~\eqref{eq:denoise_mix}~\cite{song2021score}. The ambient statistics penalty encourages the decoder to preserve first- and second-moment structure of the field, which is important for reproducing the mesoscale diagnostics of Tran et al.~\cite{tran2016stochastic}. The total FAE objective is $\cJ_\beta^{\mathrm{FAE}}(\phi,\psi) + \cL_{\mathrm{den}}(\psi)$, where $\cJ_\beta^{\mathrm{FAE}}$ is defined in~\eqref{eq:fae_obj_cont}.
+
+At inference, the decoder solves the reverse-time dynamics from $s=1$ (noise) to $s=0$ (clean field), conditioned on a given latent code $z$. Let $1-\varepsilon_{\mathrm{dn}}=s_0>s_1>\cdots>s_K=\varepsilon_{\mathrm{dn}}$ be a decreasing time grid. In the probability flow ODE regime~\cite{song2021score}, the decoder iterates
+\begin{equation}
+\widetilde u_{s_{k+1}} = \widetilde u_{s_k} + (s_{k+1}-s_k)\,\widehat v_k,
+\label{eq:ode_step}
+\end{equation}
+where $\widehat v_k = \cD^{\mathrm{den}}_\psi(\widetilde u_{s_k}, s_k, X_{\mathrm{dec}}; z)$. In the SDE regime, stochastic noise is injected at each step:
+\begin{equation}
+\widetilde u_{s_{k+1}} = \widetilde u_{s_k} + (s_{k+1}-s_k)\,\widehat v_k
++ \sqrt{|s_{k+1}-s_k|}\,\sigma_{\mathrm{sde}}\,\eta_k,\qquad \eta_k\sim\cN(0,I).
+\label{eq:sde_step}
+\end{equation}
+The SDE formulation provides additional stochasticity that can improve the diversity and sharpness of reconstructed fine-scale features~\cite{song2021score}. In practice, the rectified flow parametrization yields high-quality reconstructions with as few as one to three denoising steps~\cite{zhao2025epsilonvae}, so the computational overhead of iterative decoding remains modest.
+
+
+\subsection{Test-time Feynman--Kac biasing with Fisher--Rao cross-scale likelihood}\label{sec:testtime_fr}
+Beyond training-time MSBM fitting, we consider a test-time biased backward sampler on latent path space. Let $\mathbb{P}_{\mathrm{ref}}$ denote the path measure of the learned backward latent SDE (used as proposal), and let $\{t_i\}_{i=0}^M$ be observation knots ordered from fine to coarse. For coarse-to-fine synthesis we traverse pairs $(t_{i+1}\to t_i)$ and define a twisted target path law
+\begin{equation}
+\frac{\dd \mathbb{Q}^\star}{\dd \mathbb{P}_{\mathrm{ref}}}(Z_{[0,T]})
+\propto
+\exp\!\left(
+\sum_{i=0}^{M-1}
+\Big[
+\beta_i \log p_{\mathrm{emp}}(Z_{t_i}\mid Z_{t_{i+1}})
+-\lambda_i C_i^{\mathrm{run}}
+-\kappa_i D_i^{\mathrm{FR}}
+\Big]
+\right),
+\label{eq:fk_twist_frmeas}
+\end{equation}
+where $C_i^{\mathrm{run}}:=\int_{t_i}^{t_{i+1}}E_{\mathrm{FR}}(Z_t)\,\dd t$ is the decoder spacetime running cost, and $p_{\mathrm{emp}}$ is an empirical latent backward conditional (implemented as a local Gaussian-mixture approximation on corpus latents).
+
+The new measurement term targets cross-scale consistency directly. Define decoded fields at interval endpoints by
+\begin{equation}
+u_i:=\cD^{\mathrm{den}}_\psi(Z_{t_i}),\qquad
+u_{i+1}:=\cD^{\mathrm{den}}_\psi(Z_{t_{i+1}}),
+\end{equation}
+and let $\cF_i$ be a coarse-graining operator (identity, Gaussian blur, or Tran-style filter). Setting $\widetilde u_{i+1}:=\cF_i(u_i)$, we use a fixed denoising-time information-geometric discrepancy
+\begin{equation}
+D_i^{\mathrm{FR}}
+:=
+\mathrm{FR}_{\bar s}\!\left(\widetilde u_{i+1},u_{i+1};Z_{t_{i+1}}\right),
+\qquad \bar s\in(\varepsilon_{\mathrm{dn}},1-\varepsilon_{\mathrm{dn}}),
+\label{eq:fr_meas_term}
+\end{equation}
+with shared conditioning $Z_{t_{i+1}}$. At fixed denoising time, the scalar natural-parameter contribution cancels, so we use the closed-form symmetrized-KL inner product
+\begin{equation}
+\mathrm{FR}_{\bar s}(a,b;z)
+:=
+\frac12\left\langle
+\eta_x(x_{\bar s}^a)-\eta_x(x_{\bar s}^b),\,
+\widehat x_0(x_{\bar s}^a,\bar s;z)-\widehat x_0(x_{\bar s}^b,\bar s;z)
+\right\rangle,
+\label{eq:fr_meas_fixed_time_inner}
+\end{equation}
+where $x_{\bar s}^a=\alpha_{\bar s}a$ and $x_{\bar s}^b=\alpha_{\bar s}b$ under deterministic embedding (or both augmented with the same $\sigma_{\bar s}\varepsilon$ under shared-noise embedding). In implementation we normalize~\eqref{eq:fr_meas_fixed_time_inner} by spatial degrees of freedom.
+
+With proposal equal to reference ($\mathbb{Q}\equiv\mathbb{P}_{\mathrm{ref}}$), no proposal-ratio correction is required: the particle filter incremental weights are exactly
+\begin{equation}
+G_i^{(n)}
+=
+\exp\!\left(
+\beta_i \log p_{\mathrm{emp}}(z_i^{(n)}\mid z_{i+1}^{(n)})
+-\lambda_i C_{i,\mathrm{run}}^{(n)}
+-\kappa_i D_{i,\mathrm{FR}}^{(n)}
+\right).
+\label{eq:smc_inc_weight_frmeas}
+\end{equation}
+This preserves the non-heuristic Feynman--Kac/SMC structure while replacing Euclidean cross-scale mismatch with an information-geometric one.
+
+
+
+\appendix
+\section{IMF projections for multi-marginal Schr\"odinger bridges}\label{app:imf_projections}
+This appendix records the projection operators underlying iterative Markovian fitting (IMF) and clarifies how the drift-matching losses used in MSBM relate to these projections. The presentation follows the viewpoint of Park and Lee~\cite{park2025msbm}.
+
+\subsection{Reciprocal projection}
+Let $\mathcal{T}=\{t_0,\ldots,t_M\}$ be the set of constraint times and let $\mathbb{Q}_{\mid \mathcal{T}}(\,\cdot\,\mid z_{\mathcal{T}})$ denote a regular conditional distribution of the reference path measure $\mathbb{Q}$ given the values $Z_{\mathcal{T}}=z_{\mathcal{T}}$. For any candidate path measure $\mathbb{P}$, the \emph{reciprocal projection} is the path measure
+\begin{equation}
+\mathcal{R}(\mathbb{P},\mathcal{T})(\dd \omega)
+:=\int \mathbb{Q}_{\mid \mathcal{T}}(\dd \omega \mid z_{\mathcal{T}})\,\mathbb{P}_{\mathcal{T}}(\dd z_{\mathcal{T}}),
+\label{eq:reciprocal_projection_app}
+\end{equation}
+i.e., a mixture of reference bridges indexed by the multi-time coupling $\mathbb{P}_{\mathcal{T}}$. By construction, $\mathcal{R}(\mathbb{P},\mathcal{T})$ has the prescribed marginals on $\mathcal{T}$ whenever $\mathbb{P}$ does. However, because sampling from~\eqref{eq:reciprocal_projection_app} conditions on (future) constraint points, the resulting law is generally \emph{reciprocal} and need not be Markov.
+
+\subsection{Markov projection and drift matching}
+Given a reciprocal path measure $\Pi$ with continuous-time marginals $\{\Pi_t\}_{t\in[0,T]}$, the \emph{Markov projection} $\mathcal{M}(\Pi,\mathcal{T})$ is the Markov diffusion whose one-time marginals match those of $\Pi$ on $[0,T]$. In the Brownian reference setting, Park and Lee~\cite{park2025msbm} show that the projected Markov drift can be expressed in terms of conditional endpoint statistics under the reference bridges; in particular, over an interval $[t_i,t_{i+1}]$,
+\begin{equation}
+b^\star(t,x)
+=\frac{1}{t_{i+1}-t}\Big(\mathbb{E}_{\mathbb{Q}_{t_{i+1}\mid t}}\!\left[Z_{t_{i+1}}\mid Z_t=x\right]-x\Big),
+\qquad t\in[t_i,t_{i+1}),
+\label{eq:markov_projection_drift_app}
+\end{equation}
+where the conditional expectation is taken under the reference bridge law weighted by the current endpoint coupling. This identity motivates drift regression: one can approximate $b^\star$ by learning a parameterized drift and matching it to closed-form bridge drifts (or their conditional expectations) using samples from the reciprocal projection.
+
+\subsection{Continuity of the global mmSB solution}
+Both projection steps preserve the regularity of the reference dynamics. Each conditional bridge under $\mathbb{Q}_{\mid \mathcal{T}}$ admits continuous sample paths whenever $\mathbb{Q}$ does, and mixtures of such bridges remain supported on continuous paths. Moreover, whenever the mmSB optimizer satisfies $\mathrm{KL}(\mathbb{P}^\star\|\mathbb{Q})<\infty$, we have $\mathbb{P}^\star\ll\mathbb{Q}$, so $\mathbb{P}^\star$ inherits the almost-sure path continuity of the reference diffusion. In MSBM-style training, continuity across all snapshot times is additionally enforced at the model level by using a single, shared drift parameterization optimized via the aggregate objectives in~\eqref{eq:aggregate_losses}, so the resulting controlled diffusion is defined globally on $[0,T]$ without segment-stitching artifacts.
+
+\section{Experimental details}\label{app:exp_details}
+This appendix collects implementation-level choices that are not essential to the main methodological presentation.
+
+\subsection{Filtering kernels used in experiments}\label{app:filter_kernel}
+In the numerical studies, we instantiate the abstract kernel family $\{\rho_H\}_{H>0}$ from Section~\ref{sec:setting} by normalized, compactly supported truncated Gaussians, following the filtering framework of Tran et al.~\cite{tran2016stochastic}. For a prescribed filter size $H>0$, we set
+\begin{equation}
+\rho_H(\mathbf{r})=\alpha_H\exp\!\left(-\frac{\|\mathbf{r}\|_2^2}{2\gamma_H^2}\right)\,
+\mathbf{1}_{\{|r_\ell|\le H/2,\ \ell=1,\dots,d_x\}},
+\qquad \gamma_H:=H/6,
+\label{eq:trunc_gauss_kernel}
+\end{equation}
+where $\alpha_H$ enforces the normalization \eqref{eq:kernel_normalization}. This choice concentrates mass near the origin and yields progressive smoothing as $H$ increases, which is consistent with the mesoscale interpretation in \cite{tran2016stochastic}.
+
+
+\subsection{FAE discretization and complement masking}\label{app:fae_mask}
+To train the FAE from discretized field samples, we follow the complement-masking protocol advocated in~\cite{bunker2025fae}. Given a sample $u$ evaluated at points $\{\mathbf{x}_j\}_{j=1}^{N_p}\subset\Omega$, we draw index sets $\mathcal{I}_{\mathrm{enc}},\mathcal{I}_{\mathrm{dec}}\subset\{1,\dots,N_p\}$ such that
+\begin{equation}
+\mathcal{I}_{\mathrm{enc}}\cap\mathcal{I}_{\mathrm{dec}}=\emptyset,\qquad
+\mathcal{I}_{\mathrm{enc}}\cup\mathcal{I}_{\mathrm{dec}}=\{1,\dots,N_p\}.
+\label{eq:mask_sets_app}
+\end{equation}
+The encoder receives the values and coordinates on $\mathcal{I}_{\mathrm{enc}}$, while the decoder reconstructs the held-out values on $\mathcal{I}_{\mathrm{dec}}$:
+\begin{align}
+u_{\mathrm{enc}} &:= \{u(\mathbf{x}_j)\}_{j\in\mathcal{I}_{\mathrm{enc}}}, &
+X_{\mathrm{enc}} &:= \{\mathbf{x}_j\}_{j\in\mathcal{I}_{\mathrm{enc}}}, \nonumber\\
+u_{\mathrm{dec}} &:= \{u(\mathbf{x}_j)\}_{j\in\mathcal{I}_{\mathrm{dec}}}, &
+X_{\mathrm{dec}} &:= \{\mathbf{x}_j\}_{j\in\mathcal{I}_{\mathrm{dec}}}.
+\label{eq:enc_dec_data_app}
+\end{align}
+The latent code and reconstructions are computed as
+\begin{equation}
+z = \cE_\phi(u_{\mathrm{enc}},X_{\mathrm{enc}})\in\cZ,\qquad
+\widehat u_{\mathrm{dec}} = \cD^{\mathrm{den}}_\psi(z,X_{\mathrm{dec}}),
+\label{eq:fae_maps_app}
+\end{equation}
+and the empirical training objective (approximating \eqref{eq:fae_obj_cont}) is
+\begin{equation}
+\cJ_{\beta}^{\mathrm{FAE}}(\phi,\psi)
+= \E\left[
+\frac{1}{2|\mathcal{I}_{\mathrm{dec}}|}\sum_{j\in\mathcal{I}_{\mathrm{dec}}}
+\big\|\cD^{\mathrm{den}}_\psi(z,\mathbf{x}_j)-u(\mathbf{x}_j)\big\|_2^2
++\beta\|z\|_2^2
+\right],
+\label{eq:fae_obj_app}
+\end{equation}
+where the expectation is over the empirical data distribution (potentially mixing scales) and the random masking rule.
+
+\subsection{Time sampling and bridge discretization}\label{app:time_sampling}
+An interval index $I\in\mathcal I$ is sampled with $\mathbb{P}[I=i]=p_i$, and an interior time $t\sim\mathrm{Unif}[t_i,t_{i+1}]$ is drawn on the selected interval. For bridge discretization, $K$ intermediate times are placed on $[t_i,t_{i+1}]$, and intermediate latent states are generated using the reference bridge representation in terms of the integrated variance $\Gamma$; the forward and backward drifts are regressed against the corresponding closed-form targets. To avoid numerical instabilities of the bridge coefficients near endpoints, $t$ may be drawn from a trimmed subinterval $[t_i+\delta,t_{i+1}-\delta]$ with small $\delta>0$.
+
+\subsection{MSBM procedural details}\label{app:msbm_details}
+This section records explicit identities used in the MSBM regression procedure. For each interval $[t_i,t_{i+1}]$ and endpoint coupling $\pi_i\in\Pi(\nu_i,\nu_{i+1})$, the reference bridge is sampled by drawing $(z_a,z_b)\sim\pi_i$ and then generating an intermediate state $Y_t$ ($t\in(t_i,t_{i+1})$) from the Gaussian conditional
+\begin{equation}
+Y_t \mid (Y_{t_i}=z_a,\,Y_{t_{i+1}}=z_b)
+\;\sim\;
+\mathcal{N}\!\left(
+\frac{\Gamma(t,t_{i+1})}{\Gamma(t_i,t_{i+1})}z_a
++ \frac{\Gamma(t_i,t)}{\Gamma(t_i,t_{i+1})}z_b,\;
+\frac{\Gamma(t_i,t)\,\Gamma(t,t_{i+1})}{\Gamma(t_i,t_{i+1})}I_{d_z}
+\right).
+\label{eq:bridge_gaussian}
+\end{equation}
+The local forward regression target is
+\begin{equation}
+\widehat b_f(t,Y_t,z_b) = \sigma(t)^2\,\frac{z_b - Y_t}{\Gamma(t,t_{i+1})},
+\label{eq:fwd_target}
+\end{equation}
+and the backward target has the analogous form with $z_a$ and $\Gamma(t_i,t)$. The coupling $\pi_i$ is updated at each MSBM iteration by rolling out the current parameterized dynamics from $\nu_i$ to time $t_{i+1}$ and pairing the resulting samples with the nearest empirical samples from $\nu_{i+1}$ (or vice versa for the backward policy).
+
+\subsection{Detail-aware masking (decoder training)}\label{app:masking}
+To prevent the denoising decoder from collapsing to an identity map at low noise levels, a detail-aware masking scheme may be applied during training: for each input field, a subset of spatial locations is masked with a Bernoulli mask whose probability is modulated by local gradient magnitude. Masked values are replaced with i.i.d.\ Gaussian noise, and the decoder is trained to reconstruct only the masked regions conditioned on the unmasked context and the latent code.
+
+\section{Integrated variance for exponential schedules}\label{app:gamma}
+For \eqref{eq:sigma_exp}, the integrated variance \eqref{eq:gamma_def} is
+\begin{equation}
+\Gamma(a,b)=\int_a^b \sigma_0^2\exp(-2\lambda u/t_{\mathrm{ref}})\dd u
+=\frac{\sigma_0^2 t_{\mathrm{ref}}}{2\lambda}
+\left(e^{-2\lambda a/t_{\mathrm{ref}}}-e^{-2\lambda b/t_{\mathrm{ref}}}\right).
+\label{eq:gamma_exp}
+\end{equation}
+As $\lambda\to 0$, the first-order expansion yields $\Gamma(a,b)\to \sigma_0^2(b-a)$.
+
+\begin{thebibliography}{10}
+
+\bibitem{bunker2025fae}
+{\sc J.~Bunker, M.~Girolami, H.~Lambley, A.~M. Stuart, and T.~J. Sullivan},
+{\em Autoencoders in function space}, Journal of Machine Learning Research, 26 (2025),
+pp.~1--92.
+
+\bibitem{park2025msbm}
+{\sc B.~Park and J.~Lee}, {\em Multi-marginal Schr\"odinger bridge matching}, 2025.
+
+\bibitem{tran2016stochastic}
+{\sc V.-P. Tran, J.~Guilleminot, S.~Brisard, and K.~Sab},
+{\em Stochastic modeling of mesoscopic elasticity random field},
+Computer Methods in Applied Mechanics and Engineering, 302 (2016), pp.~117--156.
+
+\bibitem{schrodinger1931}
+{\sc E.~Schr\"odinger}, {\em {\"U}ber die umkehrung der naturgesetze},
+Sitzungsberichte der Preussischen Akademie der Wissenschaften, (1931), pp.~144--153.
+
+\bibitem{leonard2013survey}
+{\sc C.~L{\'e}onard},
+{\em A survey of the Schr\"odinger problem and some of its connections with optimal transport},
+Discrete and Continuous Dynamical Systems A, 34 (2014), pp.~1533--1574.
+
+\bibitem{shi2024sbm}
+{\sc Y.~Shi, V.~De Bortoli, A.~Campbell, and A.~Doucet},
+{\em Diffusion Schr\"odinger bridge matching},
+Advances in Neural Information Processing Systems, 37 (2024).
+
+\bibitem{lipman2023flow}
+{\sc Y.~Lipman, R.~Chen, H.~Ben-Hamu, M.~Nickel, and M.~Le},
+{\em Flow matching for generative modeling},
+in International Conference on Learning Representations, 2023.
+
+\bibitem{debortoli2021diffusion}
+{\sc V.~De Bortoli, J.~Thornton, J.~Heng, and A.~Doucet},
+{\em Diffusion Schr\"odinger bridge with applications to score-based generative modeling},
+Advances in Neural Information Processing Systems, 34 (2021), pp.~17695--17709.
+
+\bibitem{song2021score}
+{\sc Y.~Song, J.~Sohl-Dickstein, D.~P. Kingma, A.~Kumar, S.~Ermon, and B.~Poole},
+{\em Score-based generative modeling through stochastic differential equations},
+in International Conference on Learning Representations, 2021.
+
+\bibitem{villani2009ot}
+{\sc C.~Villani}, {\em Optimal Transport: Old and New}, Springer, 2009.
+
+\bibitem{zhao2025epsilonvae}
+{\sc L.~Zhao, S.~Woo, Z.~Wan, Y.~Li, H.~Zhang, B.~Gong, H.~Adam, X.~Jia, and T.~Liu},
+{\em $\epsilon$-{VAE}: Denoising as visual decoding},
+in International Conference on Machine Learning, 2025.
+
+\bibitem{qi2017pointnet}
+{\sc C.~R. Qi, H.~Su, K.~Mo, and L.~J. Guibas},
+{\em {PointNet}: Deep learning on point sets for {3D} classification and segmentation},
+in IEEE Conference on Computer Vision and Pattern Recognition, 2017, pp.~652--660.
+
+\end{thebibliography}
+
+\end{document}
