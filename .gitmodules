@@ -1,0 +1,12 @@
+[submodule "functional_autoencoders"]
+	path = functional_autoencoders
+	url = https://github.com/htlambley/functional_autoencoders
+	ignore = dirty
+[submodule "MSBM"]
+	path = MSBM
+	url = https://github.com/bw-park/MSBM.git
+	ignore = dirty
+[submodule "spacetime-geometry"]
+	path = spacetime-geometry
+	url = https://github.com/rafalkarczewski/spacetime-geometry.git
+	ignore = dirty

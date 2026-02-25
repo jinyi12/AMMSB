@@ -8,9 +8,13 @@ __pycache__/
 *.egg-info/
 *.ipynb_checkpoints/
 
-# Ignore data files but keep data generation script
+# Ignore data files but keep data generation scripts
 data/*
 !data/datagen.py
+!data/generate_fae_data.py
+!data/generate_large_corpus.py
+!data/multimarginal_generation.py
+!data/transform_utils.py
 
 # Keep results directory but ignore everything inside it
 results/*
@@ -24,16 +28,35 @@ logs/
 # Ignore local WandB directory
 wandb/
 
-/tests
+# Ignore archive directory
+archive/
 
-# ignore all archive files and folders with ./archive/
-*archive*
-
-# ignore log files
+# Ignore log files and process output
 *.log
-
 *.out
-
 *.nfs*
 
+# Ignore generated figures
 *figures/
+
+# Ignore manuscript build artifacts
+manuscript/*.aux
+manuscript/*.log
+manuscript/*.out
+manuscript/*.pdf
+manuscript/*.bbl
+manuscript/*.blg
+manuscript/*.synctex.gz
+
+# Ignore Python build artifacts
+build/
+dist/
+*.pyc
+*.pyo
+
+# Ignore IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
