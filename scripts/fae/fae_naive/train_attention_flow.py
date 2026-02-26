@@ -434,6 +434,11 @@ def run_training(
 
     print(f"  Train samples: {len(train_dataset)}  |  Test samples: {len(test_dataset)}")
 
+    n_loss_terms = 1
+    if args.training_mode == "multi_scale" and hasattr(train_dataset, "n_times"):
+        n_loss_terms = max(1, int(train_dataset.n_times))
+    setattr(args, "ntk_n_loss_terms", int(n_loss_terms))
+
     if getattr(args, "loss_type", "l2") == "sobolev_h1":
         est = _estimate_sobolev_balance_from_dataset(
             train_dataset,
@@ -464,10 +469,6 @@ def run_training(
         if len(setup_result) >= 4:
             extra_init_params_fn = setup_result[3]
     else:
-        n_loss_terms = 1
-        if args.training_mode == "multi_scale" and hasattr(train_dataset, "n_times"):
-            n_loss_terms = max(1, int(train_dataset.n_times))
-
         latent_noise_scale = getattr(args, "latent_noise_scale", 0.0) or 0.0
         domain = RandomlySampledEuclidean(s=0.0)
         if args.loss_type == "l2":
