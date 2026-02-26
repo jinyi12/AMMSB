@@ -22,7 +22,9 @@ from scripts.fae.fae_naive.diffusion_denoiser_decoder import (
     DenoiserReconstructionMSEMetric,
     LatentDiffusionPrior,
     get_denoiser_loss_fn,
+    get_ntk_scaled_denoiser_loss_fn,
     get_film_prior_loss_fn,
+    get_ntk_scaled_film_prior_loss_fn,
     reconstruct_with_denoiser,
     reconstruct_with_film,
 )
@@ -160,6 +162,43 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--eval-masking-strategy", type=str, default="random",
                         choices=["random", "detail", "same"])
     parser.add_argument("--beta", type=float, default=1e-4)
+    parser.add_argument(
+        "--loss-type",
+        type=str,
+        default="denoiser",
+        choices=["denoiser", "ntk_scaled"],
+        help=(
+            "Denoiser training objective. "
+            "'ntk_scaled' applies Wang et al.-style NTK trace balancing across "
+            "physical-time marginals (requires time-grouped batches)."
+        ),
+    )
+    parser.add_argument(
+        "--ntk-scale-norm",
+        type=float,
+        default=10.0,
+        help="Global scaling constant C for --loss-type=ntk_scaled.",
+    )
+    parser.add_argument(
+        "--ntk-epsilon",
+        type=float,
+        default=1e-8,
+        help="Stability epsilon for NTK trace inversion (--loss-type=ntk_scaled).",
+    )
+    parser.add_argument(
+        "--ntk-estimate-total-trace",
+        action="store_true",
+        help=(
+            "If set, use an EMA estimate of Tr(K_total) as the NTK numerator "
+            "(Wang et al.-style ratio-of-traces scaling)."
+        ),
+    )
+    parser.add_argument(
+        "--ntk-total-trace-ema-decay",
+        type=float,
+        default=0.99,
+        help="EMA decay in [0, 1) for total-trace estimation (--loss-type=ntk_scaled).",
+    )
 
     # -- Training ----------------------------------------------------------
     parser.add_argument("--optimizer", type=str, default="adam",
@@ -310,6 +349,29 @@ def validate_args(args: argparse.Namespace) -> None:
                 UserWarning,
             )
 
+    if getattr(args, "loss_type", "denoiser") == "ntk_scaled":
+        if args.ntk_scale_norm <= 0.0:
+            raise ValueError("--ntk-scale-norm must be > 0 for --loss-type=ntk_scaled.")
+        if args.ntk_epsilon <= 0.0:
+            raise ValueError("--ntk-epsilon must be > 0 for --loss-type=ntk_scaled.")
+        if args.ntk_total_trace_ema_decay < 0.0 or args.ntk_total_trace_ema_decay >= 1.0:
+            raise ValueError("--ntk-total-trace-ema-decay must be in [0, 1) for --loss-type=ntk_scaled.")
+    else:
+        ntk_args_used = []
+        if args.ntk_scale_norm != 10.0:
+            ntk_args_used.append("--ntk-scale-norm")
+        if args.ntk_epsilon != 1e-8:
+            ntk_args_used.append("--ntk-epsilon")
+        if args.ntk_estimate_total_trace:
+            ntk_args_used.append("--ntk-estimate-total-trace")
+        if args.ntk_total_trace_ema_decay != 0.99:
+            ntk_args_used.append("--ntk-total-trace-ema-decay")
+        if ntk_args_used:
+            warnings.warn(
+                f"NTK arguments {ntk_args_used} ignored when --loss-type={args.loss_type}.",
+                UserWarning,
+            )
+
 
 # ---------------------------------------------------------------------------
 # Model builder
@@ -379,12 +441,25 @@ def _film_prior_setup(autoencoder, args):
         )
         print(f"Latent diffusion prior: {n_prior_params:,} parameters")
 
-    loss_fn = get_film_prior_loss_fn(
-        autoencoder,
-        beta=args.beta,
-        prior=prior,
-        prior_weight=getattr(args, "prior_loss_weight", 1.0),
-    )
+    if getattr(args, "loss_type", "denoiser") == "ntk_scaled":
+        loss_fn = get_ntk_scaled_film_prior_loss_fn(
+            autoencoder,
+            beta=args.beta,
+            prior=prior,
+            prior_weight=getattr(args, "prior_loss_weight", 1.0),
+            scale_norm=args.ntk_scale_norm,
+            epsilon=args.ntk_epsilon,
+            estimate_total_trace=bool(args.ntk_estimate_total_trace),
+            total_trace_ema_decay=float(args.ntk_total_trace_ema_decay),
+            n_loss_terms=int(getattr(args, "ntk_n_loss_terms", 1) or 1),
+        )
+    else:
+        loss_fn = get_film_prior_loss_fn(
+            autoencoder,
+            beta=args.beta,
+            prior=prior,
+            prior_weight=getattr(args, "prior_loss_weight", 1.0),
+        )
 
     def reconstruct_fn(autoencoder_, state_, u_dec_, x_dec_, u_enc_, x_enc_, key_):
         del u_dec_, key_
@@ -427,20 +502,41 @@ def _denoiser_setup(autoencoder, args):
         )
         print(f"Latent diffusion prior: {n_prior_params:,} parameters")
 
-    loss_fn = get_denoiser_loss_fn(
-        autoencoder,
-        beta=args.beta,
-        time_sampling=args.denoiser_time_sampling,
-        logit_mean=args.denoiser_time_logit_mean,
-        logit_std=args.denoiser_time_logit_std,
-        logsnr_max=getattr(args, "denoiser_logsnr_max", 5.0),
-        velocity_weight=args.denoiser_velocity_loss_weight,
-        x0_weight=args.denoiser_x0_loss_weight,
-        ambient_weight=args.denoiser_ambient_loss_weight,
-        prior=prior,
-        prior_weight=getattr(args, "prior_loss_weight", 1.0),
-        decoder_loss_factor=getattr(args, "decoder_loss_factor", 1.0),
-    )
+    if getattr(args, "loss_type", "denoiser") == "ntk_scaled":
+        loss_fn = get_ntk_scaled_denoiser_loss_fn(
+            autoencoder,
+            beta=args.beta,
+            time_sampling=args.denoiser_time_sampling,
+            logit_mean=args.denoiser_time_logit_mean,
+            logit_std=args.denoiser_time_logit_std,
+            logsnr_max=getattr(args, "denoiser_logsnr_max", 5.0),
+            velocity_weight=args.denoiser_velocity_loss_weight,
+            x0_weight=args.denoiser_x0_loss_weight,
+            ambient_weight=args.denoiser_ambient_loss_weight,
+            prior=prior,
+            prior_weight=getattr(args, "prior_loss_weight", 1.0),
+            decoder_loss_factor=getattr(args, "decoder_loss_factor", 1.0),
+            scale_norm=args.ntk_scale_norm,
+            epsilon=args.ntk_epsilon,
+            estimate_total_trace=bool(args.ntk_estimate_total_trace),
+            total_trace_ema_decay=float(args.ntk_total_trace_ema_decay),
+            n_loss_terms=int(getattr(args, "ntk_n_loss_terms", 1) or 1),
+        )
+    else:
+        loss_fn = get_denoiser_loss_fn(
+            autoencoder,
+            beta=args.beta,
+            time_sampling=args.denoiser_time_sampling,
+            logit_mean=args.denoiser_time_logit_mean,
+            logit_std=args.denoiser_time_logit_std,
+            logsnr_max=getattr(args, "denoiser_logsnr_max", 5.0),
+            velocity_weight=args.denoiser_velocity_loss_weight,
+            x0_weight=args.denoiser_x0_loss_weight,
+            ambient_weight=args.denoiser_ambient_loss_weight,
+            prior=prior,
+            prior_weight=getattr(args, "prior_loss_weight", 1.0),
+            decoder_loss_factor=getattr(args, "decoder_loss_factor", 1.0),
+        )
 
     sample_steps = (
         args.denoiser_sample_steps
@@ -496,7 +592,6 @@ def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
     validate_args(args)
-    args.loss_type = "denoiser"
     run_training(
         args,
         build_autoencoder_fn=_build_denoiser_autoencoder,

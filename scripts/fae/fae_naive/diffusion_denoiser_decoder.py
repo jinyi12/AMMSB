@@ -624,6 +624,29 @@ def _get_stats_or_empty(batch_stats, name: str):
     return {}
 
 
+def _tree_squared_l2_norm(tree) -> jax.Array:
+    return jnp.sum(
+        jnp.array(
+            [jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(tree)],
+        )
+    )
+
+
+def _trace_per_output_from_jt_v(
+    *,
+    jt_v,
+    n_outputs: float,
+    epsilon: float,
+) -> tuple[jax.Array, jax.Array]:
+    trace = _tree_squared_l2_norm(jt_v)
+
+    trace_per_output = trace / max(float(n_outputs), 1.0)
+    trace_per_output = jnp.where(jnp.isfinite(trace_per_output), trace_per_output, 0.0)
+
+    inv_trace = 1.0 / (trace_per_output + float(epsilon))
+    return trace_per_output, inv_trace
+
+
 def get_denoiser_loss_fn(
     autoencoder,
     beta: float = 1e-4,
@@ -829,6 +852,260 @@ def get_denoiser_loss_fn(
             "decoder": decoder_updates.get(
                 "batch_stats", _get_stats_or_empty(batch_stats, "decoder")
             ),
+        }
+        return total_loss, updated_batch_stats
+
+    return loss_fn
+
+
+def get_ntk_scaled_denoiser_loss_fn(
+    autoencoder,
+    *,
+    beta: float = 1e-4,
+    time_sampling: str = "logit_normal",
+    logit_mean: float = 0.0,
+    logit_std: float = 1.0,
+    logsnr_max: float = 5.0,
+    velocity_weight: float = 1.0,
+    x0_weight: float = 0.1,
+    ambient_weight: float = 0.0,
+    prior: Optional[LatentDiffusionPrior] = None,
+    prior_weight: float = 1.0,
+    decoder_loss_factor: float = 1.3,
+    scale_norm: float = 10.0,
+    epsilon: float = 1e-8,
+    estimate_total_trace: bool = False,
+    total_trace_ema_decay: float = 0.99,
+    n_loss_terms: int = 1,
+) -> Callable:
+    """Denoiser objective with NTK trace balancing across physical-time marginals.
+
+    This matches the spirit of Wang et al. (2022) Algorithm 1: each physical-time
+    marginal is treated as a separate loss component, and the decoder
+    reconstruction term is reweighted by an inverse NTK trace proxy (Hutchinson)
+    computed over the full encoder+decoder pipeline.
+
+    Notes
+    -----
+    - Only the decoder reconstruction term is NTK-scaled; latent regularisation
+      (L2 or the optional latent diffusion prior) is left unscaled.
+    - The trace proxy is defined on the decoder prediction ``x_pred`` (the
+      denoised field), and includes the diffusion-time weighting induced by the
+      velocity objective (1/t) and optional sigmoid(logSNR) weighting when a
+      prior is used.
+    """
+    decoder = autoencoder.decoder
+    if not hasattr(decoder, "diffusion_steps"):
+        raise TypeError(
+            "Decoder does not expose diffusion_steps; "
+            "expected a DenoiserDecoderBase subclass."
+        )
+    if time_sampling not in {"uniform", "logit_normal", "logsnr_uniform"}:
+        raise ValueError(
+            "time_sampling must be one of {'uniform', 'logit_normal', 'logsnr_uniform'}."
+        )
+    if logit_std <= 0:
+        raise ValueError("logit_std must be > 0.")
+    if velocity_weight < 0 or x0_weight < 0 or ambient_weight < 0:
+        raise ValueError("velocity/x0/ambient weights must be >= 0.")
+    if velocity_weight > 0 and x0_weight > 0:
+        raise ValueError(
+            "Velocity and x0 losses are mutually exclusive — set exactly one > 0."
+        )
+    if velocity_weight + x0_weight + ambient_weight <= 0:
+        raise ValueError("At least one denoiser reconstruction weight must be > 0.")
+
+    beta = float(beta)
+    scale_norm = float(scale_norm)
+    epsilon = float(epsilon)
+    total_trace_ema_decay = float(total_trace_ema_decay)
+    n_loss_terms = max(1, int(n_loss_terms))
+    if scale_norm <= 0.0:
+        raise ValueError(f"scale_norm must be > 0. Got {scale_norm}.")
+    if epsilon <= 0.0:
+        raise ValueError(f"epsilon must be > 0. Got {epsilon}.")
+    if total_trace_ema_decay < 0.0 or total_trace_ema_decay >= 1.0:
+        raise ValueError(
+            "total_trace_ema_decay must be in [0, 1). "
+            f"Got {total_trace_ema_decay}."
+        )
+
+    use_prior = prior is not None
+    if use_prior:
+        if prior_weight <= 0:
+            raise ValueError("prior_weight must be > 0 when prior is provided.")
+        if decoder_loss_factor <= 0:
+            raise ValueError("decoder_loss_factor must be > 0.")
+
+    def _sample_t(t_key: jax.Array, batch_size: int) -> jax.Array:
+        if time_sampling == "uniform":
+            t01 = jax.random.uniform(t_key, (batch_size,), minval=0.0, maxval=1.0)
+        elif time_sampling == "logsnr_uniform":
+            lam = jax.random.uniform(
+                t_key, (batch_size,), minval=-logsnr_max, maxval=logsnr_max
+            )
+            t01 = jax.nn.sigmoid(-lam / 2.0)
+        else:  # logit_normal
+            logits = logit_mean + logit_std * jax.random.normal(t_key, (batch_size,))
+            t01 = jax.nn.sigmoid(logits)
+        return decoder.time_eps + (1.0 - 2.0 * decoder.time_eps) * t01
+
+    def _field_stats(field: jax.Array) -> tuple[jax.Array, jax.Array]:
+        mean = jnp.mean(field, axis=1)
+        centered = field - mean[:, None, :]
+        std = jnp.sqrt(jnp.mean(centered**2, axis=1) + 1e-6)
+        return mean, std
+
+    def loss_fn(params, key, batch_stats, u_enc, x_enc, u_dec, x_dec):
+        key, enc_dropout_key, t_key, noise_key, probe_key = jax.random.split(key, 5)
+
+        prior_t_key = None
+        prior_noise_key = None
+        z0_noise_key = None
+        if use_prior:
+            key, prior_t_key, prior_noise_key, z0_noise_key = jax.random.split(key, 4)
+
+        batch_size = u_dec.shape[0]
+        t = _sample_t(t_key=t_key, batch_size=batch_size)
+        noise = jax.random.normal(noise_key, u_dec.shape)
+
+        def predict_x(p):
+            latents, encoder_updates = _call_autoencoder_fn(
+                params=p,
+                batch_stats=batch_stats,
+                fn=autoencoder.encoder.apply,
+                u=u_enc,
+                x=x_enc,
+                name="encoder",
+                dropout_key=enc_dropout_key,
+            )
+
+            z_for_decoder = latents
+            if use_prior:
+                z_for_decoder = prior.add_encoding_noise(latents, z0_noise_key)
+
+            decoder_variables = {
+                "params": p["decoder"],
+                "batch_stats": _get_stats_or_empty(batch_stats, "decoder"),
+            }
+            (x_pred, z_t), decoder_updates = autoencoder.decoder.apply(
+                decoder_variables,
+                z_for_decoder,
+                x_dec,
+                u_dec,
+                t,
+                noise,
+                train=True,
+                mutable=["batch_stats"],
+                method=autoencoder.decoder.predict_x_from_mixture,
+            )
+            aux = (
+                latents,
+                z_t,
+                encoder_updates["batch_stats"],
+                decoder_updates["batch_stats"],
+            )
+            return x_pred, aux
+
+        x_pred, vjp_fn, aux = jax.vjp(predict_x, params, has_aux=True)
+        latents, z_t, encoder_batch_stats, decoder_batch_stats = aux
+
+        probe = jax.random.rademacher(probe_key, x_pred.shape, dtype=x_pred.dtype)
+
+        # Match the weighting induced by the reconstruction objective so that the
+        # trace corresponds to the kernel actually driving gradient dynamics.
+        probe_scale = jnp.ones((batch_size,), dtype=x_pred.dtype)
+        if velocity_weight > 0.0:
+            probe_scale = probe_scale / jnp.maximum(t, decoder.time_eps)
+
+        w = None
+        if use_prior:
+            t_clamped = jnp.clip(t, 1e-4, 1.0 - 1e-4)
+            log_snr = 2.0 * jnp.log((1.0 - t_clamped) / t_clamped)
+            w = decoder_loss_factor * jax.nn.sigmoid(log_snr)
+            probe_scale = probe_scale * jnp.sqrt(w)
+
+        probe = probe * probe_scale[:, None, None]
+        (jt_v,) = vjp_fn(probe)
+
+        trace_per_output, inv_trace = _trace_per_output_from_jt_v(
+            jt_v=jt_v,
+            n_outputs=float(x_pred.size),
+            epsilon=epsilon,
+        )
+
+        trace_sg = jax.lax.stop_gradient(trace_per_output)
+        ntk_state = (batch_stats if batch_stats else {}).get("ntk", {})
+        prev_trace_ema = ntk_state.get("trace_ema", trace_sg)
+        prev_trace_ema = jnp.asarray(prev_trace_ema, dtype=trace_sg.dtype)
+        trace_ema = total_trace_ema_decay * prev_trace_ema + (1.0 - total_trace_ema_decay) * trace_sg
+
+        total_trace_est = float(n_loss_terms) * trace_ema
+        numerator = total_trace_est if estimate_total_trace else scale_norm
+        weight = numerator * inv_trace
+        weight = jax.lax.stop_gradient(weight)
+
+        # --- Prior loss (optional) --------------------------------------
+        if use_prior:
+            lam = jax.random.uniform(
+                prior_t_key, (batch_size,),
+                minval=-prior.prior_logsnr_max,
+                maxval=prior.prior_logsnr_max,
+            )
+            prior_t = jax.nn.sigmoid(-lam / 2.0)
+            prior_eps = jax.random.normal(prior_noise_key, latents.shape)
+            z_t_prior = prior.mix_latent(latents, prior_t, prior_eps)
+            prior_variables = {"params": params["prior"]}
+            z_pred_prior = prior.apply(prior_variables, z_t_prior, prior_t)
+            latent_reg = prior_weight * jnp.mean((z_pred_prior - latents) ** 2)
+        else:
+            latent_reg = jnp.mean(beta * jnp.sum(latents ** 2, axis=-1))
+
+        # --- Decoder reconstruction loss --------------------------------
+        v = decoder._v_from_xz(x=u_dec, z_t=z_t, t=t)
+        v_pred = decoder._v_from_xz(x=x_pred, z_t=z_t, t=t)
+
+        if use_prior:
+            if w is None:
+                raise AssertionError("w should be computed when use_prior=True.")
+
+            vel_per_sample = jnp.mean((v - v_pred) ** 2, axis=(-2, -1))
+            x0_per_sample = jnp.mean((x_pred - u_dec) ** 2, axis=(-2, -1))
+            pred_mean, pred_std = _field_stats(x_pred)
+            target_mean, target_std = _field_stats(u_dec)
+            amb_per_sample = jnp.mean(
+                (pred_mean - target_mean) ** 2, axis=-1
+            ) + jnp.mean((pred_std - target_std) ** 2, axis=-1)
+
+            recon_per_sample = (
+                velocity_weight * vel_per_sample
+                + x0_weight * x0_per_sample
+                + ambient_weight * amb_per_sample
+            )
+            recon_loss = jnp.mean(w * recon_per_sample)
+        else:
+            velocity_loss = jnp.mean((v - v_pred) ** 2)
+            x0_loss = jnp.mean((x_pred - u_dec) ** 2)
+            pred_mean, pred_std = _field_stats(x_pred)
+            target_mean, target_std = _field_stats(u_dec)
+            ambient_loss = jnp.mean(
+                (pred_mean - target_mean) ** 2
+            ) + jnp.mean((pred_std - target_std) ** 2)
+            recon_loss = (
+                velocity_weight * velocity_loss
+                + x0_weight * x0_loss
+                + ambient_weight * ambient_loss
+            )
+
+        total_loss = weight * recon_loss + latent_reg
+        updated_batch_stats = {
+            "encoder": encoder_batch_stats,
+            "decoder": decoder_batch_stats,
+            "ntk": {
+                "trace": trace_sg,
+                "trace_ema": trace_ema,
+                "total_trace_est": total_trace_est,
+            },
         }
         return total_loss, updated_batch_stats
 
@@ -1146,3 +1423,114 @@ def reconstruct_with_film(
     }
     z = autoencoder.encoder.apply(encoder_vars, u_enc, x_enc, train=False)
     return autoencoder.decoder.apply(decoder_vars, z, x_dec, train=False)
+
+
+def get_ntk_scaled_film_prior_loss_fn(
+    autoencoder,
+    beta: float = 1e-4,
+    prior: Optional[LatentDiffusionPrior] = None,
+    prior_weight: float = 1.0,
+    scale_norm: float = 10.0,
+    epsilon: float = 1e-8,
+    estimate_total_trace: bool = False,
+    total_trace_ema_decay: float = 0.99,
+    n_loss_terms: int = 1,
+) -> Callable:
+    """NTK-scaled MSE loss for deterministic FiLM decoder + optional prior.
+
+    Combines NTK trace-equalisation (Type II gradient balancing across
+    physical-time marginals) with the latent diffusion prior from Heek
+    et al. 2026.  The reconstruction term is rescaled by ``C / Tr(K)``
+    while the prior loss is left unscaled.
+    """
+    use_prior = prior is not None
+    scale_norm = float(scale_norm)
+    epsilon = float(epsilon)
+    total_trace_ema_decay = float(total_trace_ema_decay)
+    n_loss_terms = max(1, int(n_loss_terms))
+    beta = float(beta)
+
+    def loss_fn(params, key, batch_stats, u_enc, x_enc, u_dec, x_dec):
+        key, enc_key, dec_key, probe_key = jax.random.split(key, 4)
+
+        # --- Encode -------------------------------------------------------
+        latents, encoder_updates = _call_autoencoder_fn(
+            params=params,
+            batch_stats=batch_stats,
+            fn=autoencoder.encoder.apply,
+            u=u_enc,
+            x=x_enc,
+            name="encoder",
+            dropout_key=enc_key,
+        )
+
+        # --- Prior regularisation -----------------------------------------
+        if use_prior:
+            key, prior_t_key, prior_noise_key, z0_noise_key = jax.random.split(key, 4)
+            batch_size = latents.shape[0]
+            lam = jax.random.uniform(
+                prior_t_key, (batch_size,),
+                minval=-prior.prior_logsnr_max,
+                maxval=prior.prior_logsnr_max,
+            )
+            prior_t = jax.nn.sigmoid(-lam / 2.0)
+            prior_eps = jax.random.normal(prior_noise_key, latents.shape)
+            z_t_prior = prior.mix_latent(latents, prior_t, prior_eps)
+
+            prior_variables = {"params": params["prior"]}
+            z_pred_prior = prior.apply(prior_variables, z_t_prior, prior_t)
+            latent_reg = prior_weight * jnp.mean((z_pred_prior - latents) ** 2)
+
+            z_for_decoder = prior.add_encoding_noise(latents, z0_noise_key)
+        else:
+            latent_reg = jnp.mean(beta * jnp.sum(latents ** 2, axis=-1))
+            z_for_decoder = latents
+
+        # --- NTK-traced reconstruction ------------------------------------
+        def recon_fn(p):
+            decoder_variables = {
+                "params": p["decoder"],
+                "batch_stats": _get_stats_or_empty(batch_stats, "decoder"),
+            }
+            u_pred = autoencoder.decoder.apply(
+                decoder_variables, z_for_decoder, x_dec, train=True
+            )
+            return u_pred
+
+        u_pred, vjp_fn = jax.vjp(recon_fn, params)
+        probe = jax.random.rademacher(probe_key, u_pred.shape, dtype=u_pred.dtype)
+        (jt_v,) = vjp_fn(probe)
+        trace_per_output, inv_trace = _trace_per_output_from_jt_v(
+            jt_v=jt_v,
+            n_outputs=float(u_pred.size),
+            epsilon=epsilon,
+        )
+
+        recon_loss = jnp.mean((u_pred - u_dec) ** 2)
+
+        trace_sg = jax.lax.stop_gradient(trace_per_output)
+        ntk_state = (batch_stats if batch_stats else {}).get("ntk", {})
+        prev_trace_ema = ntk_state.get("trace_ema", trace_sg)
+        prev_trace_ema = jnp.asarray(prev_trace_ema, dtype=trace_sg.dtype)
+        trace_ema = total_trace_ema_decay * prev_trace_ema + (1.0 - total_trace_ema_decay) * trace_sg
+
+        total_trace_est = float(n_loss_terms) * trace_ema
+        numerator = total_trace_est if estimate_total_trace else scale_norm
+        weight = jax.lax.stop_gradient(numerator * inv_trace)
+
+        total_loss = weight * recon_loss + latent_reg
+
+        updated_batch_stats = {
+            "encoder": encoder_updates.get(
+                "batch_stats", _get_stats_or_empty(batch_stats, "encoder")
+            ),
+            "decoder": _get_stats_or_empty(batch_stats, "decoder"),
+            "ntk": {
+                "trace": trace_sg,
+                "trace_ema": trace_ema,
+                "total_trace_est": total_trace_est,
+            },
+        }
+        return total_loss, updated_batch_stats
+
+    return loss_fn
