@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ===================================================================
-# Denoiser D3 — Muon + NTK + Prior (full stack, iterative decoder)
+# Denoiser D3 — Adam + NTK + Prior (full stack, iterative decoder)
 # ===================================================================
 # Full-stack gradient correction with iterative denoiser decoder.
 # Tests whether NTK reweighting can fix the denoiser's poor late-time
@@ -15,7 +15,7 @@ cd "$(dirname "$0")/../../../.."
 
 nohup "$PYTHON_BIN" scripts/fae/fae_naive/train_attention_denoiser.py \
   --data-path data/fae_tran_inclusions.npz \
-  --output-dir results/fae_denoiser_muon_ntk_prior \
+  --output-dir results/fae_denoiser_adam_ntk_prior \
   --pooling-type dual_stream_bottleneck \
   --decoder-type denoiser_standard \
   --latent-dim 256 \
@@ -48,9 +48,9 @@ nohup "$PYTHON_BIN" scripts/fae/fae_naive/train_attention_denoiser.py \
   --decoder-loss-factor 1.3 \
   --save-best-model \
   --wandb-project fae-denoiser-comparison \
-  --optimizer muon \
+  --optimizer adam \
   --lr 1e-3 \
   --max-steps 50000 \
   --eval-interval 25 \
   --eval-n-batches 5 \
-  --vis-interval 5 > fae_denoiser_muon_ntk_prior.log 2>&1 &
+  --vis-interval 5 > fae_denoiser_adam_ntk_prior.log 2>&1 &

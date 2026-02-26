@@ -43,7 +43,6 @@ nohup "$PYTHON_BIN" scripts/fae/fae_naive/train_attention_denoiser.py \
   --loss-type ntk_scaled \
   --ntk-scale-norm 10.0 \
   --ntk-epsilon 1e-8 \
-  --ntk-n-loss-terms 5 \
   --use-prior \
   --prior-hidden-dim 256 \
   --prior-n-layers 3 \
