@@ -38,7 +38,7 @@ nohup "$PYTHON_BIN" scripts/fae/fae_naive/train_attention_denoiser.py \
   --prior-logsnr-max 5.0 \
   --prior-loss-weight 1.0 \
   --save-best-model \
-  --wandb-project fae-denoiser-comparison \
+  --wandb-project fae-film-optimizer-loss-ablation \
   --optimizer muon \
   --lr 1e-3 \
   --max-steps 50000 \
