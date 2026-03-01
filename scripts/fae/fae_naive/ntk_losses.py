@@ -136,7 +136,7 @@ def _compute_per_sample_ntk_diag(
     x_dec: jax.Array,
     key: jax.Array,
     latent_noise_scale: float = 0.0,
-) -> tuple[jax.Array, jax.Array, jax.Array, dict]:
+) -> jax.Array:
     """Estimate per-sample NTK trace-per-output using residual Jacobian probes.
 
     For each sample n, this estimates:
@@ -144,21 +144,8 @@ def _compute_per_sample_ntk_diag(
     where J_n = d r_n / d theta and r_n is the residual output vector
     (u_pred - u_dec) for that sample with M_n scalar components.
     """
-    key, k_forward, k_diag = jax.random.split(key, 3)
-
-    u_pred, latents, updated_batch_stats = _forward_only(
-        autoencoder=autoencoder,
-        params=params,
-        batch_stats=batch_stats,
-        u_enc=u_enc,
-        x_enc=x_enc,
-        x_dec=x_dec,
-        key=k_forward,
-        latent_noise_scale=latent_noise_scale,
-    )
-
     batch_size = int(u_enc.shape[0])
-    grad_keys = jax.random.split(k_diag, batch_size)
+    grad_keys = jax.random.split(key, batch_size)
 
     def per_sample_probe_scalar(p, u_enc_n, x_enc_n, u_dec_n, x_dec_n, sample_key):
         k_enc, k_dec, k_noise, k_probe = jax.random.split(sample_key, 4)
@@ -209,7 +196,7 @@ def _compute_per_sample_ntk_diag(
         (u_enc, x_enc, u_dec, x_dec, grad_keys),
     )
     diag_elements = jnp.where(jnp.isfinite(diag_elements), diag_elements, 0.0)
-    return diag_elements, u_pred, latents, updated_batch_stats
+    return diag_elements
 
 
 def _subsample_batch(
@@ -343,7 +330,7 @@ def get_ntk_scaled_loss_fn(
                     key=k_subsample,
                 )
             )
-            diag_elements, _, _, _ = _compute_per_sample_ntk_diag(
+            diag_elements = _compute_per_sample_ntk_diag(
                 autoencoder=autoencoder,
                 params=params,
                 batch_stats=batch_stats,
@@ -575,7 +562,7 @@ class NTKDiagnosticMetric(Metric):
             diag_subsample=self.diag_subsample,
             key=k_subsample,
         )
-        diag_elements, _, _, _ = _compute_per_sample_ntk_diag(
+        diag_elements = _compute_per_sample_ntk_diag(
             autoencoder=self.autoencoder,
             params=state.params,
             batch_stats=batch_stats,
