@@ -33,11 +33,7 @@ from functional_autoencoders.positional_encodings import (
     PositionalEncoding,
 )
 from functional_autoencoders.train.metrics import Metric
-from scripts.fae.fae_naive.ntk_losses import (
-    _default_diag_stats,
-    _tree_squared_l2_norm_per_sample,
-    compute_ntk_diag_stats,
-)
+from scripts.fae.fae_naive.ntk_losses import compute_ntk_diag_stats
 
 
 # ===================================================================
@@ -635,6 +631,19 @@ def _tree_squared_l2_norm(tree) -> jax.Array:
     )
 
 
+def _default_diag_stats(dtype) -> dict:
+    return {
+        "mean": jnp.asarray(0.0, dtype=dtype),
+        "std": jnp.asarray(0.0, dtype=dtype),
+        "cv": jnp.asarray(0.0, dtype=dtype),
+        "cv_of_mean": jnp.asarray(0.0, dtype=dtype),
+        "min_batch_size": jnp.asarray(1, dtype=jnp.int32),
+        "is_sufficient": jnp.asarray(1, dtype=jnp.int32),
+        "batch_sufficient": jnp.asarray(1, dtype=jnp.int32),
+        "batch_size": jnp.asarray(0, dtype=jnp.int32),
+    }
+
+
 def get_denoiser_loss_fn(
     autoencoder,
     beta: float = 1e-4,
@@ -937,35 +946,50 @@ def get_ntk_scaled_denoiser_loss_fn(
         std = jnp.sqrt(jnp.mean(centered**2, axis=1) + 1e-6)
         return mean, std
 
-    def _recon_per_sample(
+    def _recon_residual_vector_and_loss(
         *,
         x_pred: jax.Array,
         z_t: jax.Array,
         u_dec: jax.Array,
         t: jax.Array,
-    ) -> jax.Array:
+    ) -> tuple[jax.Array, jax.Array]:
         v = decoder._v_from_xz(x=u_dec, z_t=z_t, t=t)
         v_pred = decoder._v_from_xz(x=x_pred, z_t=z_t, t=t)
 
-        vel_per_sample = jnp.mean((v - v_pred) ** 2, axis=(-2, -1))
-        x0_per_sample = jnp.mean((x_pred - u_dec) ** 2, axis=(-2, -1))
-        pred_mean, pred_std = _field_stats(x_pred)
-        target_mean, target_std = _field_stats(u_dec)
-        amb_per_sample = jnp.mean((pred_mean - target_mean) ** 2, axis=-1) + jnp.mean(
-            (pred_std - target_std) ** 2, axis=-1
-        )
+        parts_raw: list[tuple[jax.Array, float]] = []
+        if velocity_weight > 0.0:
+            parts_raw.append(((v_pred - v).reshape(v.shape[0], -1), float(velocity_weight)))
+        if x0_weight > 0.0:
+            parts_raw.append(
+                ((x_pred - u_dec).reshape(x_pred.shape[0], -1), float(x0_weight))
+            )
+        if ambient_weight > 0.0:
+            pred_mean, pred_std = _field_stats(x_pred)
+            target_mean, target_std = _field_stats(u_dec)
+            parts_raw.append((pred_mean - target_mean, float(ambient_weight)))
+            parts_raw.append((pred_std - target_std, float(ambient_weight)))
 
-        recon_per_sample = (
-            velocity_weight * vel_per_sample
-            + x0_weight * x0_per_sample
-            + ambient_weight * amb_per_sample
-        )
+        if not parts_raw:
+            raise ValueError("At least one denoiser reconstruction weight must be > 0.")
+
+        m_total = sum(max(int(comp.shape[-1]), 1) for comp, _ in parts_raw)
+        parts = []
+        for comp, alpha in parts_raw:
+            m_k = max(int(comp.shape[-1]), 1)
+            scale = jnp.sqrt(
+                jnp.asarray(alpha * (float(m_total) / float(m_k)), dtype=comp.dtype)
+            )
+            parts.append(scale * comp)
+
+        residual_vec = jnp.concatenate(parts, axis=-1)
         if use_prior:
             t_clamped = jnp.clip(t, 1e-4, 1.0 - 1e-4)
             log_snr = 2.0 * jnp.log((1.0 - t_clamped) / t_clamped)
             w = decoder_loss_factor * jax.nn.sigmoid(log_snr)
-            recon_per_sample = w * recon_per_sample
-        return recon_per_sample
+            residual_vec = jnp.sqrt(w)[:, None] * residual_vec
+
+        recon_per_sample = jnp.mean(jnp.square(residual_vec), axis=-1)
+        return residual_vec, recon_per_sample
 
     def loss_fn(params, key, batch_stats, u_enc, x_enc, u_dec, x_dec):
         ntk_state = (batch_stats if batch_stats else {}).get("ntk", {})
@@ -1020,7 +1044,9 @@ def get_ntk_scaled_denoiser_loss_fn(
             method=autoencoder.decoder.predict_x_from_mixture,
         )
 
-        recon_per_sample = _recon_per_sample(x_pred=x_pred, z_t=z_t, u_dec=u_dec, t=t)
+        _, recon_per_sample = _recon_residual_vector_and_loss(
+            x_pred=x_pred, z_t=z_t, u_dec=u_dec, t=t
+        )
         recon_loss = jnp.mean(recon_per_sample)
 
         if use_prior:
@@ -1083,7 +1109,7 @@ def get_ntk_scaled_denoiser_loss_fn(
             z0_noise_diag = z0_noise[idx]
             grad_keys = jax.random.split(k_diag_inner, n_diag)
 
-            def per_sample_recon_loss(
+            def per_sample_probe_scalar(
                 p,
                 u_enc_n,
                 x_enc_n,
@@ -1101,6 +1127,7 @@ def get_ntk_scaled_denoiser_loss_fn(
                 t_b = t_n[None, ...]
                 noise_b = noise_n[None, ...]
 
+                k_enc_n, k_probe_n = jax.random.split(sample_key)
                 latents_n, _ = _call_autoencoder_fn(
                     params=p,
                     batch_stats=batch_stats,
@@ -1108,7 +1135,7 @@ def get_ntk_scaled_denoiser_loss_fn(
                     u=u_enc_b,
                     x=x_enc_b,
                     name="encoder",
-                    dropout_key=sample_key,
+                    dropout_key=k_enc_n,
                 )
 
                 if use_prior:
@@ -1133,9 +1160,18 @@ def get_ntk_scaled_denoiser_loss_fn(
                     mutable=["batch_stats"],
                     method=autoencoder.decoder.predict_x_from_mixture,
                 )
-                return _recon_per_sample(
+                residual_vec_n, _ = _recon_residual_vector_and_loss(
                     x_pred=x_pred_n, z_t=z_t_n, u_dec=u_dec_b, t=t_b
-                )[0]
+                )
+                residual_flat = residual_vec_n.reshape(-1)
+                m = jnp.asarray(residual_flat.shape[0], dtype=residual_flat.dtype)
+                probe = jax.random.rademacher(
+                    k_probe_n, residual_flat.shape, dtype=residual_flat.dtype
+                )
+                probe = probe / jnp.sqrt(
+                    jnp.maximum(m, jnp.asarray(1.0, dtype=residual_flat.dtype))
+                )
+                return jnp.vdot(residual_flat, probe)
 
             def scan_step(_carry, xs):
                 (
@@ -1148,7 +1184,7 @@ def get_ntk_scaled_denoiser_loss_fn(
                     z0_noise_n,
                     sample_key,
                 ) = xs
-                grads_n = jax.grad(per_sample_recon_loss)(
+                grads_n = jax.grad(per_sample_probe_scalar)(
                     params,
                     u_enc_n,
                     x_enc_n,
@@ -1695,7 +1731,7 @@ def get_ntk_scaled_film_prior_loss_fn(
             z0_noise_diag = z0_noise[idx]
             grad_keys = jax.random.split(k_diag_inner, n_diag)
 
-            def per_sample_loss(
+            def per_sample_probe_scalar(
                 p,
                 u_enc_n,
                 x_enc_n,
@@ -1709,6 +1745,7 @@ def get_ntk_scaled_film_prior_loss_fn(
                 u_dec_b = u_dec_n[None, ...]
                 x_dec_b = x_dec_n[None, ...]
 
+                k_enc_n, k_probe_n = jax.random.split(sample_key)
                 latents_n, _ = _call_autoencoder_fn(
                     params=p,
                     batch_stats=batch_stats,
@@ -1716,7 +1753,7 @@ def get_ntk_scaled_film_prior_loss_fn(
                     u=u_enc_b,
                     x=x_enc_b,
                     name="encoder",
-                    dropout_key=sample_key,
+                    dropout_key=k_enc_n,
                 )
                 if use_prior:
                     z_for_decoder_n = prior.alpha_0 * latents_n + prior.sigma_0 * z0_noise_n[
@@ -1732,7 +1769,15 @@ def get_ntk_scaled_film_prior_loss_fn(
                 u_pred_n = autoencoder.decoder.apply(
                     decoder_vars_n, z_for_decoder_n, x_dec_b, train=True
                 )
-                return jnp.mean((u_pred_n - u_dec_b) ** 2)
+                residual_n = (u_pred_n - u_dec_b).reshape(-1)
+                m = jnp.asarray(residual_n.shape[0], dtype=residual_n.dtype)
+                probe = jax.random.rademacher(
+                    k_probe_n, residual_n.shape, dtype=residual_n.dtype
+                )
+                probe = probe / jnp.sqrt(
+                    jnp.maximum(m, jnp.asarray(1.0, dtype=residual_n.dtype))
+                )
+                return jnp.vdot(residual_n, probe)
 
             def scan_step(_carry, xs):
                 (
@@ -1743,7 +1788,7 @@ def get_ntk_scaled_film_prior_loss_fn(
                     z0_noise_n,
                     sample_key,
                 ) = xs
-                grads_n = jax.grad(per_sample_loss)(
+                grads_n = jax.grad(per_sample_probe_scalar)(
                     params,
                     u_enc_n,
                     x_enc_n,

@@ -13,8 +13,9 @@ set -euo pipefail
 #   → Via periodic exact NTK-diagonal calibration
 #
 # Key equation (Wang et al. Algorithm 1):
-#   weight = (n_loss_terms * trace_ema) / trace_per_output
-#          ≈ Tr(K_total) / Tr(K_i)  (global total / local component)
+#   weight = Tr(K_total) / Tr(K_i)
+# with Tr(K_total) updated on calibration steps and held fixed in between
+# (no EMA smoothing).
 #
 # Hypothesis: Adam + NTK Type I balancing addresses magnitude imbalance
 # via trace weighting, but Type II (directional opposition) remains → 
@@ -39,6 +40,8 @@ nohup "$PYTHON_BIN" scripts/fae/fae_naive/train_attention.py \
   --decoder-features 256,256,256 \
   --loss-type ntk_scaled \
   --ntk-epsilon 1e-8 \
+  --ntk-estimate-total-trace \
+  --ntk-total-trace-ema-decay 0.0 \
   --ntk-calibration-interval 100 \
   --ntk-cv-threshold 0.2 \
   --masking-strategy random \

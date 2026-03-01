@@ -38,6 +38,8 @@ for SIGMA in "${NOISE_LEVELS[@]}"; do
         --encoder-mlp-dim 128 \
         --decoder-features 256,256,256 \
         --loss-type ntk_scaled \
+        --ntk-estimate-total-trace \
+        --ntk-total-trace-ema-decay 0.0 \
         --ntk-calibration-interval 100 \
         --ntk-cv-threshold 0.2 \
         --masking-strategy random \

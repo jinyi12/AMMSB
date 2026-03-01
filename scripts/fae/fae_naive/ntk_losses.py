@@ -24,22 +24,6 @@ def _tree_squared_l2_norm(tree) -> jax.Array:
     )
 
 
-def _tree_squared_l2_norm_per_sample(tree) -> jax.Array:
-    leaves = jax.tree_util.tree_leaves(tree)
-    if not leaves:
-        return jnp.zeros((0,), dtype=jnp.float32)
-
-    batch_size = int(leaves[0].shape[0])
-    total = jnp.zeros((batch_size,), dtype=leaves[0].dtype)
-    for leaf in leaves:
-        sq = jnp.square(leaf)
-        if sq.ndim == 1:
-            total = total + sq
-        else:
-            total = total + jnp.sum(sq, axis=tuple(range(1, sq.ndim)))
-    return total
-
-
 def _default_diag_stats(dtype) -> dict:
     return {
         "mean": jnp.asarray(0.0, dtype=dtype),
@@ -153,7 +137,13 @@ def _compute_per_sample_ntk_diag(
     key: jax.Array,
     latent_noise_scale: float = 0.0,
 ) -> tuple[jax.Array, jax.Array, jax.Array, dict]:
-    """Compute exact per-sample NTK diagonal elements K[n,n] = ||grad_theta L_n||^2."""
+    """Estimate per-sample NTK trace-per-output using residual Jacobian probes.
+
+    For each sample n, this estimates:
+      Tr(J_n J_n^T) / M_n
+    where J_n = d r_n / d theta and r_n is the residual output vector
+    (u_pred - u_dec) for that sample with M_n scalar components.
+    """
     key, k_forward, k_diag = jax.random.split(key, 3)
 
     u_pred, latents, updated_batch_stats = _forward_only(
@@ -170,8 +160,8 @@ def _compute_per_sample_ntk_diag(
     batch_size = int(u_enc.shape[0])
     grad_keys = jax.random.split(k_diag, batch_size)
 
-    def per_sample_loss(p, u_enc_n, x_enc_n, u_dec_n, x_dec_n, sample_key):
-        k_enc, k_dec, k_noise = jax.random.split(sample_key, 3)
+    def per_sample_probe_scalar(p, u_enc_n, x_enc_n, u_dec_n, x_dec_n, sample_key):
+        k_enc, k_dec, k_noise, k_probe = jax.random.split(sample_key, 4)
         u_enc_b = u_enc_n[None, ...]
         x_enc_b = x_enc_n[None, ...]
         u_dec_b = u_dec_n[None, ...]
@@ -200,11 +190,15 @@ def _compute_per_sample_ntk_diag(
             name="decoder",
             dropout_key=k_dec,
         )
-        return jnp.mean(jnp.square(u_pred_n - u_dec_b))
+        residual_n = (u_pred_n - u_dec_b).reshape(-1)
+        m = jnp.asarray(residual_n.shape[0], dtype=residual_n.dtype)
+        probe = jax.random.rademacher(k_probe, residual_n.shape, dtype=residual_n.dtype)
+        probe = probe / jnp.sqrt(jnp.maximum(m, jnp.asarray(1.0, dtype=residual_n.dtype)))
+        return jnp.vdot(residual_n, probe)
 
     def scan_step(_carry, xs):
         u_enc_n, x_enc_n, u_dec_n, x_dec_n, sample_key = xs
-        grads_n = jax.grad(per_sample_loss)(
+        grads_n = jax.grad(per_sample_probe_scalar)(
             params, u_enc_n, x_enc_n, u_dec_n, x_dec_n, sample_key
         )
         return None, _tree_squared_l2_norm(grads_n)
