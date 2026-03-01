@@ -38,8 +38,6 @@ nohup "$PYTHON_BIN" scripts/fae/fae_naive/train_attention_denoiser.py \
   --encoder-point-ratio-by-time 0.8,0.8,0.7,0.6,0.4,0.3,0.2,0.1 \
   --beta 0.0 \
   --loss-type ntk_scaled \
-  --ntk-estimate-total-trace \
-  --ntk-total-trace-ema-decay 0.99 \
   --ntk-epsilon 1e-8 \
   --ntk-calibration-interval 100 \
   --ntk-cv-threshold 0.2 \

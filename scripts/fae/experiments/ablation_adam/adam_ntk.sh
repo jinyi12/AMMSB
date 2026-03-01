@@ -33,8 +33,6 @@ nohup "$PYTHON_BIN" scripts/fae/fae_naive/train_attention.py \
   --encoder-mlp-dim 256 \
   --decoder-features 256,256,256 \
   --loss-type ntk_scaled \
-  --ntk-estimate-total-trace \
-  --ntk-total-trace-ema-decay 0.99 \
   --ntk-epsilon 1e-8 \
   --ntk-calibration-interval 100 \
   --ntk-cv-threshold 0.2 \
