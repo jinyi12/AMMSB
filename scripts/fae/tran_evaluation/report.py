@@ -11,6 +11,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.colors import ListedColormap
 from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
 from numpy.typing import NDArray
@@ -53,12 +54,12 @@ N_COLS = 3                     # standard columns for grid plots
 # Helpers
 # ============================================================================
 
-def _save_fig(fig: plt.Figure, out_dir: Path, name: str) -> None:
-    """Save *fig* as both PNG (dpi=150) and PDF with tight bounding box."""
+def _save_fig(fig: plt.Figure, out_dir: Path, name: str, *, png_dpi: int = 150) -> None:
+    """Save *fig* as both PNG and PDF with tight bounding box."""
     for ext in ("png", "pdf"):
         fig.savefig(
             out_dir / f"{name}.{ext}",
-            dpi=150,
+            dpi=png_dpi if ext == "png" else None,
             bbox_inches="tight",
         )
 
@@ -867,6 +868,193 @@ def plot_diversity(
 
     plt.tight_layout()
     _save_fig(fig, out_dir, "fig9_diversity")
+    plt.close(fig)
+
+
+# ============================================================================
+# Latent geometry diagnostics (Phase 7b)
+# ============================================================================
+
+def plot_latent_geom_spectrum(
+    lg_results: Dict,
+    time_indices: Optional[NDArray],
+    H_schedule: Optional[List[float]],
+    out_dir: Path,
+) -> None:
+    """Plot latent metric-spectrum diagnostics across modeled time indices."""
+    per_time = lg_results.get("per_time", [])
+    if not per_time:
+        return
+
+    x = np.arange(len(per_time), dtype=np.float64)
+    if time_indices is not None and H_schedule is not None:
+        labels = [
+            f"{H_schedule[int(idx)]:.3g}" if int(idx) < len(H_schedule) else str(int(idx))
+            for idx in np.asarray(time_indices)[: len(per_time)]
+        ]
+        xlabel = "$H$"
+    else:
+        labels = [str(int(row.get("time_index", i))) for i, row in enumerate(per_time)]
+        xlabel = "Time index"
+
+    rank = np.asarray([row.get("effective_rank_mean", np.nan) for row in per_time], dtype=np.float64)
+    cond = np.asarray([row.get("condition_proxy_mean", np.nan) for row in per_time], dtype=np.float64)
+    null = np.asarray([row.get("near_null_mass_mean", np.nan) for row in per_time], dtype=np.float64)
+
+    fig, axes = plt.subplots(1, 3, figsize=(6.5, 2.5))
+    for ax in axes:
+        ax.grid(alpha=0.2, lw=0.4)
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels, fontsize=8, rotation=30, ha="right")
+        ax.tick_params(axis="y", labelsize=8)
+        ax.set_xlabel(xlabel, fontsize=9)
+
+    axes[0].plot(x, rank, marker="o", color=C_OBS, lw=1.0)
+    axes[0].set_title("Effective rank", fontsize=10)
+    axes[0].set_ylabel("$r_{\\mathrm{eff}}(g)$", fontsize=9)
+
+    axes[1].plot(x, cond, marker="s", color=C_GEN, lw=1.0)
+    axes[1].set_title("Condition proxy", fontsize=10)
+    axes[1].set_ylabel("$\\kappa_{\\mathrm{proxy}}$", fontsize=9)
+
+    axes[2].plot(x, null, marker="^", color="tab:purple", lw=1.0)
+    axes[2].set_title("Near-null mass", fontsize=10)
+    axes[2].set_ylabel("$m_{\\mathrm{null}}$", fontsize=9)
+
+    fig.tight_layout()
+    _save_fig(fig, out_dir, "latent_geom_spectrum", png_dpi=300)
+    plt.close(fig)
+
+
+def plot_latent_geom_hessian(
+    lg_results: Dict,
+    time_indices: Optional[NDArray],
+    H_schedule: Optional[List[float]],
+    out_dir: Path,
+) -> None:
+    """Plot decoder Hessian norm quantiles across modeled time indices."""
+    per_time = lg_results.get("per_time", [])
+    if not per_time:
+        return
+
+    x = np.arange(len(per_time), dtype=np.float64)
+    if time_indices is not None and H_schedule is not None:
+        labels = [
+            f"{H_schedule[int(idx)]:.3g}" if int(idx) < len(H_schedule) else str(int(idx))
+            for idx in np.asarray(time_indices)[: len(per_time)]
+        ]
+        xlabel = "$H$"
+    else:
+        labels = [str(int(row.get("time_index", i))) for i, row in enumerate(per_time)]
+        xlabel = "Time index"
+
+    med = np.asarray([row.get("hessian_frob_median", np.nan) for row in per_time], dtype=np.float64)
+    p90 = np.asarray([row.get("hessian_frob_p90", np.nan) for row in per_time], dtype=np.float64)
+    p99 = np.asarray([row.get("hessian_frob_p99", np.nan) for row in per_time], dtype=np.float64)
+
+    fig, ax = plt.subplots(figsize=(6.5, 2.5))
+    ax.fill_between(x, med, p90, color=C_OBS, alpha=0.18, label="Median–P90")
+    ax.fill_between(x, p90, p99, color=C_GEN, alpha=0.18, label="P90–P99")
+    ax.plot(x, med, color=C_OBS, lw=1.0, marker="o", label="Median")
+    ax.plot(x, p90, color=C_GEN, lw=1.0, marker="s", label="P90")
+    ax.plot(x, p99, color="tab:purple", lw=1.0, marker="^", label="P99")
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, fontsize=8, rotation=30, ha="right")
+    ax.set_xlabel(xlabel, fontsize=9)
+    ax.set_ylabel("$\\|\\Pi\\|_F^2$ proxy", fontsize=9)
+    ax.set_title("Extrinsic curvature proxy", fontsize=10)
+    ax.grid(alpha=0.2, lw=0.4)
+    ax.tick_params(axis="y", labelsize=8)
+    ax.legend(fontsize=8, framealpha=0.9)
+
+    fig.tight_layout()
+    _save_fig(fig, out_dir, "latent_geom_hessian", png_dpi=300)
+    plt.close(fig)
+
+
+def plot_latent_geom_volume(
+    lg_results: Dict,
+    time_indices: Optional[NDArray],
+    H_schedule: Optional[List[float]],
+    out_dir: Path,
+) -> None:
+    """Plot latent volume-element dynamics via logdet metric summaries."""
+    per_time = lg_results.get("per_time", [])
+    if not per_time:
+        return
+
+    x = np.arange(len(per_time), dtype=np.float64)
+    if time_indices is not None and H_schedule is not None:
+        labels = [
+            f"{H_schedule[int(idx)]:.3g}" if int(idx) < len(H_schedule) else str(int(idx))
+            for idx in np.asarray(time_indices)[: len(per_time)]
+        ]
+        xlabel = "$H$"
+    else:
+        labels = [str(int(row.get("time_index", i))) for i, row in enumerate(per_time)]
+        xlabel = "Time index"
+
+    mean = np.asarray([row.get("logdet_metric_mean", np.nan) for row in per_time], dtype=np.float64)
+    std = np.asarray([row.get("logdet_metric_std", np.nan) for row in per_time], dtype=np.float64)
+
+    fig, ax = plt.subplots(figsize=(6.5, 2.5))
+    ax.plot(x, mean, color=C_OBS, lw=1.0, marker="o")
+    ax.fill_between(x, mean - std, mean + std, color=C_FILL, alpha=0.22)
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, fontsize=8, rotation=30, ha="right")
+    ax.set_xlabel(xlabel, fontsize=9)
+    ax.set_ylabel("$\\log\\det(g + \\varepsilon I)$", fontsize=9)
+    ax.set_title("Volume-element dynamics", fontsize=10)
+    ax.grid(alpha=0.2, lw=0.4)
+    ax.tick_params(axis="y", labelsize=8)
+
+    fig.tight_layout()
+    _save_fig(fig, out_dir, "latent_geom_volume", png_dpi=300)
+    plt.close(fig)
+
+
+def plot_latent_geom_flags(
+    lg_results: Dict,
+    time_indices: Optional[NDArray],
+    H_schedule: Optional[List[float]],
+    out_dir: Path,
+) -> None:
+    """Plot traffic-light robustness flags for latent-geometry diagnostics."""
+    per_flags = lg_results.get("robustness_flags", {}).get("per_time", [])
+    if not per_flags:
+        return
+
+    metric_names = ["collapse_risk", "folding_risk", "volume_flat_risk"]
+    row_labels = ["Collapse", "Folding", "Flat volume"]
+    n_time = len(per_flags)
+    mat = np.zeros((len(metric_names), n_time), dtype=np.float64)
+    for j, row in enumerate(per_flags):
+        for i, name in enumerate(metric_names):
+            mat[i, j] = float(bool(row.get(name, False)))
+
+    x = np.arange(n_time, dtype=np.float64)
+    if time_indices is not None and H_schedule is not None:
+        labels = [
+            f"{H_schedule[int(idx)]:.3g}" if int(idx) < len(H_schedule) else str(int(idx))
+            for idx in np.asarray(time_indices)[:n_time]
+        ]
+        xlabel = "$H$"
+    else:
+        labels = [str(int(row.get("time_index", i))) for i, row in enumerate(per_flags)]
+        xlabel = "Time index"
+
+    cmap = ListedColormap(["#2ca25f", "#de2d26"])
+    fig, ax = plt.subplots(figsize=(6.5, 2.4))
+    ax.imshow(mat, cmap=cmap, vmin=0.0, vmax=1.0, aspect="auto", interpolation="nearest")
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, fontsize=8, rotation=30, ha="right")
+    ax.set_yticks(np.arange(len(row_labels)))
+    ax.set_yticklabels(row_labels, fontsize=8)
+    ax.set_xlabel(xlabel, fontsize=9)
+    ax.set_title("Latent geometry robustness flags", fontsize=10)
+
+    fig.tight_layout()
+    _save_fig(fig, out_dir, "latent_geom_flags", png_dpi=300)
     plt.close(fig)
 
 

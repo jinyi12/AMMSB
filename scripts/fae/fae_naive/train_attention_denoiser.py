@@ -199,6 +199,30 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.99,
         help="EMA decay in [0, 1) for total-trace estimation (--loss-type=ntk_scaled).",
     )
+    parser.add_argument(
+        "--ntk-calibration-interval",
+        type=int,
+        default=100,
+        help=(
+            "Steps between exact NTK diagonal calibration passes. "
+            "Between calibrations, the NTK weight is held fixed."
+        ),
+    )
+    parser.add_argument(
+        "--ntk-cv-threshold",
+        type=float,
+        default=0.2,
+        help=(
+            "Maximum acceptable coefficient of variation for NTK trace "
+            "batch-mean estimation diagnostics."
+        ),
+    )
+    parser.add_argument(
+        "--ntk-diag-subsample",
+        type=int,
+        default=0,
+        help="Samples used for NTK-diagonal calibration (0 = use full batch).",
+    )
 
     # -- Training ----------------------------------------------------------
     parser.add_argument("--optimizer", type=str, default="adam",
@@ -356,6 +380,12 @@ def validate_args(args: argparse.Namespace) -> None:
             raise ValueError("--ntk-epsilon must be > 0 for --loss-type=ntk_scaled.")
         if args.ntk_total_trace_ema_decay < 0.0 or args.ntk_total_trace_ema_decay >= 1.0:
             raise ValueError("--ntk-total-trace-ema-decay must be in [0, 1) for --loss-type=ntk_scaled.")
+        if args.ntk_calibration_interval < 1:
+            raise ValueError("--ntk-calibration-interval must be >= 1 for --loss-type=ntk_scaled.")
+        if args.ntk_cv_threshold <= 0.0:
+            raise ValueError("--ntk-cv-threshold must be > 0 for --loss-type=ntk_scaled.")
+        if args.ntk_diag_subsample < 0:
+            raise ValueError("--ntk-diag-subsample must be >= 0 for --loss-type=ntk_scaled.")
     else:
         ntk_args_used = []
         if args.ntk_scale_norm != 10.0:
@@ -366,6 +396,12 @@ def validate_args(args: argparse.Namespace) -> None:
             ntk_args_used.append("--ntk-estimate-total-trace")
         if args.ntk_total_trace_ema_decay != 0.99:
             ntk_args_used.append("--ntk-total-trace-ema-decay")
+        if args.ntk_calibration_interval != 100:
+            ntk_args_used.append("--ntk-calibration-interval")
+        if args.ntk_cv_threshold != 0.2:
+            ntk_args_used.append("--ntk-cv-threshold")
+        if args.ntk_diag_subsample != 0:
+            ntk_args_used.append("--ntk-diag-subsample")
         if ntk_args_used:
             warnings.warn(
                 f"NTK arguments {ntk_args_used} ignored when --loss-type={args.loss_type}.",
@@ -452,6 +488,9 @@ def _film_prior_setup(autoencoder, args):
             estimate_total_trace=bool(args.ntk_estimate_total_trace),
             total_trace_ema_decay=float(args.ntk_total_trace_ema_decay),
             n_loss_terms=int(getattr(args, "ntk_n_loss_terms", 1) or 1),
+            calibration_interval=int(args.ntk_calibration_interval),
+            cv_threshold=float(args.ntk_cv_threshold),
+            diag_subsample=int(args.ntk_diag_subsample),
         )
     else:
         loss_fn = get_film_prior_loss_fn(
@@ -521,6 +560,9 @@ def _denoiser_setup(autoencoder, args):
             estimate_total_trace=bool(args.ntk_estimate_total_trace),
             total_trace_ema_decay=float(args.ntk_total_trace_ema_decay),
             n_loss_terms=int(getattr(args, "ntk_n_loss_terms", 1) or 1),
+            calibration_interval=int(args.ntk_calibration_interval),
+            cv_threshold=float(args.ntk_cv_threshold),
+            diag_subsample=int(args.ntk_diag_subsample),
         )
     else:
         loss_fn = get_denoiser_loss_fn(

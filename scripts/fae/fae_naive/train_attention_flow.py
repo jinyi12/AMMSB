@@ -508,6 +508,9 @@ def run_training(
                 total_trace_ema_decay=float(args.ntk_total_trace_ema_decay),
                 n_loss_terms=n_loss_terms,
                 latent_noise_scale=latent_noise_scale,
+                calibration_interval=int(args.ntk_calibration_interval),
+                cv_threshold=float(args.ntk_cv_threshold),
+                diag_subsample=int(args.ntk_diag_subsample),
             )
         else:
             raise ValueError(f"Unsupported --loss-type={args.loss_type}")
@@ -522,6 +525,9 @@ def run_training(
                     n_batches=1,
                     estimate_total_trace=bool(args.ntk_estimate_total_trace),
                     n_loss_terms=n_loss_terms,
+                    cv_threshold=float(args.ntk_cv_threshold),
+                    diag_subsample=int(args.ntk_diag_subsample),
+                    latent_noise_scale=latent_noise_scale,
                 )
             )
 

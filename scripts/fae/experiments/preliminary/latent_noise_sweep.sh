@@ -5,6 +5,7 @@
 # Usage:
 #   nohup bash scripts/fae/run_latent_noise_sweep.sh > latent_noise_sweep.log 2>&1 &
 set -euo pipefail
+cd "$(dirname "$0")/../../../.."
 
 BASE_OUTPUT="results/latent_noise_sweep"
 DATA_PATH="data/fae_tran_inclusions.npz"
@@ -39,6 +40,8 @@ for SIGMA in "${NOISE_LEVELS[@]}"; do
         --loss-type ntk_scaled \
         --ntk-estimate-total-trace \
         --ntk-total-trace-ema-decay 0.99 \
+        --ntk-calibration-interval 100 \
+        --ntk-cv-threshold 0.2 \
         --masking-strategy random \
         --eval-masking-strategy same \
         --encoder-point-ratio-by-time 0.8,0.8,0.7,0.6,0.4,0.3,0.2,0.1 \

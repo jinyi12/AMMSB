@@ -9,7 +9,9 @@ Orchestrates all evaluation phases:
   4. Second-order statistics (directional R(tau), Tran J mismatch)
   5. PSD diagnostics
   6. Diversity / mode-collapse checks
-  7. Reporting & visualisation
+  7. Backward SDE trajectory evaluation
+  7b. Latent geometry robustness diagnostics
+  8. Reporting & visualisation
 
 Usage (preferred -- single command, generates + evaluates)
 ---------------------------------------------------------
@@ -24,6 +26,12 @@ python scripts/fae/tran_evaluation/evaluate.py \\
     --trajectory_file results/.../full_trajectories.npz \\
     --dataset_file data/fae_tran_inclusions.npz \\
     --output_dir results/.../tran_evaluation
+
+Usage (latent geometry only -- autoencoder checkpoint, no MSBM)
+---------------------------------------------------------------
+python scripts/fae/tran_evaluation/evaluate.py \\
+    --latent_geom_fae_run_dir results/fae_deterministic_film_multiscale/run_ujlkslav \\
+    --output_dir results/.../latent_geometry_eval
 
 TIME INDEX MAPPING (critical)
 -----------------------------
@@ -61,7 +69,7 @@ import ast
 import json
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import numpy as np
 
@@ -98,6 +106,10 @@ from scripts.fae.tran_evaluation.report import (  # noqa: E402
     plot_directional_correlation,
     plot_diversity,
     plot_J_bars,
+    plot_latent_geom_flags,
+    plot_latent_geom_hessian,
+    plot_latent_geom_spectrum,
+    plot_latent_geom_volume,
     plot_pdfs,
     plot_psd,
     plot_qq,
@@ -204,6 +216,32 @@ def _parse_args() -> argparse.Namespace:
     )
     p.add_argument("--nogpu", action="store_true", help="Force CPU.")
 
+    # --- Denoiser decode settings ---
+    p.add_argument(
+        "--decode_mode", type=str, default="auto",
+        choices=["auto", "standard", "one_step", "multistep"],
+        help="Decode mode for FAE decoder. 'auto' uses one_step for "
+             "denoiser decoders.  Use 'multistep' for iterative ODE/SDE "
+             "sampling with controllable step counts.",
+    )
+    p.add_argument(
+        "--denoiser_num_steps", type=int, default=32,
+        help="Default number of Euler steps for multistep decoding.",
+    )
+    p.add_argument(
+        "--denoiser_noise_scale", type=float, default=1.0,
+        help="Noise scale for one-step decoding.",
+    )
+    p.add_argument(
+        "--denoiser_steps_schedule", type=str, default=None,
+        help="Per-knot adaptive decode-step schedule.  Overrides "
+             "--denoiser_num_steps and forces multistep mode.  Formats:\n"
+             "  Comma-separated: '500,250,125,64,32,16,8'\n"
+             "  Exponential:     'exp:<max>:<decay>:<min>'  "
+             "(e.g. 'exp:500:0.5:8')\n"
+             "  Uniform int:     '32'",
+    )
+
     # --- Ground truth ---
     p.add_argument(
         "--n_gt_neighbors", type=int, default=200,
@@ -217,15 +255,68 @@ def _parse_args() -> argparse.Namespace:
     )
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--no_plot", action="store_true")
+    p.add_argument(
+        "--no_latent_geometry",
+        action="store_true",
+        help="Disable Phase 7b latent-geometry robustness diagnostics.",
+    )
+    p.add_argument(
+        "--latent_geom_budget",
+        type=str,
+        default="thorough",
+        choices=["light", "standard", "thorough"],
+        help="Sampling/probe budget preset for latent geometry diagnostics.",
+    )
+    p.add_argument("--latent_geom_n_samples", type=int, default=None)
+    p.add_argument("--latent_geom_n_probes", type=int, default=None)
+    p.add_argument("--latent_geom_n_hvp_probes", type=int, default=None)
+    p.add_argument("--latent_geom_eps", type=float, default=1e-6)
+    p.add_argument("--latent_geom_near_null_tau", type=float, default=1e-4)
+    p.add_argument(
+        "--latent_geom_fae_run_dir", type=str, default=None,
+        help="FAE run directory (contains args.json + checkpoints/) for "
+             "latent-geometry diagnostics independent of MSBM.",
+    )
+    p.add_argument(
+        "--latent_geom_checkpoint", type=str, default=None,
+        help="Explicit path to FAE checkpoint (.pkl) for latent geometry. "
+             "Overrides checkpoint discovery from --latent_geom_fae_run_dir "
+             "or --run_dir args.txt.",
+    )
+    p.add_argument(
+        "--latent_geom_data_path", type=str, default=None,
+        help="Explicit dataset path for latent geometry. Overrides discovery.",
+    )
+    p.add_argument(
+        "--latent_geom_split", type=str, default="test",
+        choices=["train", "test", "all"],
+        help="Dataset split used to encode fields for latent geometry.",
+    )
+    p.add_argument(
+        "--latent_geom_max_samples_per_time", type=int, default=0,
+        help="Max samples per time marginal for latent geometry encoding "
+             "(0 means use all available for the selected split).",
+    )
 
     args = p.parse_args()
 
-    # Validate: need either --run_dir or --trajectory_file + --dataset_file.
-    if args.run_dir is None and args.trajectory_file is None:
-        p.error("Provide either --run_dir (preferred) or "
-                "--trajectory_file + --dataset_file.")
+    has_main_eval_input = args.run_dir is not None or args.trajectory_file is not None
+    has_latent_geom_only_input = (
+        (not args.no_latent_geometry)
+        and (args.latent_geom_fae_run_dir is not None or args.latent_geom_checkpoint is not None)
+    )
+    # Validate: need main eval inputs OR latent-geometry-only inputs.
+    if not has_main_eval_input and not has_latent_geom_only_input:
+        p.error(
+            "Provide one of:\n"
+            "  (1) --run_dir\n"
+            "  (2) --trajectory_file + --dataset_file\n"
+            "  (3) --latent_geom_fae_run_dir (latent-geometry-only mode)."
+        )
     if args.trajectory_file is not None and args.dataset_file is None:
         p.error("--dataset_file is required when using --trajectory_file.")
+    if args.latent_geom_max_samples_per_time < 0:
+        p.error("--latent_geom_max_samples_per_time must be >= 0.")
 
     return args
 
@@ -253,6 +344,205 @@ def _discover_dataset_path(run_dir: Path) -> Path:
     raise FileNotFoundError(
         f"Dataset not found at '{data_path}' or '{candidate}'."
     )
+
+
+def _load_json_args(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    with path.open("r") as f:
+        payload = json.load(f)
+    if not isinstance(payload, dict):
+        return {}
+    return payload
+
+
+def _resolve_existing_path(
+    raw_path: str | Path | None,
+    *,
+    roots: Optional[list[Path]] = None,
+) -> Optional[Path]:
+    if raw_path is None:
+        return None
+    raw = Path(str(raw_path))
+    candidates: list[Path] = [raw]
+    for root in roots or []:
+        candidates.append(root / raw)
+    candidates.append(REPO_ROOT / raw)
+
+    seen: set[Path] = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        if candidate.exists():
+            return candidate.resolve()
+    return None
+
+
+def _normalise_raw_list(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, (list, tuple, np.ndarray)):
+        return ",".join(str(v) for v in value)
+    return str(value)
+
+
+def _resolve_latent_geometry_inputs(
+    args: argparse.Namespace,
+    run_dir: Optional[Path],
+) -> dict[str, Any]:
+    train_cfg = parse_args_file(run_dir / "args.txt") if run_dir is not None else {}
+    fae_run_dir = _resolve_existing_path(args.latent_geom_fae_run_dir, roots=[Path.cwd()])
+    if fae_run_dir is not None and not fae_run_dir.is_dir():
+        raise NotADirectoryError(f"--latent_geom_fae_run_dir is not a directory: {fae_run_dir}")
+
+    fae_cfg = _load_json_args(fae_run_dir / "args.json") if fae_run_dir is not None else {}
+
+    ckpt_path = _resolve_existing_path(
+        args.latent_geom_checkpoint,
+        roots=[p for p in [fae_run_dir, run_dir, Path.cwd()] if p is not None],
+    )
+    if ckpt_path is None and fae_run_dir is not None:
+        for rel in ("checkpoints/best_state.pkl", "checkpoints/state.pkl"):
+            candidate = fae_run_dir / rel
+            if candidate.exists():
+                ckpt_path = candidate.resolve()
+                break
+    if ckpt_path is None and "fae_checkpoint" in train_cfg:
+        ckpt_path = _resolve_existing_path(
+            str(train_cfg["fae_checkpoint"]),
+            roots=[p for p in [run_dir, Path.cwd()] if p is not None],
+        )
+    if ckpt_path is None:
+        raise FileNotFoundError(
+            "Could not resolve FAE checkpoint for latent geometry. "
+            "Set --latent_geom_fae_run_dir or --latent_geom_checkpoint."
+        )
+    if fae_run_dir is None:
+        ckpt_parent = ckpt_path.parent
+        if ckpt_parent.name == "checkpoints":
+            inferred_run_dir = ckpt_parent.parent
+            inferred_cfg = _load_json_args(inferred_run_dir / "args.json")
+            if inferred_cfg:
+                fae_run_dir = inferred_run_dir
+                fae_cfg = inferred_cfg
+
+    data_path = _resolve_existing_path(
+        args.latent_geom_data_path,
+        roots=[p for p in [fae_run_dir, run_dir, Path.cwd()] if p is not None],
+    )
+    if data_path is None and "data_path" in fae_cfg:
+        data_path = _resolve_existing_path(
+            str(fae_cfg["data_path"]),
+            roots=[p for p in [fae_run_dir, Path.cwd()] if p is not None],
+        )
+    if data_path is None and "data_path" in train_cfg:
+        data_path = _resolve_existing_path(
+            str(train_cfg["data_path"]),
+            roots=[p for p in [run_dir, Path.cwd()] if p is not None],
+        )
+    if data_path is None:
+        raise FileNotFoundError(
+            "Could not resolve dataset path for latent geometry. "
+            "Set --latent_geom_data_path or provide a run dir with data_path metadata."
+        )
+
+    train_ratio_raw = fae_cfg.get("train_ratio", train_cfg.get("train_ratio", 0.8))
+    if train_ratio_raw is None:
+        train_ratio = 0.8
+    else:
+        train_ratio = float(train_ratio_raw)
+    held_out_indices_raw = fae_cfg.get("held_out_indices", train_cfg.get("held_out_indices", ""))
+    held_out_times_raw = fae_cfg.get("held_out_times", train_cfg.get("held_out_times", ""))
+
+    source_run_dir = fae_run_dir if fae_run_dir is not None else run_dir
+    return {
+        "checkpoint_path": ckpt_path,
+        "data_path": data_path,
+        "train_ratio": train_ratio,
+        "held_out_indices_raw": held_out_indices_raw,
+        "held_out_times_raw": held_out_times_raw,
+        "source_run_dir": str(source_run_dir) if source_run_dir is not None else None,
+    }
+
+
+def _compute_latent_geometry_results(
+    args: argparse.Namespace,
+    run_dir: Optional[Path],
+) -> tuple[dict[str, Any], np.ndarray]:
+    from scripts.fae.fae_naive.fae_latent_utils import (  # noqa: E402
+        build_attention_fae_from_checkpoint,
+        load_fae_checkpoint,
+    )
+    from scripts.fae.fae_naive.train_attention_components import (  # noqa: E402
+        load_dataset_metadata,
+        parse_held_out_indices_arg,
+        parse_held_out_times_arg,
+    )
+    from scripts.fae.multiscale_dataset_naive import load_training_time_data_naive  # noqa: E402
+    from scripts.fae.tran_evaluation.latent_geometry import (  # noqa: E402
+        LatentGeometryConfig,
+        evaluate_latent_geometry,
+    )
+
+    resolved = _resolve_latent_geometry_inputs(args, run_dir)
+    raw_indices = _normalise_raw_list(resolved["held_out_indices_raw"]).strip()
+    raw_times = _normalise_raw_list(resolved["held_out_times_raw"]).strip()
+
+    held_out_indices: Optional[list[int]] = None
+    if raw_indices and raw_indices.lower() not in {"none", "null", "false", "no"}:
+        held_out_indices = parse_held_out_indices_arg(raw_indices)
+    elif raw_times and raw_times.lower() not in {"none", "null", "false", "no"}:
+        meta = load_dataset_metadata(str(resolved["data_path"]))
+        times_norm = meta.get("times_normalized")
+        if times_norm is None:
+            raise ValueError("Dataset missing times_normalized; cannot parse held_out_times.")
+        held_out_indices = parse_held_out_times_arg(raw_times, np.asarray(times_norm, dtype=np.float32))
+
+    time_data = load_training_time_data_naive(
+        str(resolved["data_path"]),
+        held_out_indices=held_out_indices,
+        train_ratio=float(resolved["train_ratio"]),
+        split=args.latent_geom_split,
+        max_samples=int(args.latent_geom_max_samples_per_time),
+        seed=int(args.seed),
+    )
+    if not time_data:
+        raise ValueError("No available time marginals for latent geometry after held-out filtering.")
+
+    coords = np.asarray(time_data[0]["x"], dtype=np.float32)
+    n_common = min(int(d["u"].shape[0]) for d in time_data)
+    if n_common < 1:
+        raise ValueError("No samples available for latent geometry evaluation.")
+    fields_per_time = np.stack(
+        [np.asarray(d["u"][:n_common], dtype=np.float32) for d in time_data],
+        axis=0,
+    )
+    dataset_time_indices = np.asarray([int(d["idx"]) for d in time_data], dtype=np.int64)
+
+    ckpt = load_fae_checkpoint(Path(resolved["checkpoint_path"]))
+    autoencoder, fae_params, fae_batch_stats, _ = build_attention_fae_from_checkpoint(ckpt)
+
+    lg_config = LatentGeometryConfig.from_preset(
+        args.latent_geom_budget, seed=args.seed,
+    ).with_overrides(
+        n_samples=args.latent_geom_n_samples,
+        n_probes=args.latent_geom_n_probes,
+        n_hvp_probes=args.latent_geom_n_hvp_probes,
+        eps=args.latent_geom_eps,
+        near_null_tau=args.latent_geom_near_null_tau,
+    )
+
+    lg_results = evaluate_latent_geometry(
+        autoencoder, fae_params, fae_batch_stats,
+        fields_per_time, coords, config=lg_config,
+    )
+    lg_results["run_dir"] = resolved["source_run_dir"]
+    lg_results["time_indices"] = dataset_time_indices.tolist()
+    lg_results["dataset_path"] = str(resolved["data_path"])
+    lg_results["latent_geom_split"] = args.latent_geom_split
+    lg_results["n_fields_per_time"] = int(n_common)
+    return lg_results, dataset_time_indices
 
 
 # ============================================================================
@@ -306,12 +596,50 @@ def _build_eval_scope(
 
 
 # ============================================================================
+# Latent-geometry-only mode
+# ============================================================================
+
+def _run_latent_geometry_only(args: argparse.Namespace) -> None:
+    if args.output_dir is not None:
+        out_dir = Path(args.output_dir)
+    elif args.latent_geom_fae_run_dir is not None:
+        out_dir = Path(args.latent_geom_fae_run_dir) / "latent_geometry_eval"
+    else:
+        out_dir = REPO_ROOT / "results" / "latent_geometry_eval"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    print("\n--- Latent geometry only mode ---")
+    print(f"Output: {out_dir}")
+    lg_results, _lg_time_indices = _compute_latent_geometry_results(args, run_dir=None)
+    with open(out_dir / "latent_geometry_metrics.json", "w") as f:
+        json.dump(lg_results, f, indent=2)
+    print(f"Saved latent geometry metrics to {out_dir / 'latent_geometry_metrics.json'}")
+
+    if not args.no_plot:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        format_for_paper()
+        plot_latent_geom_spectrum(lg_results, None, None, out_dir)
+        plot_latent_geom_hessian(lg_results, None, None, out_dir)
+        plot_latent_geom_volume(lg_results, None, None, out_dir)
+        plot_latent_geom_flags(lg_results, None, None, out_dir)
+        print(f"Saved latent geometry figures to {out_dir}")
+
+    print("\nDone!")
+
+
+# ============================================================================
 # Main
 # ============================================================================
 
 def main() -> None:
     args = _parse_args()
     np.random.seed(args.seed)
+
+    if args.run_dir is None and args.trajectory_file is None:
+        _run_latent_geometry_only(args)
+        return
 
     run_dir = Path(args.run_dir) if args.run_dir else None
 
@@ -358,6 +686,10 @@ def main() -> None:
             use_ema=args.use_ema,
             drift_clip_norm=args.drift_clip_norm,
             device=device,
+            decode_mode=args.decode_mode,
+            denoiser_num_steps=args.denoiser_num_steps,
+            denoiser_noise_scale=args.denoiser_noise_scale,
+            denoiser_steps_schedule=args.denoiser_steps_schedule,
         )
 
     else:
@@ -679,8 +1011,22 @@ def main() -> None:
             print("  time_indices not available. Skipping trajectory evaluation.")
 
     # ---------------------------------------------------------------
-    # Phase 8: Reporting
+    # Phase 7b: Latent geometry robustness
     # ---------------------------------------------------------------
+    latent_geometry_results = None
+    latent_geom_time_indices = None
+    if not args.no_latent_geometry:
+        print("\n--- Phase 7b: Latent geometry robustness ---")
+        try:
+            latent_geometry_results, latent_geom_time_indices = _compute_latent_geometry_results(
+                args, run_dir,
+            )
+            with open(out_dir / "latent_geometry_metrics.json", "w") as f:
+                json.dump(latent_geometry_results, f, indent=2)
+            print(f"  Saved latent geometry metrics to {out_dir / 'latent_geometry_metrics.json'}")
+        except Exception as exc:
+            print(f"  WARNING: latent geometry phase skipped: {exc}")
+
     print("\n--- Phase 8: Reporting ---")
 
     summary = print_summary_table(
@@ -701,6 +1047,8 @@ def main() -> None:
             "time_indices": time_indices.tolist() if time_indices is not None else None,
             "full_H_schedule": full_H_schedule,
             "eval_H_schedule": eval_H_schedule,
+            "decode_mode": gen.get("decode_mode"),
+            "denoiser_steps_schedule": gen.get("denoiser_steps_schedule"),
         },
         "conditioning": {
             "mean": cond["mean"], "median": cond["median"],
@@ -714,6 +1062,7 @@ def main() -> None:
             "microscale_cv": micro_d["cv"],
             "microscale_diversity_ratio": micro_d.get("diversity_ratio"),
         },
+        "latent_geometry": latent_geometry_results,
     }
     for b in sorted(first_order.keys()):
         w = first_order[b]["wasserstein1"]
@@ -884,6 +1233,21 @@ def main() -> None:
                 trajectory_results, time_indices, full_H_schedule, out_dir,
             )
             n_figs += 6
+
+        if latent_geometry_results is not None:
+            plot_latent_geom_spectrum(
+                latent_geometry_results, latent_geom_time_indices, full_H_schedule, out_dir,
+            )
+            plot_latent_geom_hessian(
+                latent_geometry_results, latent_geom_time_indices, full_H_schedule, out_dir,
+            )
+            plot_latent_geom_volume(
+                latent_geometry_results, latent_geom_time_indices, full_H_schedule, out_dir,
+            )
+            plot_latent_geom_flags(
+                latent_geometry_results, latent_geom_time_indices, full_H_schedule, out_dir,
+            )
+            n_figs += 4
 
         print(f"Saved {n_figs} figures to {out_dir}")
 

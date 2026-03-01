@@ -6,7 +6,7 @@
 #   SMOKE=1 bash scripts/fae/run_fae_pipeline.sh  # quick smoke test
 
 set -euo pipefail
-cd "$(dirname "$0")/../.."   # project root
+cd "$(dirname "$0")/../../../.."   # project root
 
 # ── Defaults (override via environment variables) ────────────────────
 DATA_GENERATOR="${DATA_GENERATOR:-grf}"

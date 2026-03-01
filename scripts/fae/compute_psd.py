@@ -223,6 +223,13 @@ def _hf_ratio(psd: np.ndarray, frac: float = 0.30) -> float:
     return hi / (lo + 1e-12)
 
 
+def _matrix_sqrt(A: np.ndarray) -> np.ndarray:
+    """Symmetric positive-definite matrix square root via eigendecomposition."""
+    eigvals, eigvecs = np.linalg.eigh(A)
+    eigvals = np.clip(eigvals, 0.0, None)
+    return (eigvecs * np.sqrt(eigvals)[None, :]) @ eigvecs.T
+
+
 def _tail_energy_frac(psd: np.ndarray, frac: float = 0.30) -> float:
     """Fraction of spectral energy in top-frequency tail."""
     p = np.asarray(psd, dtype=np.float64)
@@ -301,6 +308,7 @@ def main() -> None:
         run_psd_recon_acc = []
         run_psd_by_time: Dict[str, np.ndarray] = {}
         z_all_acc = []
+        z_per_time: Dict[str, np.ndarray] = {}  # time_key -> z array
         time_metrics = {}
         per_time_mse = []
 
@@ -322,6 +330,7 @@ def main() -> None:
             z_all_acc.append(z)
 
             split = "held_out" if tidx in ho_set else "train"
+            z_per_time[f"t{tidx}_{split}"] = np.asarray(z, dtype=np.float32)
             mse_t = float(np.mean((recon - fields) ** 2))
             per_time_mse.append((tidx, split, mse_t))
 
@@ -373,6 +382,39 @@ def main() -> None:
         z_all = np.concatenate(z_all_acc, axis=0) if z_all_acc else np.zeros((0, 1), dtype=np.float32)
         lat = _latent_metrics(z_all)
 
+        # Per-marginal latent diagnostics
+        per_marginal_latent: Dict[str, dict] = {}
+        for tk in sorted(z_per_time.keys(), key=lambda s: (int(s.split("_")[0][1:]), s)):
+            per_marginal_latent[tk] = _latent_metrics(z_per_time[tk])
+
+        # Inter-marginal W2 distances (consecutive pairs, ordered by time index)
+        ordered_tkeys = sorted(z_per_time.keys(), key=lambda s: (int(s.split("_")[0][1:]), s))
+        inter_marginal: Dict[str, dict] = {}
+        for i in range(len(ordered_tkeys) - 1):
+            tk_a, tk_b = ordered_tkeys[i], ordered_tkeys[i + 1]
+            za = np.asarray(z_per_time[tk_a], dtype=np.float64)
+            zb = np.asarray(z_per_time[tk_b], dtype=np.float64)
+            mu_a, mu_b = za.mean(axis=0), zb.mean(axis=0)
+            cov_a = np.cov(za, rowvar=False) + 1e-8 * np.eye(za.shape[1])
+            cov_b = np.cov(zb, rowvar=False) + 1e-8 * np.eye(zb.shape[1])
+            # Bures-Wasserstein W2^2 = ||mu_a - mu_b||^2 + Tr(cov_a + cov_b - 2*(cov_a^{1/2} cov_b cov_a^{1/2})^{1/2})
+            mean_dist_sq = float(np.sum((mu_a - mu_b) ** 2))
+            sqrt_a = _matrix_sqrt(cov_a)
+            M = sqrt_a @ cov_b @ sqrt_a
+            sqrt_M = _matrix_sqrt(M)
+            bures = float(np.trace(cov_a) + np.trace(cov_b) - 2.0 * np.trace(sqrt_M))
+            w2_sq = mean_dist_sq + max(0.0, bures)
+            w2 = float(np.sqrt(max(0.0, w2_sq)))
+            # Also compute simple mean-L2 distance for reference
+            mean_l2 = float(np.sqrt(mean_dist_sq))
+            pair_key = f"{tk_a}_to_{tk_b}"
+            inter_marginal[pair_key] = {
+                "w2": w2,
+                "w2_squared": w2_sq,
+                "mean_l2": mean_l2,
+                "bures_covariance_term": max(0.0, bures),
+            }
+
         key = _safe_key(label)
         psd_out[f"psd_{key}"] = run_psd_recon.astype(np.float64)
         for time_key, prc in run_psd_by_time.items():
@@ -396,6 +438,8 @@ def main() -> None:
             "psd_tail_energy_frac_gt": _tail_energy_frac(run_psd_gt),
             "psd_tail_energy_frac_recon": _tail_energy_frac(run_psd_recon),
             "latent": lat,
+            "per_marginal_latent": per_marginal_latent,
+            "inter_marginal_w2": inter_marginal,
             "time_metrics": time_metrics,
             "time_recon_balance": {
                 "mse_mean": float(np.mean([x[2] for x in per_time_mse])) if per_time_mse else float("nan"),

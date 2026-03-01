@@ -36,6 +36,8 @@ from scripts.fae.fae_naive.fae_latent_utils import (
     decode_latent_knots_to_fields,
     load_fae_checkpoint,
     make_fae_apply_fns,
+    make_fae_decode_fn,
+    parse_step_schedule,
 )
 from scripts.utils import get_device
 
@@ -100,6 +102,12 @@ def _parse_args() -> argparse.Namespace:
     )
     p.add_argument("--denoiser_num_steps", type=int, default=32, help="Euler steps for multistep decode.")
     p.add_argument("--denoiser_noise_scale", type=float, default=1.0, help="Noise scale for one_step decode.")
+    p.add_argument(
+        "--denoiser_steps_schedule", type=str, default=None,
+        help="Per-knot adaptive decode-step schedule. Overrides --denoiser_num_steps "
+             "and forces multistep mode.  Formats: comma-separated list, "
+             "'exp:<max>:<decay>:<min>', or a uniform integer.",
+    )
     p.add_argument("--decode_batch_size", type=int, default=None, help="Batch size for decoding (overrides train config).")
     return p.parse_args()
 
@@ -534,14 +542,48 @@ def main() -> None:
         else:
             ckpt = load_fae_checkpoint(fae_checkpoint_path)
             autoencoder, fae_params, fae_batch_stats, _ = build_attention_fae_from_checkpoint(ckpt)
+
+            # Resolve decode mode — schedule forces multistep.
+            effective_decode_mode = str(args.decode_mode)
+            if args.denoiser_steps_schedule is not None:
+                effective_decode_mode = "multistep"
+
             _, decode_fn = make_fae_apply_fns(
                 autoencoder,
                 fae_params,
                 fae_batch_stats,
-                decode_mode=str(args.decode_mode),
+                decode_mode=effective_decode_mode,
                 denoiser_num_steps=int(args.denoiser_num_steps),
                 denoiser_noise_scale=float(args.denoiser_noise_scale),
             )
+
+            # Build per-knot decode functions if schedule is provided.
+            knot_decode_fns = None
+            if args.denoiser_steps_schedule is not None:
+                from scripts.fae.fae_naive.diffusion_denoiser_decoder import DiffusionDenoiserDecoder
+                diffusion_cap = (
+                    autoencoder.decoder.diffusion_steps
+                    if isinstance(autoencoder.decoder, DiffusionDenoiserDecoder)
+                    else 1000
+                )
+                T_knots_dec = knots_b_np.shape[0] if "latent_backward_knots" in artifacts else knots_f_np.shape[0]
+                knot_steps = parse_step_schedule(
+                    args.denoiser_steps_schedule, T_knots_dec,
+                    diffusion_steps_cap=diffusion_cap,
+                )
+                print(f"  Adaptive decode schedule (per knot): {knot_steps}")
+
+                _cache: dict[int, object] = {}
+                knot_decode_fns = []
+                for s in knot_steps:
+                    if s not in _cache:
+                        _cache[s] = make_fae_decode_fn(
+                            autoencoder, fae_params, fae_batch_stats,
+                            decode_mode="multistep",
+                            denoiser_num_steps=s,
+                            denoiser_noise_scale=float(args.denoiser_noise_scale),
+                        )
+                    knot_decode_fns.append(_cache[s])
 
             encode_batch_size = args.decode_batch_size if args.decode_batch_size is not None else int(train_cfg.get("encode_batch_size", 64))
             print(f"FAE decode batch size: {encode_batch_size}")

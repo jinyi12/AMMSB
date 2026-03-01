@@ -1,0 +1,35 @@
+{
+  "family_slug": "fae_film_adam_ntk_scaled_multi_1248",
+  "matrix_cell_id": "film|adam|ntk_scaled|multi_1248|prior1",
+  "track": "deterministic_primary",
+  "sweep_id": "publication_curated_2026q1",
+  "status": "complete",
+  "paper_track": "publication",
+  "run_dir": "results/adam_ntk_prior/run_zaql9zhd",
+  "decoder_type": "film",
+  "optimizer": "adam",
+  "loss_type": "ntk_scaled",
+  "scale": "multi_1248",
+  "prior_flag": 1,
+  "dataset_path": "data/fae_tran_inclusions_minmax.npz",
+  "seed": 0,
+  "eval_protocol": {
+    "decode_mode": "auto",
+    "denoiser_eval_sample_steps": 32,
+    "denoiser_noise_scale": 1.0
+  },
+  "artifacts": {
+    "args_json": "args.json",
+    "eval_results_full": "eval_results_full.json",
+    "eval_results": "eval_results.json",
+    "checkpoints_dir": "checkpoints"
+  },
+  "metrics_summary": {
+    "test_mse": null,
+    "test_rel_mse": null,
+    "held_out_rel_mse_t029": null,
+    "held_out_rel_mse_t071": null,
+    "psd_log_l2_global": null
+  },
+  "notes": "Use for manifest sidecar. For denoiser runs, always fill eval_protocol fields explicitly."
+}

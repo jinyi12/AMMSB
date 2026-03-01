@@ -27,7 +27,7 @@ set -euo pipefail
 
 PYTHON_BIN="${PYTHON_BIN:-/home/jy384/miniconda3/envs/3MASB/bin/python}"
 
-cd "$(dirname "$0")/../.."
+cd "$(dirname "$0")/../../../.."
 
 nohup "$PYTHON_BIN" scripts/fae/fae_naive/train_attention_denoiser.py \
   --data-path data/fae_tran_inclusions.npz \

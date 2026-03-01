@@ -10,7 +10,7 @@ set -euo pipefail
 # Theory (Wang et al. 2022, Eqs. 6.5-6.6):
 #   Type I conflict: Magnitude imbalance across loss components (scales)
 #   → Solution: Adaptive weights λ_i = Tr(K_total) / Tr(K_i)
-#   → Via EMA of Hutchinson traces across all batches
+#   → Via periodic exact NTK-diagonal calibration
 #
 # Key equation (Wang et al. Algorithm 1):
 #   weight = (n_loss_terms * trace_ema) / trace_per_output
@@ -23,7 +23,7 @@ set -euo pipefail
 
 PYTHON_BIN="${PYTHON_BIN:-/home/jy384/miniconda3/envs/3MASB/bin/python}"
 
-cd "$(dirname "$0")/../.."
+cd "$(dirname "$0")/../../../.."
 
 nohup "$PYTHON_BIN" scripts/fae/fae_naive/train_attention.py \
   --data-path data/fae_tran_inclusions.npz \
@@ -41,6 +41,8 @@ nohup "$PYTHON_BIN" scripts/fae/fae_naive/train_attention.py \
   --ntk-estimate-total-trace \
   --ntk-total-trace-ema-decay 0.99 \
   --ntk-epsilon 1e-8 \
+  --ntk-calibration-interval 100 \
+  --ntk-cv-threshold 0.2 \
   --masking-strategy random \
   --eval-masking-strategy same \
   --encoder-point-ratio-by-time 0.8,0.8,0.7,0.6,0.4,0.3,0.2,0.1 \

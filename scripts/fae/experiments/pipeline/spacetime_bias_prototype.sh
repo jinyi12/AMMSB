@@ -17,7 +17,7 @@
 # - WandB is disabled by default for speed/portability.
 # =============================================================================
 set -euo pipefail
-cd "$(dirname "$0")/../.."   # project root
+cd "$(dirname "$0")/../../../.."   # project root
 
 # ── Defaults (override via environment variables) ────────────────────────────
 DATA_GENERATOR="${DATA_GENERATOR:-grf}"

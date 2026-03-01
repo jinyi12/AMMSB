@@ -115,6 +115,121 @@ def build_attention_fae_from_checkpoint(
     return autoencoder, params, batch_stats, meta
 
 
+def compute_exponential_step_schedule(
+    n_knots: int,
+    max_steps: int = 500,
+    decay: float = 0.5,
+    min_steps: int = 8,
+) -> list[int]:
+    """Compute an exponentially decaying decode-step schedule across knots.
+
+    Knot 0 (finest / ``t1``) gets ``max_steps``.  Each subsequent knot
+    gets ``round(max_steps * decay**k)`` steps, clamped to ``[min_steps,
+    max_steps]``.
+
+    Parameters
+    ----------
+    n_knots : int
+        Number of MSBM knots (trajectory time points).
+    max_steps : int
+        Steps for the finest knot (``t1``).
+    decay : float
+        Multiplicative decay per knot (e.g. 0.5 = halve each knot).
+    min_steps : int
+        Floor on step count for the coarsest knots.
+
+    Returns
+    -------
+    list[int]
+        Per-knot step counts, length ``n_knots``.
+    """
+    if n_knots < 1:
+        return []
+    schedule = []
+    for k in range(n_knots):
+        steps = max(min_steps, round(max_steps * (decay ** k)))
+        steps = min(steps, max_steps)
+        schedule.append(steps)
+    return schedule
+
+
+def parse_step_schedule(
+    spec: str,
+    n_knots: int,
+    diffusion_steps_cap: int = 1000,
+) -> list[int]:
+    """Parse a step-schedule specification string.
+
+    Accepted formats
+    ----------------
+    Comma-separated list (length must match *n_knots*)::
+
+        "500,250,125,64,32,16,8"
+
+    Exponential specification::
+
+        "exp:<max_steps>:<decay>:<min_steps>"
+
+    e.g. ``"exp:500:0.5:8"``.
+
+    A plain integer (uniform steps for all knots)::
+
+        "32"
+
+    Returns
+    -------
+    list[int]
+        Per-knot step counts, clamped to ``[1, diffusion_steps_cap]``.
+    """
+    spec = spec.strip()
+
+    if spec.startswith("exp:"):
+        parts = spec.split(":")
+        if len(parts) != 4:
+            raise ValueError(
+                f"Exponential schedule format: 'exp:<max>:<decay>:<min>'. Got '{spec}'."
+            )
+        max_s, decay, min_s = int(parts[1]), float(parts[2]), int(parts[3])
+        schedule = compute_exponential_step_schedule(n_knots, max_s, decay, min_s)
+    elif "," in spec:
+        schedule = [int(x.strip()) for x in spec.split(",")]
+        if len(schedule) != n_knots:
+            raise ValueError(
+                f"Step schedule has {len(schedule)} entries but there are "
+                f"{n_knots} knots. Provide exactly {n_knots} values."
+            )
+    else:
+        schedule = [int(spec)] * n_knots
+
+    # Clamp to valid range.
+    schedule = [max(1, min(s, diffusion_steps_cap)) for s in schedule]
+    return schedule
+
+
+def make_fae_decode_fn(
+    autoencoder,
+    params: dict,
+    batch_stats: Optional[dict],
+    *,
+    decode_mode: str = "multistep",
+    denoiser_num_steps: int = 32,
+    denoiser_noise_scale: float = 1.0,
+):
+    """Build a single numpy-level decode function for a specific step count.
+
+    Unlike :func:`make_fae_apply_fns`, this returns *only* the decode
+    function and is designed to be called multiple times with different
+    ``denoiser_num_steps`` to produce per-knot decode functions.
+    """
+    _, decode_fn = make_fae_apply_fns(
+        autoencoder, params, batch_stats,
+        decode_mode=decode_mode,
+        denoiser_num_steps=denoiser_num_steps,
+        denoiser_noise_scale=denoiser_noise_scale,
+    )
+    return decode_fn
+
+
 def make_fae_apply_fns(
     autoencoder,
     params: dict,
@@ -354,18 +469,35 @@ def decode_latent_knots_to_fields(
     grid_coords: np.ndarray,  # (P, 2)
     decode_fn,
     batch_size: int,
+    decode_fns_per_knot: Optional[list] = None,
 ) -> np.ndarray:
-    """Decode latent knots into fields on the full grid: (T, N, P, 1)."""
+    """Decode latent knots into fields on the full grid: (T, N, P, 1).
+
+    Parameters
+    ----------
+    decode_fn : callable
+        Default decode function (used for all knots unless overridden).
+    decode_fns_per_knot : list[callable], optional
+        If provided, a list of length T where ``decode_fns_per_knot[t]``
+        is used for knot *t* instead of *decode_fn*.  This enables
+        adaptive per-knot decode step counts (e.g. more steps for fine
+        scales, fewer for coarse).
+    """
     t, n, _k = latent_knots.shape
     x = np.asarray(grid_coords, dtype=np.float32)
     decoded: list[np.ndarray] = []
     for t_idx in range(int(t)):
+        fn = (
+            decode_fns_per_knot[t_idx]
+            if decode_fns_per_knot is not None
+            else decode_fn
+        )
         z_all = np.asarray(latent_knots[t_idx], dtype=np.float32)
         parts: list[np.ndarray] = []
         for i in range(0, int(n), int(batch_size)):
             z_b = z_all[i : i + int(batch_size)]
             x_b = np.broadcast_to(x[None, ...], (z_b.shape[0], *x.shape))
-            parts.append(decode_fn(z_b, x_b))
+            parts.append(fn(z_b, x_b))
         u_hat = np.concatenate(parts, axis=0)
         decoded.append(u_hat)
     return np.stack(decoded, axis=0)
@@ -383,12 +515,18 @@ _infer_resolution = infer_resolution
 _flat_fields_to_grid = flat_fields_to_grid
 _reference_field_subset = reference_field_subset
 _decode_latent_knots_to_fields = decode_latent_knots_to_fields
+_compute_exponential_step_schedule = compute_exponential_step_schedule
+_parse_step_schedule = parse_step_schedule
+_make_fae_decode_fn = make_fae_decode_fn
 
 __all__ = [
     "NoopTimeModule",
     "load_fae_checkpoint",
     "build_attention_fae_from_checkpoint",
     "make_fae_apply_fns",
+    "make_fae_decode_fn",
+    "compute_exponential_step_schedule",
+    "parse_step_schedule",
     "encode_time_marginals",
     "infer_resolution",
     "flat_fields_to_grid",

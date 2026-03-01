@@ -6,7 +6,7 @@ set -euo pipefail
 
 PYTHON_BIN="${PYTHON_BIN:-/home/jy384/miniconda3/envs/3MASB/bin/python}"
 
-cd "$(dirname "$0")/../.."
+cd "$(dirname "$0")/../../../.."
 
 nohup "$PYTHON_BIN" scripts/fae/fae_naive/train_attention.py \
   --data-path data/fae_tran_inclusions.npz \
@@ -23,6 +23,8 @@ nohup "$PYTHON_BIN" scripts/fae/fae_naive/train_attention.py \
   --loss-type ntk_scaled \
   --ntk-estimate-total-trace \
   --ntk-total-trace-ema-decay 0.99 \
+  --ntk-calibration-interval 100 \
+  --ntk-cv-threshold 0.2 \
   --masking-strategy random \
   --eval-masking-strategy same \
   --encoder-point-ratio-by-time 0.8,0.8,0.7,0.6,0.4,0.3,0.2,0.1 \
