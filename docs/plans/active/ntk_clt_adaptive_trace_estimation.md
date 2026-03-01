@@ -196,7 +196,7 @@ Add to `train_attention.py::build_parser()`:
     Maximum acceptable CV for the batch-mean trace estimator.
     Logged as a diagnostic; if exceeded a warning is printed.
 
---ntk-diag-subsample  INT   (default 0)
+--ntk-calibration-pilot-samples  INT   (default 0)
     Number of samples used for per-sample diagonal computation
     during calibration (0 = use full batch).
 ```
@@ -263,7 +263,7 @@ This can be done in a follow-up PR once the new scheme is validated.
 | File | Changes |
 |---|---|
 | `scripts/fae/fae_naive/ntk_losses.py` | Add `_compute_per_sample_ntk_diag`, `compute_ntk_diag_stats`, `_forward_only`; refactor `get_ntk_scaled_loss_fn` for periodic calibration; update `NTKDiagnosticMetric` |
-| `scripts/fae/fae_naive/train_attention.py` | Add `--ntk-calibration-interval`, `--ntk-cv-threshold`, `--ntk-diag-subsample` |
+| `scripts/fae/fae_naive/train_attention.py` | Add `--ntk-calibration-interval`, `--ntk-cv-threshold`, `--ntk-calibration-pilot-samples` |
 | `scripts/fae/fae_naive/train_attention_flow.py` | Pass new args to `get_ntk_scaled_loss_fn`; pass new args to `NTKDiagnosticMetric` |
 | `scripts/fae/fae_naive/train_attention_denoiser.py` | Same integration for denoiser path |
 | `scripts/fae/fae_naive/diffusion_denoiser_decoder.py` | Import shared infra from `ntk_losses.py` |
@@ -286,10 +286,10 @@ This can be done in a follow-up PR once the new scheme is validated.
 |---|---|
 | Non-calibration step (new) | **1×** — no VJP, no probe |
 | Calibration step, full batch B=32 | ~33× (vmap of 32 backward passes) |
-| Calibration step, subsample=16 | ~17× |
+| Calibration step, calibration-pilot-samples=16 | ~17× |
 | Old Hutchinson (every step) | ~2× |
 
-**Amortised cost** at `calibration_interval=100`, `diag_subsample=16`:
+**Amortised cost** at `calibration_interval=100`, `calibration_pilot_samples=16`:
 
 $$\frac{99 \times 1 + 1 \times 17}{100} = 1.16\times$$
 

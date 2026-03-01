@@ -438,6 +438,9 @@ def run_training(
     if args.training_mode == "multi_scale" and hasattr(train_dataset, "n_times"):
         n_loss_terms = max(1, int(train_dataset.n_times))
     setattr(args, "ntk_n_loss_terms", int(n_loss_terms))
+    ntk_calibration_pilot_samples = int(
+        getattr(args, "ntk_calibration_pilot_samples", 0)
+    )
 
     if getattr(args, "loss_type", "l2") == "sobolev_h1":
         est = _estimate_sobolev_balance_from_dataset(
@@ -510,7 +513,7 @@ def run_training(
                 latent_noise_scale=latent_noise_scale,
                 calibration_interval=int(args.ntk_calibration_interval),
                 cv_threshold=float(args.ntk_cv_threshold),
-                diag_subsample=int(args.ntk_diag_subsample),
+                calibration_pilot_samples=ntk_calibration_pilot_samples,
             )
         else:
             raise ValueError(f"Unsupported --loss-type={args.loss_type}")
@@ -526,7 +529,7 @@ def run_training(
                     estimate_total_trace=bool(args.ntk_estimate_total_trace),
                     n_loss_terms=n_loss_terms,
                     cv_threshold=float(args.ntk_cv_threshold),
-                    diag_subsample=int(args.ntk_diag_subsample),
+                    calibration_pilot_samples=ntk_calibration_pilot_samples,
                     latent_noise_scale=latent_noise_scale,
                 )
             )

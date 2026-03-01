@@ -205,11 +205,11 @@ def _subsample_batch(
     x_enc: jax.Array,
     u_dec: jax.Array,
     x_dec: jax.Array,
-    diag_subsample: int,
+    calibration_pilot_samples: int,
     key: jax.Array,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     batch_size = int(u_enc.shape[0])
-    if diag_subsample <= 0 or diag_subsample >= batch_size:
+    if calibration_pilot_samples <= 0 or calibration_pilot_samples >= batch_size:
         return (
             u_enc,
             x_enc,
@@ -218,7 +218,7 @@ def _subsample_batch(
             jnp.asarray(batch_size, dtype=jnp.int32),
         )
 
-    n_sub = int(diag_subsample)
+    n_sub = int(calibration_pilot_samples)
     idx = jax.random.permutation(key, batch_size)[:n_sub]
     return (
         u_enc[idx],
@@ -241,7 +241,7 @@ def get_ntk_scaled_loss_fn(
     latent_noise_scale: float = 0.0,
     calibration_interval: int = 100,
     cv_threshold: float = 0.2,
-    diag_subsample: int = 0,
+    calibration_pilot_samples: int = 0,
 ) -> Callable:
     """Return NTK-scaled loss with periodic exact NTK-diagonal calibration.
 
@@ -263,7 +263,11 @@ def get_ntk_scaled_loss_fn(
     latent_noise_scale = float(latent_noise_scale)
     calibration_interval = max(1, int(calibration_interval))
     cv_threshold = float(cv_threshold)
-    diag_subsample = max(0, int(diag_subsample))
+    calibration_pilot_samples = int(calibration_pilot_samples)
+    if calibration_pilot_samples < 0:
+        raise ValueError(
+            f"calibration_pilot_samples must be >= 0. Got {calibration_pilot_samples}."
+        )
     if epsilon <= 0.0:
         raise ValueError(f"epsilon must be > 0. Got {epsilon}.")
     if total_trace_ema_decay < 0.0 or total_trace_ema_decay >= 1.0:
@@ -326,7 +330,7 @@ def get_ntk_scaled_loss_fn(
                     x_enc=x_enc,
                     u_dec=u_dec,
                     x_dec=x_dec,
-                    diag_subsample=diag_subsample,
+                    calibration_pilot_samples=calibration_pilot_samples,
                     key=k_subsample,
                 )
             )
@@ -449,7 +453,7 @@ class NTKDiagnosticMetric(Metric):
         estimate_total_trace: bool = False,
         n_loss_terms: int = 1,
         cv_threshold: float = 0.2,
-        diag_subsample: int = 0,
+        calibration_pilot_samples: int = 0,
         latent_noise_scale: float = 0.0,
     ):
         self.autoencoder = autoencoder
@@ -459,7 +463,11 @@ class NTKDiagnosticMetric(Metric):
         self.estimate_total_trace = bool(estimate_total_trace)
         self.n_loss_terms = max(1, int(n_loss_terms))
         self.cv_threshold = float(cv_threshold)
-        self.diag_subsample = max(0, int(diag_subsample))
+        self.calibration_pilot_samples = int(calibration_pilot_samples)
+        if self.calibration_pilot_samples < 0:
+            raise ValueError(
+                "calibration_pilot_samples must be >= 0."
+            )
         self.latent_noise_scale = float(latent_noise_scale)
 
     @property
@@ -559,7 +567,7 @@ class NTKDiagnosticMetric(Metric):
             x_enc=x_enc,
             u_dec=u_dec,
             x_dec=x_dec,
-            diag_subsample=self.diag_subsample,
+            calibration_pilot_samples=self.calibration_pilot_samples,
             key=k_subsample,
         )
         diag_elements = _compute_per_sample_ntk_diag(

@@ -21,10 +21,12 @@ nohup "$PYTHON_BIN" scripts/fae/fae_naive/train_attention.py \
   --encoder-mlp-dim 256 \
   --decoder-features 256,256,256 \
   --loss-type ntk_scaled \
+  --ntk-epsilon 1e-8 \
   --ntk-estimate-total-trace \
   --ntk-total-trace-ema-decay 0.0 \
   --ntk-calibration-interval 100 \
   --ntk-cv-threshold 0.2 \
+  --ntk-calibration-pilot-samples 8 \
   --masking-strategy random \
   --eval-masking-strategy same \
   --encoder-point-ratio-by-time 0.8,0.8,0.7,0.6,0.4,0.3,0.2,0.1 \

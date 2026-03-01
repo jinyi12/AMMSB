@@ -73,7 +73,7 @@ def test_ntk_scaled_loss_calibrates_then_reuses_trace():
         beta=1e-4,
         calibration_interval=2,
         cv_threshold=0.2,
-        diag_subsample=1,
+        calibration_pilot_samples=1,
     )
 
     _loss1, bs1 = loss_fn(
@@ -138,7 +138,7 @@ def test_ntk_scaled_denoiser_loss_calibration_cycle_updates_state():
         ambient_weight=0.0,
         calibration_interval=2,
         cv_threshold=0.2,
-        diag_subsample=1,
+        calibration_pilot_samples=1,
     )
 
     _loss1, bs1 = loss_fn(

@@ -320,11 +320,12 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        "--ntk-diag-subsample",
+        "--ntk-calibration-pilot-samples",
         type=int,
         default=0,
         help=(
-            "Samples used for NTK-diagonal calibration (0 = use full batch)."
+            "Samples used for NTK trace calibration at calibration steps "
+            "(0 = use full batch)."
         ),
     )
     parser.add_argument(
@@ -434,8 +435,10 @@ def validate_args(args: argparse.Namespace) -> None:
             raise ValueError("--ntk-calibration-interval must be >= 1 for --loss-type=ntk_scaled.")
         if args.ntk_cv_threshold <= 0.0:
             raise ValueError("--ntk-cv-threshold must be > 0 for --loss-type=ntk_scaled.")
-        if args.ntk_diag_subsample < 0:
-            raise ValueError("--ntk-diag-subsample must be >= 0 for --loss-type=ntk_scaled.")
+        if args.ntk_calibration_pilot_samples < 0:
+            raise ValueError(
+                "--ntk-calibration-pilot-samples must be >= 0 for --loss-type=ntk_scaled."
+            )
         if args.ntk_estimate_total_trace and args.ntk_scale_norm != 10.0:
             warnings.warn(
                 "--ntk-scale-norm is ignored when --ntk-estimate-total-trace is set "
@@ -456,8 +459,8 @@ def validate_args(args: argparse.Namespace) -> None:
             ntk_args_used.append("--ntk-calibration-interval")
         if args.ntk_cv_threshold != 0.2:
             ntk_args_used.append("--ntk-cv-threshold")
-        if args.ntk_diag_subsample != 0:
-            ntk_args_used.append("--ntk-diag-subsample")
+        if args.ntk_calibration_pilot_samples != 0:
+            ntk_args_used.append("--ntk-calibration-pilot-samples")
         if ntk_args_used:
             warnings.warn(
                 f"NTK arguments {ntk_args_used} are ignored when --loss-type={args.loss_type}.",

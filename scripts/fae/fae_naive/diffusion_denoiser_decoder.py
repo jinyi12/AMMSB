@@ -876,7 +876,7 @@ def get_ntk_scaled_denoiser_loss_fn(
     n_loss_terms: int = 1,
     calibration_interval: int = 100,
     cv_threshold: float = 0.2,
-    diag_subsample: int = 0,
+    calibration_pilot_samples: int = 0,
 ) -> Callable:
     """Denoiser objective with periodic exact NTK-diagonal calibration."""
     decoder = autoencoder.decoder
@@ -907,7 +907,7 @@ def get_ntk_scaled_denoiser_loss_fn(
     n_loss_terms = max(1, int(n_loss_terms))
     calibration_interval = max(1, int(calibration_interval))
     cv_threshold = float(cv_threshold)
-    diag_subsample = max(0, int(diag_subsample))
+    calibration_pilot_samples = int(calibration_pilot_samples)
     if scale_norm <= 0.0:
         raise ValueError(f"scale_norm must be > 0. Got {scale_norm}.")
     if epsilon <= 0.0:
@@ -919,6 +919,8 @@ def get_ntk_scaled_denoiser_loss_fn(
         )
     if cv_threshold <= 0.0:
         raise ValueError(f"cv_threshold must be > 0. Got {cv_threshold}.")
+    if calibration_pilot_samples < 0:
+        raise ValueError("calibration_pilot_samples must be >= 0.")
 
     use_prior = prior is not None
     if use_prior:
@@ -1003,8 +1005,8 @@ def get_ntk_scaled_denoiser_loss_fn(
         batch_size = u_dec.shape[0]
         n_diag = (
             batch_size
-            if diag_subsample <= 0 or diag_subsample >= batch_size
-            else int(diag_subsample)
+            if calibration_pilot_samples <= 0 or calibration_pilot_samples >= batch_size
+            else int(calibration_pilot_samples)
         )
         diag_batch_size = jnp.asarray(n_diag, dtype=jnp.int32)
 
@@ -1611,7 +1613,7 @@ def get_ntk_scaled_film_prior_loss_fn(
     n_loss_terms: int = 1,
     calibration_interval: int = 100,
     cv_threshold: float = 0.2,
-    diag_subsample: int = 0,
+    calibration_pilot_samples: int = 0,
 ) -> Callable:
     """NTK-scaled MSE loss for deterministic FiLM decoder + optional prior.
 
@@ -1627,10 +1629,12 @@ def get_ntk_scaled_film_prior_loss_fn(
     n_loss_terms = max(1, int(n_loss_terms))
     calibration_interval = max(1, int(calibration_interval))
     cv_threshold = float(cv_threshold)
-    diag_subsample = max(0, int(diag_subsample))
+    calibration_pilot_samples = int(calibration_pilot_samples)
     beta = float(beta)
     if cv_threshold <= 0.0:
         raise ValueError(f"cv_threshold must be > 0. Got {cv_threshold}.")
+    if calibration_pilot_samples < 0:
+        raise ValueError("calibration_pilot_samples must be >= 0.")
 
     def loss_fn(params, key, batch_stats, u_enc, x_enc, u_dec, x_dec):
         ntk_state = (batch_stats if batch_stats else {}).get("ntk", {})
@@ -1643,8 +1647,8 @@ def get_ntk_scaled_film_prior_loss_fn(
         batch_size = int(u_dec.shape[0])
         n_diag = (
             batch_size
-            if diag_subsample <= 0 or diag_subsample >= batch_size
-            else int(diag_subsample)
+            if calibration_pilot_samples <= 0 or calibration_pilot_samples >= batch_size
+            else int(calibration_pilot_samples)
         )
         diag_batch_size = jnp.asarray(n_diag, dtype=jnp.int32)
 
