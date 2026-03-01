@@ -629,6 +629,12 @@ def _get_stats_or_empty(batch_stats, name: str):
     return {}
 
 
+def _tree_squared_l2_norm(tree) -> jax.Array:
+    return jnp.sum(
+        jnp.array([jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(tree)])
+    )
+
+
 def get_denoiser_loss_fn(
     autoencoder,
     beta: float = 1e-4,
@@ -1131,21 +1137,44 @@ def get_ntk_scaled_denoiser_loss_fn(
                     x_pred=x_pred_n, z_t=z_t_n, u_dec=u_dec_b, t=t_b
                 )[0]
 
-            per_sample_grads = jax.vmap(
-                jax.grad(per_sample_recon_loss),
-                in_axes=(None, 0, 0, 0, 0, 0, 0, 0, 0),
-            )(
-                params,
-                u_enc_diag,
-                x_enc_diag,
-                u_dec_diag,
-                x_dec_diag,
-                t_diag,
-                noise_diag,
-                z0_noise_diag,
-                grad_keys,
+            def scan_step(_carry, xs):
+                (
+                    u_enc_n,
+                    x_enc_n,
+                    u_dec_n,
+                    x_dec_n,
+                    t_n,
+                    noise_n,
+                    z0_noise_n,
+                    sample_key,
+                ) = xs
+                grads_n = jax.grad(per_sample_recon_loss)(
+                    params,
+                    u_enc_n,
+                    x_enc_n,
+                    u_dec_n,
+                    x_dec_n,
+                    t_n,
+                    noise_n,
+                    z0_noise_n,
+                    sample_key,
+                )
+                return None, _tree_squared_l2_norm(grads_n)
+
+            _, diag_elements = jax.lax.scan(
+                scan_step,
+                None,
+                (
+                    u_enc_diag,
+                    x_enc_diag,
+                    u_dec_diag,
+                    x_dec_diag,
+                    t_diag,
+                    noise_diag,
+                    z0_noise_diag,
+                    grad_keys,
+                ),
             )
-            diag_elements = _tree_squared_l2_norm_per_sample(per_sample_grads)
             diag_elements = jnp.where(jnp.isfinite(diag_elements), diag_elements, 0.0)
             diag_stats = compute_ntk_diag_stats(
                 diag_elements,
@@ -1705,19 +1734,38 @@ def get_ntk_scaled_film_prior_loss_fn(
                 )
                 return jnp.mean((u_pred_n - u_dec_b) ** 2)
 
-            per_sample_grads = jax.vmap(
-                jax.grad(per_sample_loss),
-                in_axes=(None, 0, 0, 0, 0, 0, 0),
-            )(
-                params,
-                u_enc_diag,
-                x_enc_diag,
-                u_dec_diag,
-                x_dec_diag,
-                z0_noise_diag,
-                grad_keys,
+            def scan_step(_carry, xs):
+                (
+                    u_enc_n,
+                    x_enc_n,
+                    u_dec_n,
+                    x_dec_n,
+                    z0_noise_n,
+                    sample_key,
+                ) = xs
+                grads_n = jax.grad(per_sample_loss)(
+                    params,
+                    u_enc_n,
+                    x_enc_n,
+                    u_dec_n,
+                    x_dec_n,
+                    z0_noise_n,
+                    sample_key,
+                )
+                return None, _tree_squared_l2_norm(grads_n)
+
+            _, diag_elements = jax.lax.scan(
+                scan_step,
+                None,
+                (
+                    u_enc_diag,
+                    x_enc_diag,
+                    u_dec_diag,
+                    x_dec_diag,
+                    z0_noise_diag,
+                    grad_keys,
+                ),
             )
-            diag_elements = _tree_squared_l2_norm_per_sample(per_sample_grads)
             diag_elements = jnp.where(jnp.isfinite(diag_elements), diag_elements, 0.0)
             diag_stats = compute_ntk_diag_stats(
                 diag_elements,

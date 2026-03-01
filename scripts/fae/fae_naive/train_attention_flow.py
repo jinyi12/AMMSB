@@ -575,6 +575,7 @@ def run_training(
 
     print("\nStarting training ...")
     key, subkey = jax.random.split(key)
+    fit_verbose = "metrics" if wandb_run is not None else "full"
     result = trainer.fit(
         key=subkey,
         lr=args.lr,
@@ -582,7 +583,7 @@ def run_training(
         lr_decay_factor=args.lr_decay_factor,
         max_step=args.max_steps,
         eval_interval=args.eval_interval,
-        verbose="full",
+        verbose=fit_verbose,
     )
 
     state = result["state"]

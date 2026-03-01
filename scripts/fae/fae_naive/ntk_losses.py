@@ -202,12 +202,18 @@ def _compute_per_sample_ntk_diag(
         )
         return jnp.mean(jnp.square(u_pred_n - u_dec_b))
 
-    per_sample_grads = jax.vmap(
-        jax.grad(per_sample_loss),
-        in_axes=(None, 0, 0, 0, 0, 0),
-    )(params, u_enc, x_enc, u_dec, x_dec, grad_keys)
+    def scan_step(_carry, xs):
+        u_enc_n, x_enc_n, u_dec_n, x_dec_n, sample_key = xs
+        grads_n = jax.grad(per_sample_loss)(
+            params, u_enc_n, x_enc_n, u_dec_n, x_dec_n, sample_key
+        )
+        return None, _tree_squared_l2_norm(grads_n)
 
-    diag_elements = _tree_squared_l2_norm_per_sample(per_sample_grads)
+    _, diag_elements = jax.lax.scan(
+        scan_step,
+        None,
+        (u_enc, x_enc, u_dec, x_dec, grad_keys),
+    )
     diag_elements = jnp.where(jnp.isfinite(diag_elements), diag_elements, 0.0)
     return diag_elements, u_pred, latents, updated_batch_stats
 
