@@ -877,6 +877,7 @@ def get_ntk_scaled_denoiser_loss_fn(
     calibration_interval: int = 100,
     cv_threshold: float = 0.2,
     calibration_pilot_samples: int = 0,
+    hutchinson_probes: int = 1,
 ) -> Callable:
     """Denoiser objective with periodic exact NTK-diagonal calibration."""
     decoder = autoencoder.decoder
@@ -908,6 +909,7 @@ def get_ntk_scaled_denoiser_loss_fn(
     calibration_interval = max(1, int(calibration_interval))
     cv_threshold = float(cv_threshold)
     calibration_pilot_samples = int(calibration_pilot_samples)
+    hutchinson_probes = int(hutchinson_probes)
     if scale_norm <= 0.0:
         raise ValueError(f"scale_norm must be > 0. Got {scale_norm}.")
     if epsilon <= 0.0:
@@ -921,6 +923,8 @@ def get_ntk_scaled_denoiser_loss_fn(
         raise ValueError(f"cv_threshold must be > 0. Got {cv_threshold}.")
     if calibration_pilot_samples < 0:
         raise ValueError("calibration_pilot_samples must be >= 0.")
+    if hutchinson_probes < 1:
+        raise ValueError("hutchinson_probes must be >= 1.")
 
     use_prior = prior is not None
     if use_prior:
@@ -1120,7 +1124,8 @@ def get_ntk_scaled_denoiser_loss_fn(
                 t_n,
                 noise_n,
                 z0_noise_n,
-                sample_key,
+                k_enc_n,
+                k_probe_n,
             ):
                 u_enc_b = u_enc_n[None, ...]
                 x_enc_b = x_enc_n[None, ...]
@@ -1128,8 +1133,6 @@ def get_ntk_scaled_denoiser_loss_fn(
                 x_dec_b = x_dec_n[None, ...]
                 t_b = t_n[None, ...]
                 noise_b = noise_n[None, ...]
-
-                k_enc_n, k_probe_n = jax.random.split(sample_key)
                 latents_n, _ = _call_autoencoder_fn(
                     params=p,
                     batch_stats=batch_stats,
@@ -1186,18 +1189,26 @@ def get_ntk_scaled_denoiser_loss_fn(
                     z0_noise_n,
                     sample_key,
                 ) = xs
-                grads_n = jax.grad(per_sample_probe_scalar)(
-                    params,
-                    u_enc_n,
-                    x_enc_n,
-                    u_dec_n,
-                    x_dec_n,
-                    t_n,
-                    noise_n,
-                    z0_noise_n,
-                    sample_key,
-                )
-                return None, _tree_squared_l2_norm(grads_n)
+                k_enc_n, k_probe_root = jax.random.split(sample_key)
+                probe_keys = jax.random.split(k_probe_root, hutchinson_probes)
+
+                def probe_step(_probe_carry, probe_key):
+                    grads_n = jax.grad(per_sample_probe_scalar)(
+                        params,
+                        u_enc_n,
+                        x_enc_n,
+                        u_dec_n,
+                        x_dec_n,
+                        t_n,
+                        noise_n,
+                        z0_noise_n,
+                        k_enc_n,
+                        probe_key,
+                    )
+                    return None, _tree_squared_l2_norm(grads_n)
+
+                _, probe_norms = jax.lax.scan(probe_step, None, probe_keys)
+                return None, jnp.mean(probe_norms)
 
             _, diag_elements = jax.lax.scan(
                 scan_step,
@@ -1614,6 +1625,7 @@ def get_ntk_scaled_film_prior_loss_fn(
     calibration_interval: int = 100,
     cv_threshold: float = 0.2,
     calibration_pilot_samples: int = 0,
+    hutchinson_probes: int = 1,
 ) -> Callable:
     """NTK-scaled MSE loss for deterministic FiLM decoder + optional prior.
 
@@ -1630,11 +1642,14 @@ def get_ntk_scaled_film_prior_loss_fn(
     calibration_interval = max(1, int(calibration_interval))
     cv_threshold = float(cv_threshold)
     calibration_pilot_samples = int(calibration_pilot_samples)
+    hutchinson_probes = int(hutchinson_probes)
     beta = float(beta)
     if cv_threshold <= 0.0:
         raise ValueError(f"cv_threshold must be > 0. Got {cv_threshold}.")
     if calibration_pilot_samples < 0:
         raise ValueError("calibration_pilot_samples must be >= 0.")
+    if hutchinson_probes < 1:
+        raise ValueError("hutchinson_probes must be >= 1.")
 
     def loss_fn(params, key, batch_stats, u_enc, x_enc, u_dec, x_dec):
         ntk_state = (batch_stats if batch_stats else {}).get("ntk", {})
@@ -1742,14 +1757,13 @@ def get_ntk_scaled_film_prior_loss_fn(
                 u_dec_n,
                 x_dec_n,
                 z0_noise_n,
-                sample_key,
+                k_enc_n,
+                k_probe_n,
             ):
                 u_enc_b = u_enc_n[None, ...]
                 x_enc_b = x_enc_n[None, ...]
                 u_dec_b = u_dec_n[None, ...]
                 x_dec_b = x_dec_n[None, ...]
-
-                k_enc_n, k_probe_n = jax.random.split(sample_key)
                 latents_n, _ = _call_autoencoder_fn(
                     params=p,
                     batch_stats=batch_stats,
@@ -1792,16 +1806,24 @@ def get_ntk_scaled_film_prior_loss_fn(
                     z0_noise_n,
                     sample_key,
                 ) = xs
-                grads_n = jax.grad(per_sample_probe_scalar)(
-                    params,
-                    u_enc_n,
-                    x_enc_n,
-                    u_dec_n,
-                    x_dec_n,
-                    z0_noise_n,
-                    sample_key,
-                )
-                return None, _tree_squared_l2_norm(grads_n)
+                k_enc_n, k_probe_root = jax.random.split(sample_key)
+                probe_keys = jax.random.split(k_probe_root, hutchinson_probes)
+
+                def probe_step(_probe_carry, probe_key):
+                    grads_n = jax.grad(per_sample_probe_scalar)(
+                        params,
+                        u_enc_n,
+                        x_enc_n,
+                        u_dec_n,
+                        x_dec_n,
+                        z0_noise_n,
+                        k_enc_n,
+                        probe_key,
+                    )
+                    return None, _tree_squared_l2_norm(grads_n)
+
+                _, probe_norms = jax.lax.scan(probe_step, None, probe_keys)
+                return None, jnp.mean(probe_norms)
 
             _, diag_elements = jax.lax.scan(
                 scan_step,

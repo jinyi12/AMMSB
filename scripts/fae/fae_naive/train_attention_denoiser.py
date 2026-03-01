@@ -226,6 +226,15 @@ def build_parser() -> argparse.ArgumentParser:
             "(0 = use full batch)."
         ),
     )
+    parser.add_argument(
+        "--ntk-hutchinson-probes",
+        type=int,
+        default=1,
+        help=(
+            "Hutchinson probes per calibration sample for NTK trace estimation "
+            "(higher = lower variance, higher compute)."
+        ),
+    )
 
     # -- Training ----------------------------------------------------------
     parser.add_argument("--optimizer", type=str, default="adam",
@@ -391,6 +400,10 @@ def validate_args(args: argparse.Namespace) -> None:
             raise ValueError(
                 "--ntk-calibration-pilot-samples must be >= 0 for --loss-type=ntk_scaled."
             )
+        if args.ntk_hutchinson_probes < 1:
+            raise ValueError(
+                "--ntk-hutchinson-probes must be >= 1 for --loss-type=ntk_scaled."
+            )
     else:
         ntk_args_used = []
         if args.ntk_scale_norm != 10.0:
@@ -407,6 +420,8 @@ def validate_args(args: argparse.Namespace) -> None:
             ntk_args_used.append("--ntk-cv-threshold")
         if args.ntk_calibration_pilot_samples != 0:
             ntk_args_used.append("--ntk-calibration-pilot-samples")
+        if args.ntk_hutchinson_probes != 1:
+            ntk_args_used.append("--ntk-hutchinson-probes")
         if ntk_args_used:
             warnings.warn(
                 f"NTK arguments {ntk_args_used} ignored when --loss-type={args.loss_type}.",
@@ -496,6 +511,7 @@ def _film_prior_setup(autoencoder, args):
             calibration_interval=int(args.ntk_calibration_interval),
             cv_threshold=float(args.ntk_cv_threshold),
             calibration_pilot_samples=int(args.ntk_calibration_pilot_samples),
+            hutchinson_probes=int(args.ntk_hutchinson_probes),
         )
     else:
         loss_fn = get_film_prior_loss_fn(
@@ -568,6 +584,7 @@ def _denoiser_setup(autoencoder, args):
             calibration_interval=int(args.ntk_calibration_interval),
             cv_threshold=float(args.ntk_cv_threshold),
             calibration_pilot_samples=int(args.ntk_calibration_pilot_samples),
+            hutchinson_probes=int(args.ntk_hutchinson_probes),
         )
     else:
         loss_fn = get_denoiser_loss_fn(

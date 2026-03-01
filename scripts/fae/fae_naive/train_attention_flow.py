@@ -441,6 +441,7 @@ def run_training(
     ntk_calibration_pilot_samples = int(
         getattr(args, "ntk_calibration_pilot_samples", 0)
     )
+    ntk_hutchinson_probes = int(getattr(args, "ntk_hutchinson_probes", 1))
 
     if getattr(args, "loss_type", "l2") == "sobolev_h1":
         est = _estimate_sobolev_balance_from_dataset(
@@ -514,6 +515,7 @@ def run_training(
                 calibration_interval=int(args.ntk_calibration_interval),
                 cv_threshold=float(args.ntk_cv_threshold),
                 calibration_pilot_samples=ntk_calibration_pilot_samples,
+                hutchinson_probes=ntk_hutchinson_probes,
             )
         else:
             raise ValueError(f"Unsupported --loss-type={args.loss_type}")
@@ -530,6 +532,7 @@ def run_training(
                     n_loss_terms=n_loss_terms,
                     cv_threshold=float(args.ntk_cv_threshold),
                     calibration_pilot_samples=ntk_calibration_pilot_samples,
+                    hutchinson_probes=ntk_hutchinson_probes,
                     latent_noise_scale=latent_noise_scale,
                 )
             )

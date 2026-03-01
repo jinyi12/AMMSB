@@ -136,6 +136,7 @@ def _compute_per_sample_ntk_diag(
     x_dec: jax.Array,
     key: jax.Array,
     latent_noise_scale: float = 0.0,
+    hutchinson_probes: int = 1,
 ) -> jax.Array:
     """Estimate per-sample NTK trace-per-output using residual Jacobian probes.
 
@@ -145,10 +146,20 @@ def _compute_per_sample_ntk_diag(
     (u_pred - u_dec) for that sample with M_n scalar components.
     """
     batch_size = int(u_enc.shape[0])
+    n_probes = max(1, int(hutchinson_probes))
     grad_keys = jax.random.split(key, batch_size)
 
-    def per_sample_probe_scalar(p, u_enc_n, x_enc_n, u_dec_n, x_dec_n, sample_key):
-        k_enc, k_dec, k_noise, k_probe = jax.random.split(sample_key, 4)
+    def per_sample_probe_scalar(
+        p,
+        u_enc_n,
+        x_enc_n,
+        u_dec_n,
+        x_dec_n,
+        k_enc,
+        k_dec,
+        k_noise,
+        k_probe,
+    ):
         u_enc_b = u_enc_n[None, ...]
         x_enc_b = x_enc_n[None, ...]
         u_dec_b = u_dec_n[None, ...]
@@ -185,10 +196,25 @@ def _compute_per_sample_ntk_diag(
 
     def scan_step(_carry, xs):
         u_enc_n, x_enc_n, u_dec_n, x_dec_n, sample_key = xs
-        grads_n = jax.grad(per_sample_probe_scalar)(
-            params, u_enc_n, x_enc_n, u_dec_n, x_dec_n, sample_key
-        )
-        return None, _tree_squared_l2_norm(grads_n)
+        k_enc_n, k_dec_n, k_noise_n, k_probe_root = jax.random.split(sample_key, 4)
+        probe_keys = jax.random.split(k_probe_root, n_probes)
+
+        def probe_step(_probe_carry, probe_key):
+            grads_n = jax.grad(per_sample_probe_scalar)(
+                params,
+                u_enc_n,
+                x_enc_n,
+                u_dec_n,
+                x_dec_n,
+                k_enc_n,
+                k_dec_n,
+                k_noise_n,
+                probe_key,
+            )
+            return None, _tree_squared_l2_norm(grads_n)
+
+        _, probe_norms = jax.lax.scan(probe_step, None, probe_keys)
+        return None, jnp.mean(probe_norms)
 
     _, diag_elements = jax.lax.scan(
         scan_step,
@@ -242,6 +268,7 @@ def get_ntk_scaled_loss_fn(
     calibration_interval: int = 100,
     cv_threshold: float = 0.2,
     calibration_pilot_samples: int = 0,
+    hutchinson_probes: int = 1,
 ) -> Callable:
     """Return NTK-scaled loss with periodic exact NTK-diagonal calibration.
 
@@ -264,10 +291,13 @@ def get_ntk_scaled_loss_fn(
     calibration_interval = max(1, int(calibration_interval))
     cv_threshold = float(cv_threshold)
     calibration_pilot_samples = int(calibration_pilot_samples)
+    hutchinson_probes = int(hutchinson_probes)
     if calibration_pilot_samples < 0:
         raise ValueError(
             f"calibration_pilot_samples must be >= 0. Got {calibration_pilot_samples}."
         )
+    if hutchinson_probes < 1:
+        raise ValueError(f"hutchinson_probes must be >= 1. Got {hutchinson_probes}.")
     if epsilon <= 0.0:
         raise ValueError(f"epsilon must be > 0. Got {epsilon}.")
     if total_trace_ema_decay < 0.0 or total_trace_ema_decay >= 1.0:
@@ -344,6 +374,7 @@ def get_ntk_scaled_loss_fn(
                 x_dec=x_dec_diag,
                 key=k_diag,
                 latent_noise_scale=latent_noise_scale,
+                hutchinson_probes=hutchinson_probes,
             )
             diag_stats = compute_ntk_diag_stats(
                 diag_elements,
@@ -455,6 +486,7 @@ class NTKDiagnosticMetric(Metric):
         cv_threshold: float = 0.2,
         calibration_pilot_samples: int = 0,
         latent_noise_scale: float = 0.0,
+        hutchinson_probes: int = 1,
     ):
         self.autoencoder = autoencoder
         self.scale_norm = float(scale_norm)
@@ -468,6 +500,9 @@ class NTKDiagnosticMetric(Metric):
             raise ValueError(
                 "calibration_pilot_samples must be >= 0."
             )
+        self.hutchinson_probes = int(hutchinson_probes)
+        if self.hutchinson_probes < 1:
+            raise ValueError("hutchinson_probes must be >= 1.")
         self.latent_noise_scale = float(latent_noise_scale)
 
     @property
@@ -580,6 +615,7 @@ class NTKDiagnosticMetric(Metric):
             x_dec=x_dec_diag,
             key=k_diag,
             latent_noise_scale=self.latent_noise_scale,
+            hutchinson_probes=self.hutchinson_probes,
         )
         diag_stats = compute_ntk_diag_stats(
             diag_elements,

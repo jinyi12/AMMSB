@@ -50,6 +50,7 @@ nohup "$PYTHON_BIN" scripts/fae/fae_naive/train_attention.py \
   --ntk-calibration-interval 100 \
   --ntk-cv-threshold 0.2 \
   --ntk-calibration-pilot-samples 8 \
+  --ntk-hutchinson-probes 1 \
   --masking-strategy random \
   --eval-masking-strategy same \
   --encoder-point-ratio-by-time 0.8,0.8,0.7,0.6,0.4,0.3,0.2,0.1 \

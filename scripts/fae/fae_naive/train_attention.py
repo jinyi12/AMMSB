@@ -329,6 +329,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--ntk-hutchinson-probes",
+        type=int,
+        default=1,
+        help=(
+            "Hutchinson probes per calibration sample for NTK trace estimation "
+            "(higher = lower variance, higher compute)."
+        ),
+    )
+    parser.add_argument(
         "--latent-noise-scale",
         type=float,
         default=0.0,
@@ -439,6 +448,10 @@ def validate_args(args: argparse.Namespace) -> None:
             raise ValueError(
                 "--ntk-calibration-pilot-samples must be >= 0 for --loss-type=ntk_scaled."
             )
+        if args.ntk_hutchinson_probes < 1:
+            raise ValueError(
+                "--ntk-hutchinson-probes must be >= 1 for --loss-type=ntk_scaled."
+            )
         if args.ntk_estimate_total_trace and args.ntk_scale_norm != 10.0:
             warnings.warn(
                 "--ntk-scale-norm is ignored when --ntk-estimate-total-trace is set "
@@ -461,6 +474,8 @@ def validate_args(args: argparse.Namespace) -> None:
             ntk_args_used.append("--ntk-cv-threshold")
         if args.ntk_calibration_pilot_samples != 0:
             ntk_args_used.append("--ntk-calibration-pilot-samples")
+        if args.ntk_hutchinson_probes != 1:
+            ntk_args_used.append("--ntk-hutchinson-probes")
         if ntk_args_used:
             warnings.warn(
                 f"NTK arguments {ntk_args_used} are ignored when --loss-type={args.loss_type}.",
