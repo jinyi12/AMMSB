@@ -302,30 +302,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="EMA decay in [0, 1) for total-trace estimation (--loss-type=ntk_scaled).",
     )
     parser.add_argument(
-        "--ntk-calibration-interval",
+        "--ntk-trace-update-interval",
         type=int,
         default=100,
         help=(
-            "Steps between exact NTK diagonal calibration passes. "
-            "Between calibrations, the NTK weight is held fixed."
-        ),
-    )
-    parser.add_argument(
-        "--ntk-cv-threshold",
-        type=float,
-        default=0.2,
-        help=(
-            "Maximum acceptable coefficient of variation for the NTK trace "
-            "batch-mean estimator diagnostic."
-        ),
-    )
-    parser.add_argument(
-        "--ntk-calibration-pilot-samples",
-        type=int,
-        default=0,
-        help=(
-            "Samples used for NTK trace calibration at calibration steps "
-            "(0 = use full batch)."
+            "Steps between global NTK trace refreshes. "
+            "Between refreshes, the NTK weight is held fixed."
         ),
     )
     parser.add_argument(
@@ -333,7 +315,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=1,
         help=(
-            "Hutchinson probes per calibration sample for NTK trace estimation "
+            "Hutchinson probes per global NTK trace estimate "
             "(higher = lower variance, higher compute)."
         ),
     )
@@ -440,14 +422,8 @@ def validate_args(args: argparse.Namespace) -> None:
             raise ValueError("--ntk-epsilon must be > 0 for --loss-type=ntk_scaled.")
         if args.ntk_total_trace_ema_decay < 0.0 or args.ntk_total_trace_ema_decay >= 1.0:
             raise ValueError("--ntk-total-trace-ema-decay must be in [0, 1).")
-        if args.ntk_calibration_interval < 1:
-            raise ValueError("--ntk-calibration-interval must be >= 1 for --loss-type=ntk_scaled.")
-        if args.ntk_cv_threshold <= 0.0:
-            raise ValueError("--ntk-cv-threshold must be > 0 for --loss-type=ntk_scaled.")
-        if args.ntk_calibration_pilot_samples < 0:
-            raise ValueError(
-                "--ntk-calibration-pilot-samples must be >= 0 for --loss-type=ntk_scaled."
-            )
+        if args.ntk_trace_update_interval < 1:
+            raise ValueError("--ntk-trace-update-interval must be >= 1 for --loss-type=ntk_scaled.")
         if args.ntk_hutchinson_probes < 1:
             raise ValueError(
                 "--ntk-hutchinson-probes must be >= 1 for --loss-type=ntk_scaled."
@@ -468,12 +444,8 @@ def validate_args(args: argparse.Namespace) -> None:
             ntk_args_used.append("--ntk-estimate-total-trace")
         if args.ntk_total_trace_ema_decay != 0.99:
             ntk_args_used.append("--ntk-total-trace-ema-decay")
-        if args.ntk_calibration_interval != 100:
-            ntk_args_used.append("--ntk-calibration-interval")
-        if args.ntk_cv_threshold != 0.2:
-            ntk_args_used.append("--ntk-cv-threshold")
-        if args.ntk_calibration_pilot_samples != 0:
-            ntk_args_used.append("--ntk-calibration-pilot-samples")
+        if args.ntk_trace_update_interval != 100:
+            ntk_args_used.append("--ntk-trace-update-interval")
         if args.ntk_hutchinson_probes != 1:
             ntk_args_used.append("--ntk-hutchinson-probes")
         if ntk_args_used:

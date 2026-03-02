@@ -438,9 +438,6 @@ def run_training(
     if args.training_mode == "multi_scale" and hasattr(train_dataset, "n_times"):
         n_loss_terms = max(1, int(train_dataset.n_times))
     setattr(args, "ntk_n_loss_terms", int(n_loss_terms))
-    ntk_calibration_pilot_samples = int(
-        getattr(args, "ntk_calibration_pilot_samples", 0)
-    )
     ntk_hutchinson_probes = int(getattr(args, "ntk_hutchinson_probes", 1))
 
     if getattr(args, "loss_type", "l2") == "sobolev_h1":
@@ -512,9 +509,7 @@ def run_training(
                 total_trace_ema_decay=float(args.ntk_total_trace_ema_decay),
                 n_loss_terms=n_loss_terms,
                 latent_noise_scale=latent_noise_scale,
-                calibration_interval=int(args.ntk_calibration_interval),
-                cv_threshold=float(args.ntk_cv_threshold),
-                calibration_pilot_samples=ntk_calibration_pilot_samples,
+                trace_update_interval=int(args.ntk_trace_update_interval),
                 hutchinson_probes=ntk_hutchinson_probes,
             )
         else:
@@ -530,8 +525,7 @@ def run_training(
                     n_batches=1,
                     estimate_total_trace=bool(args.ntk_estimate_total_trace),
                     n_loss_terms=n_loss_terms,
-                    cv_threshold=float(args.ntk_cv_threshold),
-                    calibration_pilot_samples=ntk_calibration_pilot_samples,
+                    trace_update_interval=int(args.ntk_trace_update_interval),
                     hutchinson_probes=ntk_hutchinson_probes,
                     latent_noise_scale=latent_noise_scale,
                 )

@@ -1,4 +1,4 @@
-"""Tests for CLT-based exact NTK diagonal calibration."""
+"""Tests for interval-gated global Hutchinson NTK scaling."""
 
 from __future__ import annotations
 
@@ -18,10 +18,7 @@ jnp = pytest.importorskip("jax.numpy")
 from scripts.fae.fae_naive.diffusion_denoiser_decoder import (
     get_ntk_scaled_denoiser_loss_fn,
 )
-from scripts.fae.fae_naive.ntk_losses import (
-    compute_ntk_diag_stats,
-    get_ntk_scaled_loss_fn,
-)
+from scripts.fae.fae_naive.ntk_losses import get_ntk_scaled_loss_fn
 from scripts.fae.fae_naive.train_attention_components import build_autoencoder
 
 
@@ -34,22 +31,9 @@ def _make_tiny_batch(key, *, batch_size=2, n_enc=6, n_dec=7):
     return u_enc, x_enc, u_dec, x_dec
 
 
-def test_compute_ntk_diag_stats_matches_closed_form():
-    diag = jnp.array([1.0, 3.0], dtype=jnp.float32)  # mean=2, std=1, cv=0.5
-    out = compute_ntk_diag_stats(diag, batch_size=2, cv_threshold=0.2)
-
-    assert np.isclose(float(out["mean"]), 2.0, atol=1e-6)
-    assert np.isclose(float(out["std"]), 1.0, atol=1e-6)
-    assert np.isclose(float(out["cv"]), 0.5, atol=1e-6)
-    assert np.isclose(float(out["cv_of_mean"]), 0.5 / np.sqrt(2.0), atol=1e-6)
-    # ceil((cv / threshold)^2) = ceil((0.5 / 0.2)^2) = ceil(6.25) = 7
-    assert int(out["min_batch_size"]) == 7
-    assert int(out["batch_sufficient"]) == 0
-
-
-def test_ntk_scaled_loss_calibrates_then_reuses_trace():
+def test_ntk_scaled_loss_updates_on_interval_and_reuses_between_updates():
     key = jax.random.PRNGKey(0)
-    key, k_model, k_batch, k_init, k_step1, k_step2 = jax.random.split(key, 6)
+    key, k_model, k_batch, k_init, k_step1, k_step2, k_step3 = jax.random.split(key, 7)
 
     autoencoder, _ = build_autoencoder(
         k_model,
@@ -71,41 +55,69 @@ def test_ntk_scaled_loss_calibrates_then_reuses_trace():
     loss_fn = get_ntk_scaled_loss_fn(
         autoencoder=autoencoder,
         beta=1e-4,
-        calibration_interval=2,
-        cv_threshold=0.2,
-        calibration_pilot_samples=1,
+        trace_update_interval=2,
+        hutchinson_probes=1,
     )
 
-    _loss1, bs1 = loss_fn(
-        params,
-        key=k_step1,
-        batch_stats=batch_stats,
-        u_enc=u_enc,
-        x_enc=x_enc,
-        u_dec=u_dec,
-        x_dec=x_dec,
-    )
-    _loss2, bs2 = loss_fn(
-        params,
-        key=k_step2,
-        batch_stats=bs1,
-        u_enc=u_enc,
-        x_enc=x_enc,
-        u_dec=u_dec,
-        x_dec=x_dec,
-    )
+    _loss1, bs1 = loss_fn(params, k_step1, batch_stats, u_enc, x_enc, u_dec, x_dec)
+    _loss2, bs2 = loss_fn(params, k_step2, bs1, u_enc, x_enc, u_dec, x_dec)
+    _loss3, bs3 = loss_fn(params, k_step3, bs2, u_enc, x_enc, u_dec, x_dec)
 
     ntk1 = bs1["ntk"]
     ntk2 = bs2["ntk"]
+    ntk3 = bs3["ntk"]
+
     assert int(ntk1["step"]) == 1
     assert int(ntk2["step"]) == 2
-    assert int(ntk1["is_calibration"]) == 1
-    assert int(ntk2["is_calibration"]) == 0
-    # Step 2 is frozen-trace phase for interval=2, so it should reuse step-1 trace.
+    assert int(ntk3["step"]) == 3
+
+    assert int(ntk1["is_trace_update"]) == 1
+    assert int(ntk2["is_trace_update"]) == 0
+    assert int(ntk3["is_trace_update"]) == 1
+
     assert np.isclose(float(ntk2["trace"]), float(ntk1["trace"]), rtol=1e-6, atol=1e-8)
+    assert np.isfinite(float(ntk3["trace"]))
+
+    expected_keys = {"step", "trace", "trace_ema", "total_trace_est", "weight", "is_trace_update"}
+    assert set(ntk3.keys()) == expected_keys
 
 
-def test_ntk_scaled_denoiser_loss_calibration_cycle_updates_state():
+def test_ntk_scaled_loss_multi_probe_path_runs_and_is_finite():
+    key = jax.random.PRNGKey(2)
+    key, k_model, k_batch, k_init, k_step = jax.random.split(key, 5)
+
+    autoencoder, _ = build_autoencoder(
+        k_model,
+        latent_dim=4,
+        n_freqs=8,
+        fourier_sigma=1.0,
+        decoder_features=(16, 16),
+        pooling_type="deepset",
+        encoder_mlp_dim=16,
+        encoder_mlp_layers=1,
+        decoder_type="standard",
+    )
+    u_enc, x_enc, u_dec, x_dec = _make_tiny_batch(k_batch)
+
+    variables = autoencoder.init(k_init, u_enc, x_enc, x_dec, train=True)
+    params = variables["params"]
+    batch_stats = variables.get("batch_stats", {})
+
+    loss_fn = get_ntk_scaled_loss_fn(
+        autoencoder=autoencoder,
+        beta=1e-4,
+        trace_update_interval=1,
+        hutchinson_probes=3,
+    )
+
+    _loss, bs = loss_fn(params, k_step, batch_stats, u_enc, x_enc, u_dec, x_dec)
+    ntk = bs["ntk"]
+    assert int(ntk["is_trace_update"]) == 1
+    assert np.isfinite(float(ntk["trace"]))
+    assert np.isfinite(float(ntk["weight"]))
+
+
+def test_ntk_scaled_denoiser_loss_updates_on_interval_and_reuses_between_updates():
     key = jax.random.PRNGKey(1)
     key, k_model, k_batch, k_init, k_step1, k_step2 = jax.random.split(key, 6)
 
@@ -136,9 +148,8 @@ def test_ntk_scaled_denoiser_loss_calibration_cycle_updates_state():
         velocity_weight=1.0,
         x0_weight=0.0,
         ambient_weight=0.0,
-        calibration_interval=2,
-        cv_threshold=0.2,
-        calibration_pilot_samples=1,
+        trace_update_interval=2,
+        hutchinson_probes=2,
     )
 
     _loss1, bs1 = loss_fn(
@@ -164,7 +175,11 @@ def test_ntk_scaled_denoiser_loss_calibration_cycle_updates_state():
     ntk2 = bs2["ntk"]
     assert int(ntk1["step"]) == 1
     assert int(ntk2["step"]) == 2
-    assert int(ntk1["is_calibration"]) == 1
-    assert int(ntk2["is_calibration"]) == 0
+    assert int(ntk1["is_trace_update"]) == 1
+    assert int(ntk2["is_trace_update"]) == 0
+    assert np.isclose(float(ntk2["trace"]), float(ntk1["trace"]), rtol=1e-6, atol=1e-8)
     assert np.isfinite(float(ntk1["trace"]))
-    assert np.isfinite(float(ntk2["trace"]))
+    assert np.isfinite(float(ntk1["weight"]))
+
+    expected_keys = {"step", "trace", "trace_ema", "total_trace_est", "weight", "is_trace_update"}
+    assert set(ntk2.keys()) == expected_keys

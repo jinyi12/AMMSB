@@ -41,9 +41,7 @@ for SIGMA in "${NOISE_LEVELS[@]}"; do
         --ntk-epsilon 1e-8 \
         --ntk-estimate-total-trace \
         --ntk-total-trace-ema-decay 0.0 \
-        --ntk-calibration-interval 100 \
-        --ntk-cv-threshold 0.2 \
-        --ntk-calibration-pilot-samples 8 \
+        --ntk-trace-update-interval 100 \
         --ntk-hutchinson-probes 1 \
         --masking-strategy random \
         --eval-masking-strategy same \
