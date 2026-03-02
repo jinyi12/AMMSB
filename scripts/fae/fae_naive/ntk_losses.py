@@ -69,6 +69,151 @@ def _forward_only(
     return u_pred, latents, updated_batch_stats
 
 
+def compute_ntk_diag_stats(
+    diag_elements: jax.Array,
+    batch_size: int | jax.Array,
+    *,
+    cv_threshold: float = 0.2,
+    epsilon: float = 1e-12,
+) -> dict:
+    """Compute CLT-style diagnostics for NTK diagonal estimates."""
+    dtype = diag_elements.dtype
+    batch_size_i = jnp.asarray(batch_size, dtype=jnp.int32)
+    batch_size_f = jnp.asarray(batch_size_i, dtype=dtype)
+
+    mean = jnp.mean(diag_elements)
+    std = jnp.std(diag_elements)
+    eps = jnp.asarray(float(epsilon), dtype=dtype)
+    safe_mean = jnp.maximum(jnp.abs(mean), eps)
+    cv = std / safe_mean
+    cv = jnp.where(jnp.isfinite(cv), cv, jnp.asarray(0.0, dtype=dtype))
+
+    cv_threshold_val = jnp.maximum(jnp.asarray(float(cv_threshold), dtype=dtype), eps)
+    cv_for_min = jnp.clip(cv, 0.0, 9_000.0)
+    min_batch_size = jnp.ceil(jnp.square(cv_for_min / cv_threshold_val)).astype(
+        jnp.int32
+    )
+    min_batch_size = jnp.maximum(min_batch_size, jnp.asarray(1, dtype=jnp.int32))
+
+    cv_of_mean = cv / jnp.sqrt(jnp.maximum(batch_size_f, jnp.asarray(1.0, dtype=dtype)))
+    is_sufficient = batch_size_i >= min_batch_size
+    is_sufficient_i = is_sufficient.astype(jnp.int32)
+    return {
+        "mean": mean,
+        "std": std,
+        "cv": cv,
+        "cv_of_mean": cv_of_mean,
+        "min_batch_size": min_batch_size,
+        "is_sufficient": is_sufficient_i,
+        "batch_sufficient": is_sufficient_i,
+        "batch_size": batch_size_i,
+    }
+
+
+def _compute_per_sample_ntk_diag(
+    *,
+    autoencoder,
+    params,
+    batch_stats,
+    u_enc: jax.Array,
+    x_enc: jax.Array,
+    u_dec: jax.Array,
+    x_dec: jax.Array,
+    key: jax.Array,
+    latent_noise_scale: float = 0.0,
+    hutchinson_probes: int = 1,
+) -> tuple[jax.Array, jax.Array, jax.Array, dict]:
+    """Legacy per-sample NTK-diagonal estimator kept for analysis scripts."""
+    n_probes = max(1, int(hutchinson_probes))
+    key, k_forward, k_diag = jax.random.split(key, 3)
+    u_pred, latents, updated_batch_stats = _forward_only(
+        autoencoder=autoencoder,
+        params=params,
+        batch_stats=batch_stats,
+        u_enc=u_enc,
+        x_enc=x_enc,
+        x_dec=x_dec,
+        key=k_forward,
+        latent_noise_scale=latent_noise_scale,
+    )
+
+    batch_size = int(u_enc.shape[0])
+    grad_keys = jax.random.split(k_diag, batch_size)
+
+    def per_sample_probe_scalar(
+        p,
+        u_enc_n,
+        x_enc_n,
+        u_dec_n,
+        x_dec_n,
+        k_noise,
+        k_probe,
+    ):
+        u_enc_b = u_enc_n[None, ...]
+        x_enc_b = x_enc_n[None, ...]
+        u_dec_b = u_dec_n[None, ...]
+        x_dec_b = x_dec_n[None, ...]
+
+        encoder_vars = {
+            "params": p["encoder"],
+            "batch_stats": (batch_stats if batch_stats else {}).get("encoder", {}),
+        }
+        latents_n = autoencoder.encoder.apply(
+            encoder_vars,
+            u_enc_b,
+            x_enc_b,
+            train=False,
+        )
+        decode_latents_n = latents_n
+        if latent_noise_scale > 0.0:
+            noise = jax.random.normal(k_noise, latents_n.shape, dtype=latents_n.dtype)
+            decode_latents_n = latents_n + float(latent_noise_scale) * noise
+
+        decoder_vars = {
+            "params": p["decoder"],
+            "batch_stats": (batch_stats if batch_stats else {}).get("decoder", {}),
+        }
+        u_pred_n = autoencoder.decoder.apply(
+            decoder_vars,
+            decode_latents_n,
+            x_dec_b,
+            train=False,
+        )
+        residual_n = (u_pred_n - u_dec_b).reshape(-1)
+        m = jnp.asarray(residual_n.shape[0], dtype=residual_n.dtype)
+        probe = jax.random.rademacher(k_probe, residual_n.shape, dtype=residual_n.dtype)
+        probe = probe / jnp.sqrt(jnp.maximum(m, jnp.asarray(1.0, dtype=residual_n.dtype)))
+        return jnp.vdot(residual_n, probe)
+
+    def scan_step(_carry, xs):
+        u_enc_n, x_enc_n, u_dec_n, x_dec_n, sample_key = xs
+        k_noise_n, k_probe_root = jax.random.split(sample_key, 2)
+        probe_keys = jax.random.split(k_probe_root, n_probes)
+
+        def probe_step(_probe_carry, probe_key):
+            grads_n = jax.grad(per_sample_probe_scalar)(
+                params,
+                u_enc_n,
+                x_enc_n,
+                u_dec_n,
+                x_dec_n,
+                k_noise_n,
+                probe_key,
+            )
+            return None, _tree_squared_l2_norm(grads_n)
+
+        _, probe_norms = jax.lax.scan(probe_step, None, probe_keys)
+        return None, jnp.mean(probe_norms)
+
+    _, diag_elements = jax.lax.scan(
+        scan_step,
+        None,
+        (u_enc, x_enc, u_dec, x_dec, grad_keys),
+    )
+    diag_elements = jnp.where(jnp.isfinite(diag_elements), diag_elements, 0.0)
+    return diag_elements, u_pred, latents, updated_batch_stats
+
+
 def _trace_per_output_from_jt_v(
     *,
     jt_v,
