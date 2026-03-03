@@ -16,15 +16,21 @@ from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
 from numpy.typing import NDArray
 
-from scripts.images.field_visualization import format_for_paper  # noqa: F401
+from scripts.images.field_visualization import EASTERN_HUES, format_for_paper  # noqa: F401
 
 
 # ============================================================================
 # Colour palette
 # ============================================================================
-C_OBS = "#2166ac"
-C_GEN = "#b2182b"
-C_FILL = "#d6604d"
+# ChromaPalette "EasternHues" (see docs/latent_geometry_plotting.md for conventions)
+# Order: [gold, brown-red, deep green, light teal, red, dark brown, tan, steel blue]
+C_OBS = EASTERN_HUES[7]      # steel blue
+C_GEN = EASTERN_HUES[4]      # red
+C_FILL = EASTERN_HUES[0]     # gold
+C_OK = EASTERN_HUES[2]       # deep green
+C_WARN = EASTERN_HUES[0]     # gold
+C_RISK = EASTERN_HUES[4]     # red
+C_ACCENT = EASTERN_HUES[3]   # light teal
 
 # ============================================================================
 # Colormap
@@ -851,11 +857,11 @@ def plot_diversity(
     if per_band:
         bands = sorted(per_band.keys())
         ratios = [per_band[b].get("diversity_ratio", float("nan")) for b in bands]
-        colors = ["green" if 0.5 <= r <= 2.0 else "red" for r in ratios]
+        colors = [C_OK if 0.5 <= r <= 2.0 else C_RISK for r in ratios]
         ax.bar(range(len(bands)), ratios, color=colors, alpha=0.7, edgecolor="k")
         ax.axhline(1.0, color="k", ls="--", lw=0.8)
-        ax.axhline(0.5, color="orange", ls=":", lw=0.8, alpha=0.5)
-        ax.axhline(2.0, color="orange", ls=":", lw=0.8, alpha=0.5)
+        ax.axhline(0.5, color=C_WARN, ls=":", lw=0.8, alpha=0.5)
+        ax.axhline(2.0, color=C_WARN, ls=":", lw=0.8, alpha=0.5)
         ax.set_xticks(range(len(bands)))
         ax.set_xticklabels([f"Band {b}" for b in bands], fontsize=FONT_TICK)
         ax.set_ylabel("Diversity ratio (gen / GT)", fontsize=FONT_LABEL)
@@ -881,7 +887,10 @@ def plot_latent_geom_spectrum(
     H_schedule: Optional[List[float]],
     out_dir: Path,
 ) -> None:
-    """Plot latent metric-spectrum diagnostics across modeled time indices."""
+    """Plot latent metric-spectrum diagnostics across modeled time indices.
+
+    This is a thin wrapper that emits one figure per metric (single-attribution).
+    """
     per_time = lg_results.get("per_time", [])
     if not per_time:
         return
@@ -897,33 +906,57 @@ def plot_latent_geom_spectrum(
         labels = [str(int(row.get("time_index", i))) for i, row in enumerate(per_time)]
         xlabel = "Time index"
 
-    rank = np.asarray([row.get("effective_rank_mean", np.nan) for row in per_time], dtype=np.float64)
-    cond = np.asarray([row.get("condition_proxy_mean", np.nan) for row in per_time], dtype=np.float64)
-    null = np.asarray([row.get("near_null_mass_mean", np.nan) for row in per_time], dtype=np.float64)
+    series = [
+        dict(
+            key="effective_rank_mean",
+            filename="latent_geom_effective_rank",
+            title="Effective rank",
+            ylabel=r"$r_{\mathrm{eff}}(g)$",
+            marker="o",
+            color=C_OBS,
+            ylim=None,
+            yscale=None,
+        ),
+        dict(
+            key="condition_proxy_mean",
+            filename="latent_geom_condition_proxy",
+            title="Condition proxy",
+            ylabel=r"$\kappa_{\mathrm{proxy}}$",
+            marker="s",
+            color=C_GEN,
+            ylim=None,
+            yscale="log",
+        ),
+        dict(
+            key="near_null_mass_mean",
+            filename="latent_geom_near_null_mass",
+            title="Near-null mass",
+            ylabel=r"$m_{\mathrm{null}}$",
+            marker="^",
+            color=C_FILL,
+            ylim=(-0.02, 1.02),
+            yscale=None,
+        ),
+    ]
 
-    fig, axes = plt.subplots(1, 3, figsize=(6.5, 2.5))
-    for ax in axes:
-        ax.grid(alpha=0.2, lw=0.4)
+    for spec in series:
+        y = np.asarray([row.get(spec["key"], np.nan) for row in per_time], dtype=np.float64)
+        fig, ax = plt.subplots(1, 1, figsize=(6.5, 2.5))
+        ax.plot(x, y, marker=spec["marker"], color=spec["color"], lw=1.0)
         ax.set_xticks(x)
         ax.set_xticklabels(labels, fontsize=8, rotation=30, ha="right")
-        ax.tick_params(axis="y", labelsize=8)
         ax.set_xlabel(xlabel, fontsize=9)
-
-    axes[0].plot(x, rank, marker="o", color=C_OBS, lw=1.0)
-    axes[0].set_title("Effective rank", fontsize=10)
-    axes[0].set_ylabel("$r_{\\mathrm{eff}}(g)$", fontsize=9)
-
-    axes[1].plot(x, cond, marker="s", color=C_GEN, lw=1.0)
-    axes[1].set_title("Condition proxy", fontsize=10)
-    axes[1].set_ylabel("$\\kappa_{\\mathrm{proxy}}$", fontsize=9)
-
-    axes[2].plot(x, null, marker="^", color="tab:purple", lw=1.0)
-    axes[2].set_title("Near-null mass", fontsize=10)
-    axes[2].set_ylabel("$m_{\\mathrm{null}}$", fontsize=9)
-
-    fig.tight_layout()
-    _save_fig(fig, out_dir, "latent_geom_spectrum", png_dpi=300)
-    plt.close(fig)
+        ax.set_ylabel(spec["ylabel"], fontsize=9)
+        ax.set_title(spec["title"], fontsize=10)
+        ax.grid(alpha=0.2, lw=0.4)
+        ax.tick_params(axis="y", labelsize=8)
+        if spec["yscale"] is not None:
+            ax.set_yscale(spec["yscale"])
+        if spec["ylim"] is not None:
+            ax.set_ylim(*spec["ylim"])
+        fig.tight_layout()
+        _save_fig(fig, out_dir, spec["filename"], png_dpi=300)
+        plt.close(fig)
 
 
 def plot_latent_geom_hessian(
@@ -957,12 +990,12 @@ def plot_latent_geom_hessian(
     ax.fill_between(x, p90, p99, color=C_GEN, alpha=0.18, label="P90–P99")
     ax.plot(x, med, color=C_OBS, lw=1.0, marker="o", label="Median")
     ax.plot(x, p90, color=C_GEN, lw=1.0, marker="s", label="P90")
-    ax.plot(x, p99, color="tab:purple", lw=1.0, marker="^", label="P99")
+    ax.plot(x, p99, color=C_FILL, lw=1.0, marker="^", label="P99")
     ax.set_xticks(x)
     ax.set_xticklabels(labels, fontsize=8, rotation=30, ha="right")
     ax.set_xlabel(xlabel, fontsize=9)
-    ax.set_ylabel("$\\|\\Pi\\|_F^2$ proxy", fontsize=9)
-    ax.set_title("Extrinsic curvature proxy", fontsize=10)
+    ax.set_ylabel(r"$\|H_z D\|_F^2$", fontsize=9)
+    ax.set_title("Curvature proxy (decoder Hessian energy)", fontsize=10)
     ax.grid(alpha=0.2, lw=0.4)
     ax.tick_params(axis="y", labelsize=8)
     ax.legend(fontsize=8, framealpha=0.9)
@@ -972,66 +1005,21 @@ def plot_latent_geom_hessian(
     plt.close(fig)
 
 
-def plot_latent_geom_volume(
-    lg_results: Dict,
-    time_indices: Optional[NDArray],
-    H_schedule: Optional[List[float]],
-    out_dir: Path,
-) -> None:
-    """Plot latent volume-element dynamics via logdet metric summaries."""
-    per_time = lg_results.get("per_time", [])
-    if not per_time:
-        return
-
-    x = np.arange(len(per_time), dtype=np.float64)
-    if time_indices is not None and H_schedule is not None:
-        labels = [
-            f"{H_schedule[int(idx)]:.3g}" if int(idx) < len(H_schedule) else str(int(idx))
-            for idx in np.asarray(time_indices)[: len(per_time)]
-        ]
-        xlabel = "$H$"
-    else:
-        labels = [str(int(row.get("time_index", i))) for i, row in enumerate(per_time)]
-        xlabel = "Time index"
-
-    mean = np.asarray([row.get("logdet_metric_mean", np.nan) for row in per_time], dtype=np.float64)
-    std = np.asarray([row.get("logdet_metric_std", np.nan) for row in per_time], dtype=np.float64)
-
-    fig, ax = plt.subplots(figsize=(6.5, 2.5))
-    ax.plot(x, mean, color=C_OBS, lw=1.0, marker="o")
-    ax.fill_between(x, mean - std, mean + std, color=C_FILL, alpha=0.22)
-    ax.set_xticks(x)
-    ax.set_xticklabels(labels, fontsize=8, rotation=30, ha="right")
-    ax.set_xlabel(xlabel, fontsize=9)
-    ax.set_ylabel("$\\log\\det(g + \\varepsilon I)$", fontsize=9)
-    ax.set_title("Volume-element dynamics", fontsize=10)
-    ax.grid(alpha=0.2, lw=0.4)
-    ax.tick_params(axis="y", labelsize=8)
-
-    fig.tight_layout()
-    _save_fig(fig, out_dir, "latent_geom_volume", png_dpi=300)
-    plt.close(fig)
-
-
 def plot_latent_geom_flags(
     lg_results: Dict,
     time_indices: Optional[NDArray],
     H_schedule: Optional[List[float]],
     out_dir: Path,
 ) -> None:
-    """Plot traffic-light robustness flags for latent-geometry diagnostics."""
+    """Plot traffic-light robustness flags for latent-geometry diagnostics.
+
+    Emits one figure per flag (single-attribution).
+    """
     per_flags = lg_results.get("robustness_flags", {}).get("per_time", [])
     if not per_flags:
         return
 
-    metric_names = ["collapse_risk", "folding_risk", "volume_flat_risk"]
-    row_labels = ["Collapse", "Folding", "Flat volume"]
     n_time = len(per_flags)
-    mat = np.zeros((len(metric_names), n_time), dtype=np.float64)
-    for j, row in enumerate(per_flags):
-        for i, name in enumerate(metric_names):
-            mat[i, j] = float(bool(row.get(name, False)))
-
     x = np.arange(n_time, dtype=np.float64)
     if time_indices is not None and H_schedule is not None:
         labels = [
@@ -1043,19 +1031,35 @@ def plot_latent_geom_flags(
         labels = [str(int(row.get("time_index", i))) for i, row in enumerate(per_flags)]
         xlabel = "Time index"
 
-    cmap = ListedColormap(["#2ca25f", "#de2d26"])
-    fig, ax = plt.subplots(figsize=(6.5, 2.4))
-    ax.imshow(mat, cmap=cmap, vmin=0.0, vmax=1.0, aspect="auto", interpolation="nearest")
-    ax.set_xticks(x)
-    ax.set_xticklabels(labels, fontsize=8, rotation=30, ha="right")
-    ax.set_yticks(np.arange(len(row_labels)))
-    ax.set_yticklabels(row_labels, fontsize=8)
-    ax.set_xlabel(xlabel, fontsize=9)
-    ax.set_title("Latent geometry robustness flags", fontsize=10)
+    specs = [
+        dict(
+            key="collapse_risk",
+            filename="latent_geom_flag_collapse",
+            title="Collapse risk indicator",
+            ylabel=r"$\mathbb{I}\{\mathrm{collapse}\}$",
+        ),
+        dict(
+            key="folding_risk",
+            filename="latent_geom_flag_folding",
+            title="Folding risk indicator",
+            ylabel=r"$\mathbb{I}\{\mathrm{folding}\}$",
+        ),
+    ]
 
-    fig.tight_layout()
-    _save_fig(fig, out_dir, "latent_geom_flags", png_dpi=300)
-    plt.close(fig)
+    cmap = ListedColormap([C_OK, C_RISK])
+    for spec in specs:
+        vals = np.asarray([float(bool(row.get(spec["key"], False))) for row in per_flags], dtype=np.float64)[None, :]
+        fig, ax = plt.subplots(figsize=(6.5, 1.4))
+        ax.imshow(vals, cmap=cmap, vmin=0.0, vmax=1.0, aspect="auto", interpolation="nearest")
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels, fontsize=8, rotation=30, ha="right")
+        ax.set_yticks([0])
+        ax.set_yticklabels([spec["ylabel"]], fontsize=8)
+        ax.set_xlabel(xlabel, fontsize=9)
+        ax.set_title(spec["title"], fontsize=10)
+        fig.tight_layout()
+        _save_fig(fig, out_dir, spec["filename"], png_dpi=300)
+        plt.close(fig)
 
 
 # ============================================================================

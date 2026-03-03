@@ -39,6 +39,21 @@ __all__ = [
 _NUMERIC_EPS = 1e-12
 
 
+# =============================================================================
+# Publication palette (ChromaPalette: EasternHues)
+# =============================================================================
+EASTERN_HUES: list[str] = [
+    "#D9AB42",
+    "#A35E47",
+    "#0F4C3A",
+    "#78C2C4",
+    "#C73E3A",
+    "#563F2E",
+    "#B47157",
+    "#2B5F75",
+]
+
+
 def format_for_paper() -> None:
     """Apply publication-style defaults for matplotlib figures."""
     plt.rcParams.update({"image.cmap": "viridis"})
@@ -68,6 +83,14 @@ def format_for_paper() -> None:
     plt.rcParams.update({"mathtext.rm": "serif"})
     plt.rcParams.update({"mathtext.it": "serif:italic"})
     plt.rcParams.update({"mathtext.bf": "serif:bold"})
+    try:
+        from cycler import cycler
+
+        plt.rcParams.update({"axes.prop_cycle": cycler(color=EASTERN_HUES)})
+    except Exception:
+        # cycler is an indirect matplotlib dependency; if anything goes wrong,
+        # keep the default color cycle rather than failing plotting.
+        pass
     plt.close("all")
 
 

@@ -109,7 +109,6 @@ from scripts.fae.tran_evaluation.report import (  # noqa: E402
     plot_latent_geom_flags,
     plot_latent_geom_hessian,
     plot_latent_geom_spectrum,
-    plot_latent_geom_volume,
     plot_pdfs,
     plot_psd,
     plot_qq,
@@ -622,7 +621,6 @@ def _run_latent_geometry_only(args: argparse.Namespace) -> None:
         format_for_paper()
         plot_latent_geom_spectrum(lg_results, None, None, out_dir)
         plot_latent_geom_hessian(lg_results, None, None, out_dir)
-        plot_latent_geom_volume(lg_results, None, None, out_dir)
         plot_latent_geom_flags(lg_results, None, None, out_dir)
         print(f"Saved latent geometry figures to {out_dir}")
 
@@ -1241,13 +1239,10 @@ def main() -> None:
             plot_latent_geom_hessian(
                 latent_geometry_results, latent_geom_time_indices, full_H_schedule, out_dir,
             )
-            plot_latent_geom_volume(
-                latent_geometry_results, latent_geom_time_indices, full_H_schedule, out_dir,
-            )
             plot_latent_geom_flags(
                 latent_geometry_results, latent_geom_time_indices, full_H_schedule, out_dir,
             )
-            n_figs += 4
+            n_figs += 6
 
         print(f"Saved {n_figs} figures to {out_dir}")
 

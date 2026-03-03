@@ -34,7 +34,7 @@ from scripts.wandb_compat import wandb  # noqa: E402
 from scripts.utils import get_device, log_cli_metadata_to_wandb, set_up_exp  # noqa: E402
 
 from scripts.fae.multiscale_dataset_naive import load_training_time_data_naive  # noqa: E402
-from scripts.fae.fae_naive.train_attention import (  # noqa: E402
+from scripts.fae.fae_naive.train_attention_components import (  # noqa: E402
     load_dataset_metadata,
     parse_held_out_indices_arg,
     parse_held_out_times_arg,
@@ -284,8 +284,26 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--project", type=str, default="mmsfm")
     p.add_argument("--group", type=str, default=None)
     p.add_argument("--run_name", type=str, default=None)
+    p.add_argument(
+        "--wandb_tags",
+        type=str,
+        default="",
+        help="Comma-separated W&B tags (e.g. 'latent_msbm,ntk_prior,adam').",
+    )
 
     return p.parse_args()
+
+
+def _parse_wandb_tags(tags_csv: str) -> list[str]:
+    tags: list[str] = []
+    seen: set[str] = set()
+    for raw in str(tags_csv).split(","):
+        tag = raw.strip()
+        if not tag or tag in seen:
+            continue
+        seen.add(tag)
+        tags.append(tag)
+    return tags
 
 
 def _interval_deltas_rms(latent: np.ndarray) -> np.ndarray:
@@ -1314,6 +1332,10 @@ def main() -> None:
     # -----------------------------------------------------------------------
     # Logging
     # -----------------------------------------------------------------------
+    wandb_tags = _parse_wandb_tags(getattr(args, "wandb_tags", ""))
+    if wandb_tags:
+        print("W&B tags: " + ", ".join(wandb_tags))
+
     run = wandb.init(
         entity=args.entity,
         project=args.project,
@@ -1321,6 +1343,7 @@ def main() -> None:
         config=vars(args),
         mode=args.wandb_mode,
         name=args.run_name,
+        tags=wandb_tags if wandb_tags else None,
         resume="allow",
     )
     log_cli_metadata_to_wandb(run, args, outdir=outdir, extra={"fae_meta": fae_meta})

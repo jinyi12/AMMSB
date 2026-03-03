@@ -103,7 +103,6 @@ def estimate_pullback_spectrum(
 ) -> Dict[str, Any]:
     """Estimate pullback spectrum proxies for g(z)=J(z)^T J(z)."""
     jax, jnp = _lazy_jax()
-    from scripts.fae.fae_naive.spacetime_geometry_jax import hutchinson_divergence_jvp
 
     z = np.asarray(z, dtype=np.float32)
     x = np.asarray(x, dtype=np.float32)
@@ -113,72 +112,139 @@ def estimate_pullback_spectrum(
     latent_dim = int(z.shape[1])
     n_use = int(min(config.n_samples, z.shape[0]))
     z_use = z[:n_use]
+    if n_use < 1:
+        empty = np.asarray([], dtype=np.float64)
+        return {
+            "trace_g_samples": empty,
+            "trace_g_sq_samples": empty,
+            "effective_rank_samples": empty,
+            "condition_proxy_samples": empty,
+            "near_null_mass_samples": empty,
+            "trace_g": float("nan"),
+            "trace_g_sq": float("nan"),
+            "effective_rank": float("nan"),
+            "condition_proxy": float("nan"),
+            "near_null_mass": float("nan"),
+            "definitions": {
+                "pullback_metric": "g(z)=J(z)^T J(z)",
+                "trace_g": "Tr(g) estimated by Rademacher probes: E[||J v||_2^2]",
+                "trace_g_sq": "Tr(g^2) estimated by Rademacher probes: E[||g v||_2^2]",
+                "effective_rank": "Canonical PR: r_eff = Tr(g)^2 / Tr(g^2); implementation uses max(Tr(g^2), eps) in denominator and clips to [1, d_z]",
+                "condition_proxy": "Projected-spectrum surrogate: (lambda_max + eps)/(lambda_min + eps)",
+                "near_null_mass": "Projected-spectrum surrogate mass below tau * max(Tr_proj(g)/d_z, eps)",
+            },
+            "effective_rank_definition": {
+                "formula": "r_eff = Tr(g)^2 / Tr(g^2)",
+                "numerical_implementation": "r_eff_hat = Tr(g)^2 / max(Tr(g^2), eps)",
+                "trace_estimator": "Tr(g) ≈ (1/K) Σ_k ||J v_k||_2^2",
+                "trace_sq_estimator": "Tr(g^2) ≈ (1/K) Σ_k ||g v_k||_2^2",
+                "probe_distribution": "rademacher",
+                "n_probes": int(max(1, config.n_probes)),
+                "clip_bounds": [1.0, float(latent_dim)],
+                "eps": float(config.eps),
+            },
+        }
 
-    trace_vals: list[float] = []
-    eff_rank_vals: list[float] = []
-    condition_vals: list[float] = []
-    near_null_vals: list[float] = []
+    x_coords = jnp.asarray(x)
 
     base_key = jax.random.PRNGKey(config.seed)
+    key_proj, key_moment = jax.random.split(base_key)
+
+    # Shared random projected subspace across latent samples.
+    n_proj = int(min(max(1, config.n_probes), latent_dim))
+    probe_mat = jax.random.normal(key_proj, shape=(latent_dim, n_proj), dtype=jnp.float32)
+    q_basis, _ = jnp.linalg.qr(probe_mat)
+    q_basis = q_basis[:, :n_proj]
+
+    n_probes = int(max(1, config.n_probes))
+    moment_keys = jax.random.split(key_moment, n_use)
+
+    trace_samples: list[float] = []
+    trace_sq_samples: list[float] = []
+    eff_rank_samples: list[float] = []
+    condition_samples: list[float] = []
+    near_null_samples: list[float] = []
 
     for i in range(n_use):
-        key_i = jax.random.fold_in(base_key, i + 17)
-        key_eig, key_trace = jax.random.split(key_i)
-        eigs = _projected_metric_eigs(
-            decode_fn, z_use[i], x,
-            key=key_eig, n_probes=config.n_probes, eps=config.eps,
-        )
-
-        trace_proj = float(np.sum(eigs))
-        eff_rank = (trace_proj ** 2) / float(np.sum(eigs * eigs) + config.eps)
-        cond = float((np.max(eigs) + config.eps) / (np.min(eigs) + config.eps))
-
-        threshold = float(config.near_null_tau * max(trace_proj / max(latent_dim, 1), config.eps))
-        near_null = float(np.mean(eigs < threshold))
-
         z_single = jnp.asarray(z_use[i])
-        x_coords = jnp.asarray(x)
 
         def decode_at(z_in):
             return decode_fn(z_in, x_coords)
 
         _, jvp_fn = jax.linearize(decode_at, z_single)
-        _, vjp_fn = jax.vjp(decode_at, z_single)
+        transpose_fn = jax.linear_transpose(jvp_fn, z_single)
 
-        def pullback_batch(v_batch):
-            return jax.vmap(lambda v: vjp_fn(jvp_fn(v))[0])(v_batch)
+        y_cols = jax.vmap(jvp_fn, in_axes=1, out_axes=1)(q_basis)
+        gram_proj = y_cols.T @ y_cols
+        gram_proj = 0.5 * (gram_proj + gram_proj.T)
+        eigvals = jnp.linalg.eigvalsh(gram_proj)
+        eigvals = jnp.clip(eigvals, min=0.0)
+        eigs = eigvals * (latent_dim / float(n_proj))
+        eigs = jnp.clip(eigs, min=config.eps)
 
-        x0 = jnp.zeros((1, latent_dim), dtype=z_single.dtype)
-        trace_hutch = float(
-            hutchinson_divergence_jvp(
-                pullback_batch,
-                x0,
-                key=key_trace,
-                num_probes=max(1, config.n_probes // 2),
-                probe="rademacher",
-            )[0]
+        trace_proj = jnp.sum(eigs)
+        cond = (jnp.max(eigs) + config.eps) / (jnp.min(eigs) + config.eps)
+        threshold = config.near_null_tau * jnp.maximum(trace_proj / float(max(latent_dim, 1)), config.eps)
+        near_null = jnp.mean(eigs < threshold)
+
+        probes = jax.random.rademacher(
+            moment_keys[i],
+            shape=(n_probes, latent_dim),
+            dtype=z_single.dtype,
         )
-        trace_val = 0.5 * (trace_proj + trace_hutch)
 
-        trace_vals.append(trace_val)
-        eff_rank_vals.append(float(eff_rank))
-        condition_vals.append(cond)
-        near_null_vals.append(near_null)
+        def _probe_stats(v_single):
+            jv = jvp_fn(v_single)
+            gv = transpose_fn(jv)[0]
+            return jnp.sum(jv * jv), jnp.sum(gv * gv)
 
-    trace_arr = np.asarray(trace_vals, dtype=np.float64)
-    eff_rank_arr = np.asarray(eff_rank_vals, dtype=np.float64)
-    condition_arr = np.asarray(condition_vals, dtype=np.float64)
-    near_null_arr = np.asarray(near_null_vals, dtype=np.float64)
+        trace_terms, trace_sq_terms = jax.vmap(_probe_stats)(probes)
+        trace_est = jnp.maximum(jnp.mean(trace_terms), 0.0)
+        trace_sq_est = jnp.maximum(jnp.mean(trace_sq_terms), 0.0)
+        denom_safe = jnp.maximum(trace_sq_est, config.eps)
+        eff_rank = jnp.clip((trace_est ** 2) / denom_safe, 1.0, float(latent_dim))
+
+        trace_samples.append(float(trace_est))
+        trace_sq_samples.append(float(trace_sq_est))
+        eff_rank_samples.append(float(eff_rank))
+        condition_samples.append(float(cond))
+        near_null_samples.append(float(near_null))
+
+    trace_arr = np.asarray(trace_samples, dtype=np.float64)
+    trace_sq_arr = np.asarray(trace_sq_samples, dtype=np.float64)
+    eff_rank_arr = np.asarray(eff_rank_samples, dtype=np.float64)
+    condition_arr = np.asarray(condition_samples, dtype=np.float64)
+    near_null_arr = np.asarray(near_null_samples, dtype=np.float64)
 
     return {
         "trace_g_samples": trace_arr,
+        "trace_g_sq_samples": trace_sq_arr,
         "effective_rank_samples": eff_rank_arr,
         "condition_proxy_samples": condition_arr,
         "near_null_mass_samples": near_null_arr,
         "trace_g": float(np.nanmean(trace_arr)),
+        "trace_g_sq": float(np.nanmean(trace_sq_arr)),
         "effective_rank": float(np.nanmean(eff_rank_arr)),
         "condition_proxy": float(np.nanmean(condition_arr)),
         "near_null_mass": float(np.nanmean(near_null_arr)),
+        "definitions": {
+            "pullback_metric": "g(z)=J(z)^T J(z)",
+            "trace_g": "Tr(g) estimated by Rademacher probes: E[||J v||_2^2]",
+            "trace_g_sq": "Tr(g^2) estimated by Rademacher probes: E[||g v||_2^2]",
+            "effective_rank": "Canonical PR: r_eff = Tr(g)^2 / Tr(g^2); implementation uses max(Tr(g^2), eps) in denominator and clips to [1, d_z]",
+            "condition_proxy": "Projected-spectrum surrogate: (lambda_max + eps)/(lambda_min + eps)",
+            "near_null_mass": "Projected-spectrum surrogate mass below tau * max(Tr_proj(g)/d_z, eps)",
+        },
+        "effective_rank_definition": {
+            "formula": "r_eff = Tr(g)^2 / Tr(g^2)",
+            "numerical_implementation": "r_eff_hat = Tr(g)^2 / max(Tr(g^2), eps)",
+            "trace_estimator": "Tr(g) ≈ (1/K) Σ_k ||J v_k||_2^2",
+            "trace_sq_estimator": "Tr(g^2) ≈ (1/K) Σ_k ||g v_k||_2^2",
+            "probe_distribution": "rademacher",
+            "n_probes": int(max(1, config.n_probes)),
+            "clip_bounds": [1.0, float(latent_dim)],
+            "eps": float(config.eps),
+        },
     }
 
 
@@ -230,44 +296,6 @@ def estimate_hessian_norm(
         "median": float(np.nanmedian(hvp_arr)),
         "p90": float(np.nanpercentile(hvp_arr, 90.0)),
         "p99": float(np.nanpercentile(hvp_arr, 99.0)),
-    }
-
-
-def estimate_logdet_metric(
-    decode_fn,
-    z: np.ndarray,
-    x: np.ndarray,
-    *,
-    config: LatentGeometryConfig,
-) -> Dict[str, Any]:
-    """Estimate logdet(g + eps I) from projected pullback spectra."""
-    jax, _jnp = _lazy_jax()
-
-    z = np.asarray(z, dtype=np.float32)
-    x = np.asarray(x, dtype=np.float32)
-    if z.ndim != 2:
-        raise ValueError(f"Expected z shape (N, K); got {z.shape}")
-
-    latent_dim = int(z.shape[1])
-    n_use = int(min(config.n_samples, z.shape[0]))
-    z_use = z[:n_use]
-    base_key = jax.random.PRNGKey(config.seed + 1771)
-
-    logdet_vals: list[float] = []
-    for i in range(n_use):
-        key_i = jax.random.fold_in(base_key, i + 313)
-        eigs = _projected_metric_eigs(
-            decode_fn, z_use[i], x,
-            key=key_i, n_probes=config.n_probes, eps=config.eps,
-        )
-        avg_log = float(np.mean(np.log(np.maximum(eigs, config.eps) + config.eps)))
-        logdet_vals.append(float(latent_dim * avg_log))
-
-    arr = np.asarray(logdet_vals, dtype=np.float64)
-    return {
-        "logdet_samples": arr,
-        "logdet_mean": float(np.nanmean(arr)),
-        "logdet_std": float(np.nanstd(arr)),
     }
 
 
@@ -330,7 +358,8 @@ def evaluate_latent_geometry(
     ci_trace: list[list[float]] = []
     ci_rank: list[list[float]] = []
     ci_hessian: list[list[float]] = []
-    ci_logdet: list[list[float]] = []
+    metric_definitions: dict[str, Any] = {}
+    effective_rank_definition: dict[str, Any] = {}
 
     for t_idx in range(n_times):
         z_all = np.asarray(latent_codes[t_idx], dtype=np.float32)
@@ -341,12 +370,14 @@ def evaluate_latent_geometry(
         cfg_t = config.with_overrides(seed=int(config.seed + 9973 * (t_idx + 1)))
         spectrum = estimate_pullback_spectrum(decode_flat, z_t, coords, config=cfg_t)
         hessian = estimate_hessian_norm(decode_flat, z_t, coords, config=cfg_t)
-        volume = estimate_logdet_metric(decode_flat, z_t, coords, config=cfg_t)
+        if not metric_definitions:
+            metric_definitions = dict(spectrum.get("definitions", {}))
+        if not effective_rank_definition:
+            effective_rank_definition = dict(spectrum.get("effective_rank_definition", {}))
 
         trace_ci = _ci95(spectrum["trace_g_samples"])
         rank_ci = _ci95(spectrum["effective_rank_samples"])
         hessian_ci = _ci95(hessian["hessian_frob_samples"])
-        logdet_ci = _ci95(volume["logdet_samples"])
 
         collapse_risk = bool(
             (spectrum["near_null_mass"] > 0.50)
@@ -366,8 +397,6 @@ def evaluate_latent_geometry(
                 "hessian_frob_median": hessian["median"],
                 "hessian_frob_p90": hessian["p90"],
                 "hessian_frob_p99": hessian["p99"],
-                "logdet_metric_mean": volume["logdet_mean"],
-                "logdet_metric_std": volume["logdet_std"],
                 "collapse_risk": collapse_risk,
                 "folding_risk": folding_risk,
             }
@@ -375,20 +404,6 @@ def evaluate_latent_geometry(
         ci_trace.append(trace_ci)
         ci_rank.append(rank_ci)
         ci_hessian.append(hessian_ci)
-        ci_logdet.append(logdet_ci)
-
-    logdet_means = np.asarray([row["logdet_metric_mean"] for row in per_time], dtype=np.float64)
-    if logdet_means.size > 1 and np.all(np.isfinite(logdet_means)):
-        x_axis = np.arange(logdet_means.size, dtype=np.float64)
-        slope = float(np.polyfit(x_axis, logdet_means, deg=1)[0])
-        drift = float(logdet_means[-1] - logdet_means[0])
-    else:
-        slope = 0.0
-        drift = 0.0
-
-    nonadaptive_volume = bool(np.nanstd(logdet_means) < 1e-3)
-    for row in per_time:
-        row["volume_flat_risk"] = nonadaptive_volume
 
     global_summary = {
         "trace_g_mean_over_time": float(np.nanmean([row["trace_g_mean"] for row in per_time])),
@@ -396,32 +411,30 @@ def evaluate_latent_geometry(
         "condition_proxy_mean_over_time": float(np.nanmean([row["condition_proxy_mean"] for row in per_time])),
         "near_null_mass_mean_over_time": float(np.nanmean([row["near_null_mass_mean"] for row in per_time])),
         "hessian_frob_p99_max": float(np.nanmax([row["hessian_frob_p99"] for row in per_time])),
-        "logdet_metric_slope": slope,
-        "logdet_metric_drift": drift,
     }
 
     robustness_flags = {
         "overall": {
             "collapse_risk": bool(any(row["collapse_risk"] for row in per_time)),
             "folding_risk": bool(any(row["folding_risk"] for row in per_time)),
-            "nonadaptive_volume_risk": nonadaptive_volume,
         },
         "per_time": [
             {
                 "time_index": row["time_index"],
                 "collapse_risk": row["collapse_risk"],
                 "folding_risk": row["folding_risk"],
-                "volume_flat_risk": row["volume_flat_risk"],
             }
             for row in per_time
         ],
     }
 
     return {
-        "schema_version": "latent_geometry_v1",
+        "schema_version": "latent_geometry_v2",
         "run_dir": None,
         "time_indices": list(range(n_times)),
         "config": asdict(config),
+        "metric_definitions": metric_definitions,
+        "effective_rank_definition": effective_rank_definition,
         "per_time": per_time,
         "global_summary": global_summary,
         "robustness_flags": robustness_flags,
@@ -429,6 +442,5 @@ def evaluate_latent_geometry(
             "trace_g_ci95": ci_trace,
             "effective_rank_ci95": ci_rank,
             "hessian_frob_ci95": ci_hessian,
-            "logdet_metric_ci95": ci_logdet,
         },
     }
