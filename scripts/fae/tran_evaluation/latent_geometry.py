@@ -7,6 +7,11 @@ from typing import Any, Dict
 
 import numpy as np
 
+from scripts.fae.fae_naive.ntk_estimators import (
+    estimate_psd_trace_hutchpp,
+    estimate_psd_trace_of_square_hutchinson,
+)
+
 
 def _lazy_jax():
     import jax
@@ -24,6 +29,7 @@ class LatentGeometryConfig:
     n_hvp_probes: int = 16
     eps: float = 1e-6
     near_null_tau: float = 1e-4
+    trace_estimator: str = "fhutch"
     seed: int = 42
 
     @classmethod
@@ -44,6 +50,8 @@ class LatentGeometryConfig:
             raise ValueError("n_samples, n_probes, and n_hvp_probes must be >= 1.")
         if cfg.eps <= 0.0 or cfg.near_null_tau <= 0.0:
             raise ValueError("eps and near_null_tau must be > 0.")
+        if cfg.trace_estimator not in {"fhutch", "hutchpp"}:
+            raise ValueError("trace_estimator must be one of {'fhutch', 'hutchpp'}.")
         return cfg
 
 
@@ -117,18 +125,21 @@ def estimate_pullback_spectrum(
         return {
             "trace_g_samples": empty,
             "trace_g_sq_samples": empty,
+            "fro_norm_g_samples": empty,
             "effective_rank_samples": empty,
             "condition_proxy_samples": empty,
             "near_null_mass_samples": empty,
             "trace_g": float("nan"),
             "trace_g_sq": float("nan"),
+            "fro_norm_g": float("nan"),
             "effective_rank": float("nan"),
             "condition_proxy": float("nan"),
             "near_null_mass": float("nan"),
             "definitions": {
                 "pullback_metric": "g(z)=J(z)^T J(z)",
-                "trace_g": "Tr(g) estimated by Rademacher probes: E[||J v||_2^2]",
-                "trace_g_sq": "Tr(g^2) estimated by Rademacher probes: E[||g v||_2^2]",
+                "trace_g": "Tr(g) via stochastic estimator selected by trace_estimator (fhutch or hutchpp).",
+                "trace_g_sq": "Tr(g^2) estimated by Rademacher probes: E[||g v||_2^2] (Hutchinson).",
+                "fro_norm_g": "Frobenius proxy of g: ||g||_F = sqrt(Tr(g^2)).",
                 "effective_rank": "Canonical PR: r_eff = Tr(g)^2 / Tr(g^2); implementation uses max(Tr(g^2), eps) in denominator and clips to [1, d_z]",
                 "condition_proxy": "Projected-spectrum surrogate: (lambda_max + eps)/(lambda_min + eps)",
                 "near_null_mass": "Projected-spectrum surrogate mass below tau * max(Tr_proj(g)/d_z, eps)",
@@ -136,10 +147,11 @@ def estimate_pullback_spectrum(
             "effective_rank_definition": {
                 "formula": "r_eff = Tr(g)^2 / Tr(g^2)",
                 "numerical_implementation": "r_eff_hat = Tr(g)^2 / max(Tr(g^2), eps)",
-                "trace_estimator": "Tr(g) ≈ (1/K) Σ_k ||J v_k||_2^2",
+                "trace_estimator": "Tr(g) estimated with trace_estimator in {'fhutch','hutchpp'}",
                 "trace_sq_estimator": "Tr(g^2) ≈ (1/K) Σ_k ||g v_k||_2^2",
                 "probe_distribution": "rademacher",
                 "n_probes": int(max(1, config.n_probes)),
+                "trace_estimator_mode": str(config.trace_estimator),
                 "clip_bounds": [1.0, float(latent_dim)],
                 "eps": float(config.eps),
             },
@@ -161,6 +173,7 @@ def estimate_pullback_spectrum(
 
     trace_samples: list[float] = []
     trace_sq_samples: list[float] = []
+    fro_norm_samples: list[float] = []
     eff_rank_samples: list[float] = []
     condition_samples: list[float] = []
     near_null_samples: list[float] = []
@@ -187,31 +200,61 @@ def estimate_pullback_spectrum(
         threshold = config.near_null_tau * jnp.maximum(trace_proj / float(max(latent_dim, 1)), config.eps)
         near_null = jnp.mean(eigs < threshold)
 
-        probes = jax.random.rademacher(
-            moment_keys[i],
-            shape=(n_probes, latent_dim),
-            dtype=z_single.dtype,
-        )
-
-        def _probe_stats(v_single):
+        def matvec_g(v_single):
             jv = jvp_fn(v_single)
-            gv = transpose_fn(jv)[0]
-            return jnp.sum(jv * jv), jnp.sum(gv * gv)
+            return transpose_fn(jv)[0]
 
-        trace_terms, trace_sq_terms = jax.vmap(_probe_stats)(probes)
-        trace_est = jnp.maximum(jnp.mean(trace_terms), 0.0)
-        trace_sq_est = jnp.maximum(jnp.mean(trace_sq_terms), 0.0)
+        if config.trace_estimator == "hutchpp":
+            trace_est = jnp.maximum(
+                estimate_psd_trace_hutchpp(
+                    matvec_fn=matvec_g,
+                    dim=latent_dim,
+                    key=moment_keys[i],
+                    num_probes=n_probes,
+                    dtype=z_single.dtype,
+                ),
+                0.0,
+            )
+            trace_sq_est = jnp.maximum(
+                estimate_psd_trace_of_square_hutchinson(
+                    matvec_fn=matvec_g,
+                    dim=latent_dim,
+                    key=jax.random.fold_in(moment_keys[i], 1_000_003),
+                    num_probes=n_probes,
+                    dtype=z_single.dtype,
+                ),
+                0.0,
+            )
+        else:
+            probes = jax.random.rademacher(
+                moment_keys[i],
+                shape=(n_probes, latent_dim),
+                dtype=z_single.dtype,
+            )
+
+            def _probe_stats(v_single):
+                jv = jvp_fn(v_single)
+                gv = transpose_fn(jv)[0]
+                return jnp.sum(jv * jv), jnp.sum(gv * gv)
+
+            trace_terms, trace_sq_terms = jax.vmap(_probe_stats)(probes)
+            trace_est = jnp.maximum(jnp.mean(trace_terms), 0.0)
+            trace_sq_est = jnp.maximum(jnp.mean(trace_sq_terms), 0.0)
+
+        fro_norm_est = jnp.sqrt(jnp.maximum(trace_sq_est, 0.0))
         denom_safe = jnp.maximum(trace_sq_est, config.eps)
         eff_rank = jnp.clip((trace_est ** 2) / denom_safe, 1.0, float(latent_dim))
 
         trace_samples.append(float(trace_est))
         trace_sq_samples.append(float(trace_sq_est))
+        fro_norm_samples.append(float(fro_norm_est))
         eff_rank_samples.append(float(eff_rank))
         condition_samples.append(float(cond))
         near_null_samples.append(float(near_null))
 
     trace_arr = np.asarray(trace_samples, dtype=np.float64)
     trace_sq_arr = np.asarray(trace_sq_samples, dtype=np.float64)
+    fro_arr = np.asarray(fro_norm_samples, dtype=np.float64)
     eff_rank_arr = np.asarray(eff_rank_samples, dtype=np.float64)
     condition_arr = np.asarray(condition_samples, dtype=np.float64)
     near_null_arr = np.asarray(near_null_samples, dtype=np.float64)
@@ -219,18 +262,21 @@ def estimate_pullback_spectrum(
     return {
         "trace_g_samples": trace_arr,
         "trace_g_sq_samples": trace_sq_arr,
+        "fro_norm_g_samples": fro_arr,
         "effective_rank_samples": eff_rank_arr,
         "condition_proxy_samples": condition_arr,
         "near_null_mass_samples": near_null_arr,
         "trace_g": float(np.nanmean(trace_arr)),
         "trace_g_sq": float(np.nanmean(trace_sq_arr)),
+        "fro_norm_g": float(np.nanmean(fro_arr)),
         "effective_rank": float(np.nanmean(eff_rank_arr)),
         "condition_proxy": float(np.nanmean(condition_arr)),
         "near_null_mass": float(np.nanmean(near_null_arr)),
         "definitions": {
             "pullback_metric": "g(z)=J(z)^T J(z)",
-            "trace_g": "Tr(g) estimated by Rademacher probes: E[||J v||_2^2]",
-            "trace_g_sq": "Tr(g^2) estimated by Rademacher probes: E[||g v||_2^2]",
+            "trace_g": "Tr(g) via stochastic estimator selected by trace_estimator (fhutch or hutchpp).",
+            "trace_g_sq": "Tr(g^2) estimated by Rademacher probes: E[||g v||_2^2] (Hutchinson).",
+            "fro_norm_g": "Frobenius proxy of g: ||g||_F = sqrt(Tr(g^2)).",
             "effective_rank": "Canonical PR: r_eff = Tr(g)^2 / Tr(g^2); implementation uses max(Tr(g^2), eps) in denominator and clips to [1, d_z]",
             "condition_proxy": "Projected-spectrum surrogate: (lambda_max + eps)/(lambda_min + eps)",
             "near_null_mass": "Projected-spectrum surrogate mass below tau * max(Tr_proj(g)/d_z, eps)",
@@ -238,10 +284,11 @@ def estimate_pullback_spectrum(
         "effective_rank_definition": {
             "formula": "r_eff = Tr(g)^2 / Tr(g^2)",
             "numerical_implementation": "r_eff_hat = Tr(g)^2 / max(Tr(g^2), eps)",
-            "trace_estimator": "Tr(g) ≈ (1/K) Σ_k ||J v_k||_2^2",
+            "trace_estimator": "Tr(g) estimated with trace_estimator in {'fhutch','hutchpp'}",
             "trace_sq_estimator": "Tr(g^2) ≈ (1/K) Σ_k ||g v_k||_2^2",
             "probe_distribution": "rademacher",
             "n_probes": int(max(1, config.n_probes)),
+            "trace_estimator_mode": str(config.trace_estimator),
             "clip_bounds": [1.0, float(latent_dim)],
             "eps": float(config.eps),
         },
@@ -390,6 +437,7 @@ def evaluate_latent_geometry(
                 "time_index": t_idx,
                 "trace_g_mean": spectrum["trace_g"],
                 "trace_g_ci95": trace_ci,
+                "fro_norm_g_mean": spectrum["fro_norm_g"],
                 "effective_rank_mean": spectrum["effective_rank"],
                 "effective_rank_ci95": rank_ci,
                 "condition_proxy_mean": spectrum["condition_proxy"],
@@ -407,6 +455,7 @@ def evaluate_latent_geometry(
 
     global_summary = {
         "trace_g_mean_over_time": float(np.nanmean([row["trace_g_mean"] for row in per_time])),
+        "fro_norm_g_mean_over_time": float(np.nanmean([row["fro_norm_g_mean"] for row in per_time])),
         "effective_rank_mean_over_time": float(np.nanmean([row["effective_rank_mean"] for row in per_time])),
         "condition_proxy_mean_over_time": float(np.nanmean([row["condition_proxy_mean"] for row in per_time])),
         "near_null_mass_mean_over_time": float(np.nanmean([row["near_null_mass_mean"] for row in per_time])),

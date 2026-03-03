@@ -217,6 +217,27 @@ def build_parser() -> argparse.ArgumentParser:
             "(higher = lower variance, higher compute)."
         ),
     )
+    parser.add_argument(
+        "--ntk-output-chunk-size",
+        type=int,
+        default=0,
+        help=(
+            "If > 0, compute J^T v via output-chunked VJPs with this chunk size "
+            "in flattened output coordinates (mathematically equivalent, "
+            "lower peak memory, higher compute)."
+        ),
+    )
+    parser.add_argument(
+        "--ntk-trace-estimator",
+        type=str,
+        default="rhutch",
+        choices=["rhutch", "fhutch"],
+        help=(
+            "Trace estimator backend for --loss-type=ntk_scaled. "
+            "'rhutch' uses output-space VJP probes (supports output chunking); "
+            "'fhutch' uses parameter-space JVP probes."
+        ),
+    )
 
     # -- Training ----------------------------------------------------------
     parser.add_argument("--optimizer", type=str, default="adam",
@@ -380,6 +401,21 @@ def validate_args(args: argparse.Namespace) -> None:
             raise ValueError(
                 "--ntk-hutchinson-probes must be >= 1 for --loss-type=ntk_scaled."
             )
+        if args.ntk_output_chunk_size < 0:
+            raise ValueError(
+                "--ntk-output-chunk-size must be >= 0 for --loss-type=ntk_scaled."
+            )
+        if args.ntk_trace_estimator not in {"rhutch", "fhutch"}:
+            raise ValueError(
+                "--ntk-trace-estimator must be one of {'rhutch','fhutch'} "
+                "for --loss-type=ntk_scaled."
+            )
+        if args.ntk_trace_estimator == "fhutch" and args.ntk_output_chunk_size > 0:
+            warnings.warn(
+                "--ntk-output-chunk-size is ignored when --ntk-trace-estimator=fhutch "
+                "(chunking applies to RHutch/VJP probes only).",
+                UserWarning,
+            )
     else:
         ntk_args_used = []
         if args.ntk_scale_norm != 10.0:
@@ -394,6 +430,10 @@ def validate_args(args: argparse.Namespace) -> None:
             ntk_args_used.append("--ntk-trace-update-interval")
         if args.ntk_hutchinson_probes != 1:
             ntk_args_used.append("--ntk-hutchinson-probes")
+        if args.ntk_output_chunk_size != 0:
+            ntk_args_used.append("--ntk-output-chunk-size")
+        if args.ntk_trace_estimator != "rhutch":
+            ntk_args_used.append("--ntk-trace-estimator")
         if ntk_args_used:
             warnings.warn(
                 f"NTK arguments {ntk_args_used} ignored when --loss-type={args.loss_type}.",
@@ -482,6 +522,8 @@ def _film_prior_setup(autoencoder, args):
             n_loss_terms=int(getattr(args, "ntk_n_loss_terms", 1) or 1),
             trace_update_interval=int(args.ntk_trace_update_interval),
             hutchinson_probes=int(args.ntk_hutchinson_probes),
+            output_chunk_size=int(getattr(args, "ntk_output_chunk_size", 0)),
+            trace_estimator=str(getattr(args, "ntk_trace_estimator", "rhutch")).lower(),
         )
     else:
         loss_fn = get_film_prior_loss_fn(
@@ -553,6 +595,8 @@ def _denoiser_setup(autoencoder, args):
             n_loss_terms=int(getattr(args, "ntk_n_loss_terms", 1) or 1),
             trace_update_interval=int(args.ntk_trace_update_interval),
             hutchinson_probes=int(args.ntk_hutchinson_probes),
+            output_chunk_size=int(getattr(args, "ntk_output_chunk_size", 0)),
+            trace_estimator=str(getattr(args, "ntk_trace_estimator", "rhutch")).lower(),
         )
     else:
         loss_fn = get_denoiser_loss_fn(

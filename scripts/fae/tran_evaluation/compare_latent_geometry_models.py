@@ -322,6 +322,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--latent_geom_eps", type=float, default=1e-6)
     parser.add_argument("--latent_geom_near_null_tau", type=float, default=1e-4)
     parser.add_argument(
+        "--latent_geom_trace_estimator",
+        type=str,
+        default="fhutch",
+        choices=["fhutch", "hutchpp"],
+    )
+    parser.add_argument(
         "--latent_geom_split",
         type=str,
         default="test",
@@ -1135,6 +1141,7 @@ def main() -> None:
         n_hvp_probes=args.latent_geom_n_hvp_probes,
         eps=args.latent_geom_eps,
         near_null_tau=args.latent_geom_near_null_tau,
+        trace_estimator=args.latent_geom_trace_estimator,
     )
 
     summaries: list[dict[str, Any]] = []

@@ -272,6 +272,13 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--latent_geom_eps", type=float, default=1e-6)
     p.add_argument("--latent_geom_near_null_tau", type=float, default=1e-4)
     p.add_argument(
+        "--latent_geom_trace_estimator",
+        type=str,
+        default="fhutch",
+        choices=["fhutch", "hutchpp"],
+        help="Trace estimator for pullback metric Tr(g): fhutch or hutchpp.",
+    )
+    p.add_argument(
         "--latent_geom_fae_run_dir", type=str, default=None,
         help="FAE run directory (contains args.json + checkpoints/) for "
              "latent-geometry diagnostics independent of MSBM.",
@@ -530,6 +537,7 @@ def _compute_latent_geometry_results(
         n_hvp_probes=args.latent_geom_n_hvp_probes,
         eps=args.latent_geom_eps,
         near_null_tau=args.latent_geom_near_null_tau,
+        trace_estimator=args.latent_geom_trace_estimator,
     )
 
     lg_results = evaluate_latent_geometry(

@@ -15,12 +15,14 @@ import jax.numpy as jnp
 
 from functional_autoencoders.losses import _call_autoencoder_fn
 from functional_autoencoders.train.metrics import Metric
+from scripts.fae.fae_naive.ntk_estimators import (
+    trace_per_output_from_jvp_probe,
+    trace_per_output_from_vjp_probe,
+    tree_squared_l2_norm,
+)
 
-
-def _tree_squared_l2_norm(tree) -> jax.Array:
-    return jnp.sum(
-        jnp.array([jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(tree)])
-    )
+# Backward-compatible local alias for existing internal callsites.
+_tree_squared_l2_norm = tree_squared_l2_norm
 
 
 def _forward_only(
@@ -214,17 +216,6 @@ def _compute_per_sample_ntk_diag(
     return diag_elements, u_pred, latents, updated_batch_stats
 
 
-def _trace_per_output_from_jt_v(
-    *,
-    jt_v,
-    n_outputs: int,
-) -> jax.Array:
-    trace = _tree_squared_l2_norm(jt_v)
-    n_outputs_f = jnp.asarray(max(int(n_outputs), 1), dtype=trace.dtype)
-    trace_per_output = trace / n_outputs_f
-    return jnp.where(jnp.isfinite(trace_per_output), trace_per_output, 0.0)
-
-
 def _reconstruct_and_estimate_full_ntk_trace_per_output(
     *,
     autoencoder,
@@ -236,9 +227,17 @@ def _reconstruct_and_estimate_full_ntk_trace_per_output(
     key: jax.Array,
     latent_noise_scale: float = 0.0,
     hutchinson_probes: int = 1,
+    output_chunk_size: int = 0,
+    trace_estimator: str = "rhutch",
 ) -> tuple[jax.Array, jax.Array, dict, jax.Array]:
     """Return u_pred, latents, updated_batch_stats, trace_per_output."""
     n_probes = max(1, int(hutchinson_probes))
+    output_chunk_size = int(output_chunk_size)
+    trace_estimator = str(trace_estimator).lower()
+    if trace_estimator not in ("rhutch", "fhutch"):
+        raise ValueError(
+            f"trace_estimator must be one of ('rhutch', 'fhutch'). Got {trace_estimator!r}."
+        )
     key, k_enc, k_dec, k_noise, k_probe_root = jax.random.split(key, 5)
 
     def reconstruct(p):
@@ -273,18 +272,35 @@ def _reconstruct_and_estimate_full_ntk_trace_per_output(
         )
         return u_pred, aux
 
-    u_pred, vjp_fn, aux = jax.vjp(reconstruct, params, has_aux=True)
+    if trace_estimator == "rhutch":
+        u_pred, vjp_fn, aux = jax.vjp(reconstruct, params, has_aux=True)
+    else:
+        u_pred, aux = reconstruct(params)
+        vjp_fn = None
     latents, encoder_batch_stats, decoder_batch_stats = aux
 
     probe_keys = jax.random.split(k_probe_root, n_probes)
+    n_outputs = int(u_pred.size)
+    decode_only = lambda p: reconstruct(p)[0]
 
     def _probe_trace(_carry, probe_key):
-        probe = jax.random.rademacher(probe_key, u_pred.shape, dtype=u_pred.dtype)
-        (jt_v,) = vjp_fn(probe)
-        trace_per_output = _trace_per_output_from_jt_v(
-            jt_v=jt_v,
-            n_outputs=u_pred.size,
-        )
+        if trace_estimator == "rhutch":
+            trace_per_output = trace_per_output_from_vjp_probe(
+                vjp_fn=vjp_fn,
+                output_shape=u_pred.shape,
+                n_outputs=n_outputs,
+                probe_key=probe_key,
+                dtype=u_pred.dtype,
+                template_tree=params,
+                output_chunk_size=output_chunk_size,
+            )
+        else:
+            trace_per_output = trace_per_output_from_jvp_probe(
+                fn=decode_only,
+                params=params,
+                n_outputs=n_outputs,
+                probe_key=probe_key,
+            )
         return None, trace_per_output
 
     _, probe_traces = jax.lax.scan(_probe_trace, None, probe_keys)
@@ -309,6 +325,8 @@ def get_ntk_scaled_loss_fn(
     latent_noise_scale: float = 0.0,
     trace_update_interval: int = 100,
     hutchinson_probes: int = 1,
+    output_chunk_size: int = 0,
+    trace_estimator: str = "rhutch",
 ) -> Callable:
     """Return a loss_fn that rescales reconstruction by inverse NTK trace."""
     if getattr(autoencoder.encoder, "is_variational", False):
@@ -322,6 +340,8 @@ def get_ntk_scaled_loss_fn(
     latent_noise_scale = float(latent_noise_scale)
     trace_update_interval = max(1, int(trace_update_interval))
     hutchinson_probes = int(hutchinson_probes)
+    output_chunk_size = int(output_chunk_size)
+    trace_estimator = str(trace_estimator).lower()
     if epsilon <= 0.0:
         raise ValueError(f"epsilon must be > 0. Got {epsilon}.")
     if total_trace_ema_decay < 0.0 or total_trace_ema_decay >= 1.0:
@@ -331,6 +351,13 @@ def get_ntk_scaled_loss_fn(
         )
     if hutchinson_probes < 1:
         raise ValueError(f"hutchinson_probes must be >= 1. Got {hutchinson_probes}.")
+    if output_chunk_size < 0:
+        raise ValueError(f"output_chunk_size must be >= 0. Got {output_chunk_size}.")
+    if trace_estimator not in ("rhutch", "fhutch"):
+        raise ValueError(
+            "trace_estimator must be one of ('rhutch', 'fhutch'). "
+            f"Got {trace_estimator!r}."
+        )
 
     def loss_fn(params, key, batch_stats, u_enc, x_enc, u_dec, x_dec):
         ntk_state = (batch_stats if batch_stats else {}).get("ntk", {})
@@ -352,6 +379,8 @@ def get_ntk_scaled_loss_fn(
                 key=k_ntk,
                 latent_noise_scale=latent_noise_scale,
                 hutchinson_probes=hutchinson_probes,
+                output_chunk_size=output_chunk_size,
+                trace_estimator=trace_estimator,
             )
 
         def frozen_branch(loss_key):
@@ -429,6 +458,8 @@ class NTKDiagnosticMetric(Metric):
         latent_noise_scale: float = 0.0,
         trace_update_interval: int = 100,
         hutchinson_probes: int = 1,
+        output_chunk_size: int = 0,
+        trace_estimator: str = "rhutch",
     ):
         self.autoencoder = autoencoder
         self.scale_norm = float(scale_norm)
@@ -439,8 +470,14 @@ class NTKDiagnosticMetric(Metric):
         self.latent_noise_scale = float(latent_noise_scale)
         self.trace_update_interval = max(1, int(trace_update_interval))
         self.hutchinson_probes = int(hutchinson_probes)
+        self.output_chunk_size = int(output_chunk_size)
+        self.trace_estimator = str(trace_estimator).lower()
         if self.hutchinson_probes < 1:
             raise ValueError("hutchinson_probes must be >= 1.")
+        if self.output_chunk_size < 0:
+            raise ValueError("output_chunk_size must be >= 0.")
+        if self.trace_estimator not in ("rhutch", "fhutch"):
+            raise ValueError("trace_estimator must be one of ('rhutch', 'fhutch').")
 
     @property
     def name(self) -> str:
@@ -500,6 +537,8 @@ class NTKDiagnosticMetric(Metric):
             key=k_trace,
             latent_noise_scale=self.latent_noise_scale,
             hutchinson_probes=self.hutchinson_probes,
+            output_chunk_size=self.output_chunk_size,
+            trace_estimator=self.trace_estimator,
         )
         mse = jnp.mean(jnp.square(u_pred - u_dec))
 

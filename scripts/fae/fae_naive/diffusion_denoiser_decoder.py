@@ -33,6 +33,11 @@ from functional_autoencoders.positional_encodings import (
     PositionalEncoding,
 )
 from functional_autoencoders.train.metrics import Metric
+from scripts.fae.fae_naive.ntk_estimators import (
+    trace_per_output_from_jvp_probe,
+    trace_per_output_from_vjp_probe,
+    tree_squared_l2_norm,
+)
 
 
 # ===================================================================
@@ -624,10 +629,7 @@ def _get_stats_or_empty(batch_stats, name: str):
     return {}
 
 
-def _tree_squared_l2_norm(tree) -> jax.Array:
-    return jnp.sum(
-        jnp.array([jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(tree)])
-    )
+_tree_squared_l2_norm = tree_squared_l2_norm
 
 
 def _estimate_global_trace_per_output(
@@ -637,23 +639,49 @@ def _estimate_global_trace_per_output(
     key: jax.Array,
     n_outputs: int,
     hutchinson_probes: int,
+    output_chunk_size: int = 0,
+    trace_estimator: str = "rhutch",
 ) -> jax.Array:
     """Estimate full-batch NTK trace per output via global Hutchinson probes."""
     n_probes = max(1, int(hutchinson_probes))
-    residual_flat, vjp_fn = jax.vjp(residual_fn, params)
+    output_chunk_size = int(output_chunk_size)
+    trace_estimator = str(trace_estimator).lower()
+    if trace_estimator not in ("rhutch", "fhutch"):
+        raise ValueError(
+            f"trace_estimator must be one of ('rhutch', 'fhutch'). Got {trace_estimator!r}."
+        )
+
+    if trace_estimator == "rhutch":
+        residual_flat, vjp_fn = jax.vjp(residual_fn, params)
+    else:
+        residual_flat = residual_fn(params)
+        vjp_fn = None
     probe_keys = jax.random.split(key, n_probes)
+    n_outputs_i = max(int(n_outputs), 1)
 
     def probe_step(_carry, probe_key):
-        probe = jax.random.rademacher(
-            probe_key, residual_flat.shape, dtype=residual_flat.dtype
-        )
-        (jt_v,) = vjp_fn(probe)
-        return None, _tree_squared_l2_norm(jt_v)
+        if trace_estimator == "rhutch":
+            trace_per_output = trace_per_output_from_vjp_probe(
+                vjp_fn=vjp_fn,
+                output_shape=residual_flat.shape,
+                n_outputs=n_outputs_i,
+                probe_key=probe_key,
+                dtype=residual_flat.dtype,
+                template_tree=params,
+                output_chunk_size=output_chunk_size,
+            )
+            return None, trace_per_output
 
-    _, traces = jax.lax.scan(probe_step, None, probe_keys)
-    trace = jnp.mean(traces)
-    n_outputs_f = jnp.asarray(max(int(n_outputs), 1), dtype=trace.dtype)
-    trace_per_output = trace / n_outputs_f
+        trace_per_output = trace_per_output_from_jvp_probe(
+            fn=residual_fn,
+            params=params,
+            n_outputs=n_outputs_i,
+            probe_key=probe_key,
+        )
+        return None, trace_per_output
+
+    _, traces_per_output = jax.lax.scan(probe_step, None, probe_keys)
+    trace_per_output = jnp.mean(traces_per_output)
     return jnp.where(jnp.isfinite(trace_per_output), trace_per_output, 0.0)
 
 
@@ -889,6 +917,8 @@ def get_ntk_scaled_denoiser_loss_fn(
     n_loss_terms: int = 1,
     trace_update_interval: int = 100,
     hutchinson_probes: int = 1,
+    output_chunk_size: int = 0,
+    trace_estimator: str = "rhutch",
 ) -> Callable:
     """Denoiser objective with interval-gated global Hutchinson NTK scaling."""
     decoder = autoencoder.decoder
@@ -919,6 +949,8 @@ def get_ntk_scaled_denoiser_loss_fn(
     n_loss_terms = max(1, int(n_loss_terms))
     trace_update_interval = max(1, int(trace_update_interval))
     hutchinson_probes = int(hutchinson_probes)
+    output_chunk_size = int(output_chunk_size)
+    trace_estimator = str(trace_estimator).lower()
     if scale_norm <= 0.0:
         raise ValueError(f"scale_norm must be > 0. Got {scale_norm}.")
     if epsilon <= 0.0:
@@ -930,6 +962,10 @@ def get_ntk_scaled_denoiser_loss_fn(
         )
     if hutchinson_probes < 1:
         raise ValueError("hutchinson_probes must be >= 1.")
+    if output_chunk_size < 0:
+        raise ValueError("output_chunk_size must be >= 0.")
+    if trace_estimator not in ("rhutch", "fhutch"):
+        raise ValueError("trace_estimator must be one of ('rhutch', 'fhutch').")
 
     use_prior = prior is not None
     if use_prior:
@@ -1120,6 +1156,8 @@ def get_ntk_scaled_denoiser_loss_fn(
                 key=k_trace_inner,
                 n_outputs=n_outputs,
                 hutchinson_probes=hutchinson_probes,
+                output_chunk_size=output_chunk_size,
+                trace_estimator=trace_estimator,
             )
 
         def frozen_branch(_k_trace_inner):
@@ -1497,6 +1535,8 @@ def get_ntk_scaled_film_prior_loss_fn(
     n_loss_terms: int = 1,
     trace_update_interval: int = 100,
     hutchinson_probes: int = 1,
+    output_chunk_size: int = 0,
+    trace_estimator: str = "rhutch",
 ) -> Callable:
     """NTK-scaled MSE loss for deterministic FiLM decoder + optional prior.
 
@@ -1512,9 +1552,15 @@ def get_ntk_scaled_film_prior_loss_fn(
     n_loss_terms = max(1, int(n_loss_terms))
     trace_update_interval = max(1, int(trace_update_interval))
     hutchinson_probes = int(hutchinson_probes)
+    output_chunk_size = int(output_chunk_size)
+    trace_estimator = str(trace_estimator).lower()
     beta = float(beta)
     if hutchinson_probes < 1:
         raise ValueError("hutchinson_probes must be >= 1.")
+    if output_chunk_size < 0:
+        raise ValueError("output_chunk_size must be >= 0.")
+    if trace_estimator not in ("rhutch", "fhutch"):
+        raise ValueError("trace_estimator must be one of ('rhutch', 'fhutch').")
 
     def loss_fn(params, key, batch_stats, u_enc, x_enc, u_dec, x_dec):
         ntk_state = (batch_stats if batch_stats else {}).get("ntk", {})
@@ -1605,6 +1651,8 @@ def get_ntk_scaled_film_prior_loss_fn(
                 key=k_trace_inner,
                 n_outputs=n_outputs,
                 hutchinson_probes=hutchinson_probes,
+                output_chunk_size=output_chunk_size,
+                trace_estimator=trace_estimator,
             )
 
         def frozen_branch(_k_trace_inner):

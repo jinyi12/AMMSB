@@ -439,6 +439,8 @@ def run_training(
         n_loss_terms = max(1, int(train_dataset.n_times))
     setattr(args, "ntk_n_loss_terms", int(n_loss_terms))
     ntk_hutchinson_probes = int(getattr(args, "ntk_hutchinson_probes", 1))
+    ntk_output_chunk_size = int(getattr(args, "ntk_output_chunk_size", 0))
+    ntk_trace_estimator = str(getattr(args, "ntk_trace_estimator", "rhutch")).lower()
 
     if getattr(args, "loss_type", "l2") == "sobolev_h1":
         est = _estimate_sobolev_balance_from_dataset(
@@ -511,6 +513,8 @@ def run_training(
                 latent_noise_scale=latent_noise_scale,
                 trace_update_interval=int(args.ntk_trace_update_interval),
                 hutchinson_probes=ntk_hutchinson_probes,
+                output_chunk_size=ntk_output_chunk_size,
+                trace_estimator=ntk_trace_estimator,
             )
         else:
             raise ValueError(f"Unsupported --loss-type={args.loss_type}")
@@ -527,6 +531,8 @@ def run_training(
                     n_loss_terms=n_loss_terms,
                     trace_update_interval=int(args.ntk_trace_update_interval),
                     hutchinson_probes=ntk_hutchinson_probes,
+                    output_chunk_size=ntk_output_chunk_size,
+                    trace_estimator=ntk_trace_estimator,
                     latent_noise_scale=latent_noise_scale,
                 )
             )
