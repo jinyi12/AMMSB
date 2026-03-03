@@ -231,3 +231,11 @@ If you find this work useful in your research, please consider citing our paper:
   publisher={PMLR}
 }
 ```
+
+## Third-Party Attribution
+
+This repository includes/adapts ideas and reference code from external projects.
+
+- `kpflow` (https://github.com/meeree/kpflow)
+  - Authors (as listed by the upstream preprint citation): James Hazelden, Laura Driscoll, Eli Shlizerman, and Eric Shea-Brown.
+  - Local reference copy: `kpflow/`
