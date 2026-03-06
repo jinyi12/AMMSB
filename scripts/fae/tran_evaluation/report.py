@@ -485,17 +485,16 @@ def plot_detail_bands(
 # ============================================================================
 
 def plot_pdfs(
-    obs_details: Dict[int, NDArray],
-    gen_details: Dict[int, NDArray],
+    first_order_results: Dict[int, Dict],
     out_dir: Path,
     n_cols: int = N_COLS,
     H_schedule: Optional[List[float]] = None,
 ) -> None:
-    """One-point PDFs of detail-band values (observed vs generated).
+    """One-point PDFs of decorrelated detail-band values (observed vs generated).
 
     **What it shows.**  Histogram-based density curves (with light
-    smoothing for presentation) of pixel values in each detail band,
-    overlaid for the observed and generated ensembles (following
+    smoothing for presentation) of decorrelated point values in each
+    detail band, overlaid for the observed and generated ensembles (following
     Tran et al., Figs. 13--14 in spirit).
 
     **Diagnostic value.**  The most direct test of one-point accuracy.
@@ -506,7 +505,7 @@ def plot_pdfs(
     shift, scale mismatch, or heavy-tail discrepancies indicate first-order
     errors.  Complement with the QQ plot (Fig 5) for tail sensitivity.
     """
-    bands = sorted(set(obs_details.keys()) & set(gen_details.keys()))
+    bands = sorted(first_order_results.keys())
     n_bands = len(bands)
     n_rows = (n_bands + n_cols - 1) // n_cols
 
@@ -518,9 +517,10 @@ def plot_pdfs(
     for i, band in enumerate(bands):
         ax = axes[i // n_cols, i % n_cols]
 
+        res = first_order_results[band]
         x, y_obs, y_gen = _density_pair_curve(
-            obs_details[band],
-            gen_details[band],
+            res["obs_values"],
+            res["gen_values"],
             rng,
         )
         markevery = max(1, int(len(x) // 10))
@@ -1072,12 +1072,13 @@ def plot_direct_field_pdfs(
     eval_H_schedule: List[float],
     out_dir: Path,
     n_cols: int = N_COLS,
+    min_spacing_pixels: int = 4,
 ) -> None:
-    """One-point PDFs of the direct filtered fields (not detail-band residuals).
+    """One-point PDFs of decorrelated direct filtered-field values.
 
     **What it shows.**  Histogram-based density curves (with light
-    smoothing for presentation) of GT ensemble pixel values vs generated
-    ensemble pixel values at each evaluation scale. One subplot per scale.
+    smoothing for presentation) of decorrelated GT vs generated point
+    values at each evaluation scale. One subplot per scale.
 
     **Diagnostic value.**  Shows whether the generator reproduces the
     correct marginal distribution at each spatial scale independently,
@@ -1096,13 +1097,20 @@ def plot_direct_field_pdfs(
     axes = np.atleast_2d(axes)
 
     rng = np.random.default_rng(0)
+    from scripts.fae.tran_evaluation.first_order import sample_decorrelated_values
 
     for i, scale in enumerate(scales):
         ax = axes[i // n_cols, i % n_cols]
 
-        x, y_obs, y_gen = _density_pair_curve(
+        sampled = sample_decorrelated_values(
             eval_gt_fields[scale],
             gen_filtered_fields[scale],
+            resolution=int(np.sqrt(eval_gt_fields[scale].shape[1])),
+            min_spacing_pixels=min_spacing_pixels,
+        )
+        x, y_obs, y_gen = _density_pair_curve(
+            sampled["obs_values"],
+            sampled["gen_values"],
             rng,
         )
         markevery = max(1, int(len(x) // 10))
@@ -1217,7 +1225,7 @@ def plot_direct_field_correlation(
     """Directional normalised correlation R(tau) of the direct filtered fields.
 
     **What it shows.**  R(tau e_1) and R(tau e_2) for the filtered fields
-    at each evaluation scale, comparing the observed ensemble-mean curve
+    at each evaluation scale, comparing the observed ensemble curve
     (solid/dashed blue) against the generated ensemble mean +/- one
     standard deviation (red with shaded envelope).  One subplot per scale.
 
@@ -1231,7 +1239,6 @@ def plot_direct_field_correlation(
     envelope across the full lag range, analogous to Fig 6.
     """
     from scripts.fae.tran_evaluation.second_order import (
-        directional_correlation,
         ensemble_directional_correlation,
     )
 
@@ -1245,11 +1252,11 @@ def plot_direct_field_correlation(
     for i, scale in enumerate(scales):
         ax = axes[i // n_cols, i % n_cols]
 
-        # Observed: correlation of ensemble-mean field.
-        obs_mean_2d = np.mean(
-            eval_gt_fields[scale], axis=0,
-        ).reshape(resolution, resolution)
-        R_obs_e1, R_obs_e2 = directional_correlation(obs_mean_2d)
+        obs_corr = ensemble_directional_correlation(
+            eval_gt_fields[scale], resolution,
+        )
+        R_obs_e1 = obs_corr["R_e1_mean"]
+        R_obs_e2 = obs_corr["R_e2_mean"]
 
         # Generated: ensemble statistics.
         gen_corr = ensemble_directional_correlation(
@@ -1468,11 +1475,11 @@ def plot_trajectory_pdfs(
     out_dir: Path,
     n_cols: int = N_COLS,
 ) -> None:
-    """One-point PDFs of backward SDE trajectory fields vs GT at each knot scale.
+    """One-point PDFs of decorrelated backward SDE trajectory fields vs GT.
 
     **What it shows.**  Histogram-based density curves (with light
-    smoothing for presentation) of GT ensemble pixel values vs generated
-    trajectory-field pixel values at each MSBM knot time (following
+    smoothing for presentation) of decorrelated GT vs generated
+    trajectory-field point values at each MSBM knot time (following
     Tran et al., Figs. 13--14 in spirit).
 
     **Diagnostic value.**  Tests whether the backward SDE produces fields
@@ -1499,8 +1506,8 @@ def plot_trajectory_pdfs(
         res = trajectory_results[k]
 
         x, y_obs, y_gen = _density_pair_curve(
-            res["_obs_fields"],
-            res["_gen_fields"],
+            res["_obs_values"],
+            res["_gen_values"],
             rng,
         )
         markevery = max(1, int(len(x) // 10))

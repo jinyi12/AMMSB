@@ -17,7 +17,9 @@ Metrics
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Tuple
+
+import math
 
 import numpy as np
 from numpy.typing import NDArray
@@ -56,35 +58,95 @@ def subsample_grid_indices(
 
 
 # ============================================================================
+# Correlation-aware spatial sub-sampling
+# ============================================================================
+
+def decorrelation_spacing_from_curves(
+    R_e1: NDArray[np.floating],
+    R_e2: NDArray[np.floating],
+    *,
+    min_spacing_pixels: int = 4,
+    spacing_multiplier: float = 2.0,
+) -> Dict[str, float | int]:
+    """Choose a decorrelated spatial spacing from observed correlation curves.
+
+    The spacing is set to at least ``spacing_multiplier`` times the larger
+    observed e-folding correlation length, with ``min_spacing_pixels`` used
+    as a lower bound.
+    """
+    from scripts.fae.tran_evaluation.second_order import correlation_lengths
+
+    xi_e1 = float(correlation_lengths(np.asarray(R_e1, dtype=np.float64), pixel_size=1.0)["xi_e"])
+    xi_e2 = float(correlation_lengths(np.asarray(R_e2, dtype=np.float64), pixel_size=1.0)["xi_e"])
+    xi_max = max(xi_e1, xi_e2)
+
+    spacing = int(max(
+        1,
+        int(min_spacing_pixels),
+        int(math.ceil(float(spacing_multiplier) * xi_max)),
+    ))
+    return {
+        "spacing_pixels": spacing,
+        "xi_e1_pixels": xi_e1,
+        "xi_e2_pixels": xi_e2,
+        "xi_max_pixels": xi_max,
+        "spacing_multiplier": float(spacing_multiplier),
+    }
+
+
+def sample_decorrelated_values(
+    obs_fields: NDArray[np.floating],
+    gen_fields: NDArray[np.floating],
+    resolution: int,
+    min_spacing_pixels: int = 4,
+    spacing_multiplier: float = 2.0,
+) -> Dict:
+    """Sample decorrelated one-point values using observed correlation lengths.
+
+    The observed ensemble determines the spatial spacing, and the same sample
+    locations are then applied to both observed and generated fields.
+    """
+    from scripts.fae.tran_evaluation.second_order import ensemble_directional_correlation
+
+    obs_corr = ensemble_directional_correlation(obs_fields, resolution)
+    spacing_info = decorrelation_spacing_from_curves(
+        obs_corr["R_e1_mean"],
+        obs_corr["R_e2_mean"],
+        min_spacing_pixels=min_spacing_pixels,
+        spacing_multiplier=spacing_multiplier,
+    )
+    spacing = int(min(int(spacing_info["spacing_pixels"]), int(resolution)))
+    idx = subsample_grid_indices(resolution, spacing)
+
+    obs_vals = np.asarray(obs_fields[:, idx], dtype=np.float64).ravel()
+    gen_vals = np.asarray(gen_fields[:, idx], dtype=np.float64).ravel()
+
+    sampling = {
+        **spacing_info,
+        "spacing_pixels": spacing,
+        "n_pixels_per_sample": int(idx.size),
+        "n_obs_values": int(obs_vals.size),
+        "n_gen_values": int(gen_vals.size),
+    }
+    return {
+        "obs_values": obs_vals,
+        "gen_values": gen_vals,
+        "indices": idx,
+        "sampling": sampling,
+    }
+
+
+# ============================================================================
 # Wasserstein-1
 # ============================================================================
 
-def wasserstein1_detail(
-    obs_detail: NDArray[np.floating],
-    gen_detail: NDArray[np.floating],
-    resolution: int,
-    min_spacing_pixels: int = 4,
+def wasserstein1_values(
+    obs_values: NDArray[np.floating],
+    gen_values: NDArray[np.floating],
 ) -> Dict:
-    """Compute 1-D Wasserstein-1 between observed and generated detail values.
-
-    Both arrays may contain multiple samples; pixel values are pooled.
-
-    Parameters
-    ----------
-    obs_detail : array (N_obs, res²)
-    gen_detail : array (K, res²)
-    resolution : int
-    min_spacing_pixels : int
-        Sub-grid spacing for approximate independence.
-
-    Returns
-    -------
-    dict with ``w1``, ``w1_normalised`` (by obs std), sampled pixel counts.
-    """
-    idx = subsample_grid_indices(resolution, min_spacing_pixels)
-
-    obs_vals = obs_detail[:, idx].ravel().astype(np.float64)
-    gen_vals = gen_detail[:, idx].ravel().astype(np.float64)
+    """Compute 1-D Wasserstein-1 between two sampled one-point ensembles."""
+    obs_vals = np.asarray(obs_values, dtype=np.float64).ravel()
+    gen_vals = np.asarray(gen_values, dtype=np.float64).ravel()
 
     w1 = float(_w1(obs_vals, gen_vals))
 
@@ -97,7 +159,6 @@ def wasserstein1_detail(
         "obs_std": obs_std,
         "n_obs_values": int(obs_vals.size),
         "n_gen_values": int(gen_vals.size),
-        "n_pixels_per_sample": int(idx.size),
     }
 
 
@@ -106,22 +167,22 @@ def wasserstein1_detail(
 # ============================================================================
 
 def moment_comparison(
-    obs_detail: NDArray[np.floating],
-    gen_detail: NDArray[np.floating],
+    obs_values: NDArray[np.floating],
+    gen_values: NDArray[np.floating],
 ) -> Dict:
-    """Compare first four moments of observed vs generated detail fields.
+    """Compare first four moments of observed vs generated sampled values.
 
     Parameters
     ----------
-    obs_detail : array (N_obs, res²)
-    gen_detail : array (K, res²)
+    obs_values : array-like
+    gen_values : array-like
 
     Returns
     -------
     dict with ``obs_moments``, ``gen_moments``, ``relative_errors``.
     """
-    obs_flat = obs_detail.ravel().astype(np.float64)
-    gen_flat = gen_detail.ravel().astype(np.float64)
+    obs_flat = np.asarray(obs_values, dtype=np.float64).ravel()
+    gen_flat = np.asarray(gen_values, dtype=np.float64).ravel()
 
     obs_m = {
         "mean": float(np.mean(obs_flat)),
@@ -164,8 +225,8 @@ def empirical_cdf(
 
 
 def qq_data(
-    obs: NDArray[np.floating],
-    gen: NDArray[np.floating],
+    obs_values: NDArray[np.floating],
+    gen_values: NDArray[np.floating],
     n_quantiles: int = 200,
 ) -> Tuple[NDArray, NDArray]:
     """Return matched quantiles for a QQ plot.
@@ -173,9 +234,47 @@ def qq_data(
     Returns (obs_quantiles, gen_quantiles).
     """
     probs = np.linspace(0, 1, n_quantiles + 2)[1:-1]  # exclude 0 and 1
-    obs_q = np.quantile(obs.ravel().astype(np.float64), probs)
-    gen_q = np.quantile(gen.ravel().astype(np.float64), probs)
+    obs_q = np.quantile(np.asarray(obs_values, dtype=np.float64).ravel(), probs)
+    gen_q = np.quantile(np.asarray(gen_values, dtype=np.float64).ravel(), probs)
     return obs_q, gen_q
+
+
+# ============================================================================
+# Aggregate helpers
+# ============================================================================
+
+def evaluate_first_order_pair(
+    obs_fields: NDArray[np.floating],
+    gen_fields: NDArray[np.floating],
+    resolution: int,
+    min_spacing_pixels: int = 4,
+) -> Dict:
+    """Run decorrelated first-order evaluation for a single observed/generated pair."""
+    sampled = sample_decorrelated_values(
+        obs_fields,
+        gen_fields,
+        resolution,
+        min_spacing_pixels=min_spacing_pixels,
+    )
+    obs_values = sampled["obs_values"]
+    gen_values = sampled["gen_values"]
+
+    w1_res = wasserstein1_values(obs_values, gen_values)
+    w1_res["n_pixels_per_sample"] = int(sampled["sampling"]["n_pixels_per_sample"])
+    w1_res["spacing_pixels"] = int(sampled["sampling"]["spacing_pixels"])
+
+    mom_res = moment_comparison(obs_values, gen_values)
+    obs_q, gen_q = qq_data(obs_values, gen_values)
+
+    return {
+        "wasserstein1": w1_res,
+        "moments": mom_res,
+        "qq_obs": obs_q,
+        "qq_gen": gen_q,
+        "obs_values": obs_values,
+        "gen_values": gen_values,
+        "sampling": sampled["sampling"],
+    }
 
 
 # ============================================================================
@@ -205,21 +304,11 @@ def evaluate_first_order(
     bands = sorted(set(obs_details.keys()) & set(gen_details.keys()))
 
     for band in bands:
-        w1_res = wasserstein1_detail(
+        results[band] = evaluate_first_order_pair(
             obs_details[band],
             gen_details[band],
             resolution,
             min_spacing_pixels,
         )
-        mom_res = moment_comparison(obs_details[band], gen_details[band])
-
-        obs_q, gen_q = qq_data(obs_details[band], gen_details[band])
-
-        results[band] = {
-            "wasserstein1": w1_res,
-            "moments": mom_res,
-            "qq_obs": obs_q,
-            "qq_gen": gen_q,
-        }
 
     return results

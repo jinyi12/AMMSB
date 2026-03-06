@@ -101,8 +101,15 @@ def ensemble_directional_correlation(
 
     Returns
     -------
-    dict with ``R_e1_mean``, ``R_e1_std``, ``R_e2_mean``, ``R_e2_std``,
-    each of shape (res,), and ``lags_pixels`` array.
+        dict with ``R_e1_mean``, ``R_e1_std``, ``R_e2_mean``, ``R_e2_std``,
+        each of shape (res,), and ``lags_pixels`` array.
+
+    Notes
+    -----
+    This matches Tran et al.'s ensemble-level normalized covariance
+    descriptor: compute the directional correlation for each realization,
+    then average across realizations. This is not the same as computing the
+    correlation of the ensemble-mean field.
     """
     K = fields.shape[0]
     all_e1 = np.zeros((K, resolution), dtype=np.float64)
@@ -304,11 +311,10 @@ def evaluate_second_order(
     bands = sorted(set(obs_details.keys()) & set(gen_details.keys()))
 
     for band in bands:
-        # Observed: single sample → compute one R per direction.
         obs = obs_details[band]
-        # Use mean field across available observations for reference R.
-        obs_mean_2d = np.mean(obs, axis=0).reshape(resolution, resolution)
-        R_obs_e1, R_obs_e2 = directional_correlation(obs_mean_2d)
+        obs_corr = ensemble_directional_correlation(obs, resolution)
+        R_obs_e1 = obs_corr["R_e1_mean"]
+        R_obs_e2 = obs_corr["R_e2_mean"]
 
         # Generated: ensemble statistics.
         gen_corr = ensemble_directional_correlation(gen_details[band], resolution)

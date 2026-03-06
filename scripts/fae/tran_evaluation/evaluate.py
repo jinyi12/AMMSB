@@ -93,7 +93,10 @@ from scripts.fae.tran_evaluation.detail_fields import (  # noqa: E402
     build_observed_detail_fields,
     build_observed_ensemble_detail_fields,
 )
-from scripts.fae.tran_evaluation.first_order import evaluate_first_order  # noqa: E402
+from scripts.fae.tran_evaluation.first_order import (  # noqa: E402
+    evaluate_first_order,
+    evaluate_first_order_pair,
+)
 from scripts.fae.tran_evaluation.second_order import evaluate_second_order  # noqa: E402
 from scripts.fae.tran_evaluation.spectral import evaluate_spectral  # noqa: E402
 from scripts.fae.tran_evaluation.diversity import evaluate_diversity  # noqa: E402
@@ -559,7 +562,7 @@ def _compute_latent_geometry_results(
 def _build_eval_scope(
     full_H_schedule: list[float],
     gt_fields_by_index: dict[int, np.ndarray],
-    gt_micro_dataset_idx: int,
+    modeled_dataset_indices: list[int],
     L_domain: float,
     resolution: int,
 ) -> tuple[list[float], dict[int, np.ndarray], "FilterLadder"]:
@@ -580,17 +583,21 @@ def _build_eval_scope(
     eval_ladder : FilterLadder
         Ladder configured with ``eval_H_schedule``.
     """
-    # Scales strictly coarser than the generator's native scale.
-    coarser_H = full_H_schedule[gt_micro_dataset_idx + 1:]
+    if not modeled_dataset_indices:
+        raise ValueError("modeled_dataset_indices must contain at least one dataset index.")
 
-    # H=0 (identity) as starting point, then coarser scales.
-    eval_H_schedule = [0.0] + coarser_H
+    modeled_dataset_indices = [int(idx) for idx in modeled_dataset_indices]
+    if modeled_dataset_indices[0] == 0:
+        raise ValueError(
+            "modeled_dataset_indices should exclude raw microscale index 0 for Tran evaluation."
+        )
 
-    # Remap GT fields: new key 0 → GT at gen's native scale, etc.
-    dataset_indices = list(range(gt_micro_dataset_idx, len(full_H_schedule)))
+    # H=0 (identity) corresponds to the generator's native scale.
+    eval_H_schedule = [0.0] + [full_H_schedule[idx] for idx in modeled_dataset_indices[1:]]
+
     eval_gt_fields = {
         new_idx: gt_fields_by_index[old_idx]
-        for new_idx, old_idx in enumerate(dataset_indices)
+        for new_idx, old_idx in enumerate(modeled_dataset_indices)
     }
 
     eval_ladder = FilterLadder(
@@ -760,31 +767,31 @@ def main() -> None:
     # --- Build evaluation-scope ladder & GT fields ---
     # Excludes the raw piecewise-constant microscale (H=0, dataset idx 0)
     # AND the generator's native scale (H=1.0D) from the filter ladder
-    # to avoid including unfair bands or double-convolution artefacts.
-    #
-    # eval_H_schedule = [0(identity), 1.25, 1.5, 2.0, 2.5, 3.0, 6.0]
-    # eval_gt_fields  = {0: GT_H1.0, 1: GT_H1.25, ..., 6: GT_H6.0}
-    #
-    # Both gen and GT yield 6 aligned detail bands:
-    #   Band 0: H=1.0D -> H=1.25D
-    #   Band 1: H=1.25D -> H=1.5D
-    #   ...
-    #   Band 5: H=3.0D -> H=6.0D
+    modeled_dataset_indices = (
+        [int(idx) for idx in time_indices.tolist()]
+        if time_indices is not None
+        else list(range(max(1, gt_micro_dataset_idx), len(full_H_schedule)))
+    )
+
     eval_H_schedule, eval_gt_fields, eval_ladder = _build_eval_scope(
         full_H_schedule,
         gt["fields_by_index"],
-        gt_micro_dataset_idx,
+        modeled_dataset_indices,
         args.L_domain,
         resolution,
     )
+
+    eval_gt_ensemble_fields = {
+        idx: fields[:args.n_gt_neighbors]
+        for idx, fields in eval_gt_fields.items()
+    }
 
     # For plotting: map eval scale index 0 (identity filter on the generated
     # field) to the generator's *physical* native scale (e.g. H=1.0D).
     # This avoids misleading figure titles/labels like "H=0" for the native
     # generated/GT field, while keeping the evaluation ladder correct.
     label_H_schedule = [
-        full_H_schedule[gt_micro_dataset_idx],
-        *eval_H_schedule[1:],
+        *[full_H_schedule[idx] for idx in modeled_dataset_indices],
     ]
 
     n_eval_scales = len(eval_H_schedule)
@@ -792,8 +799,8 @@ def main() -> None:
     eval_macro_scale_idx = n_eval_scales - 1
 
     print(f"Eval H_schedule: {eval_H_schedule}  ({n_eval_bands} detail bands)")
-    print(f"  Excluded from bands: H=0 (raw microscale) and "
-          f"H={full_H_schedule[gt_micro_dataset_idx]:.2f} (gen native scale)")
+    print(f"Modeled dataset indices: {modeled_dataset_indices}")
+    print("  Excluded from evaluation: raw microscale index 0 and any held-out dataset indices")
 
     # ---------------------------------------------------------------
     # Phase 1: Conditioning consistency
@@ -830,7 +837,7 @@ def main() -> None:
 
     # Ensemble of GT detail fields for distribution comparison.
     obs_ensemble_details = build_observed_ensemble_detail_fields(
-        eval_gt_fields,
+        eval_gt_ensemble_fields,
         max_samples=args.n_gt_neighbors,
     )
 
@@ -848,6 +855,12 @@ def main() -> None:
     for b in sorted(first_order.keys()):
         w = first_order[b]["wasserstein1"]
         print(f"  Band {b}: W1={w['w1']:.6f}  W1_norm={w['w1_normalised']:.6f}")
+        samp = first_order[b]["sampling"]
+        print(
+            "           "
+            f"spacing={int(samp['spacing_pixels'])} px  "
+            f"xi_obs=({samp['xi_e1_pixels']:.2f}, {samp['xi_e2_pixels']:.2f}) px"
+        )
 
     # ---------------------------------------------------------------
     # Phase 4: Second-order statistics
@@ -915,13 +928,7 @@ def main() -> None:
     trajectory_fields = gen.get("trajectory_fields_phys")
 
     if trajectory_fields is not None and time_indices is not None:
-        from scripts.fae.tran_evaluation.first_order import (  # noqa: E402
-            wasserstein1_detail,
-            moment_comparison,
-            qq_data,
-        )
         from scripts.fae.tran_evaluation.second_order import (  # noqa: E402
-            directional_correlation,
             ensemble_directional_correlation,
             tran_J_mismatch,
             correlation_lengths,
@@ -944,17 +951,16 @@ def main() -> None:
             gen_fields_k = trajectory_fields[k]  # (N_real, res^2)
             gt_fields_k = gt["fields_by_index"][ds_idx][:args.n_gt_neighbors]  # (N_gt, res^2)
 
-            # First-order: W1 + moments.
-            w1_res = wasserstein1_detail(
-                gt_fields_k, gen_fields_k,
-                resolution, args.min_spacing_pixels,
+            first_order_k = evaluate_first_order_pair(
+                gt_fields_k,
+                gen_fields_k,
+                resolution,
+                args.min_spacing_pixels,
             )
-            mom_res = moment_comparison(gt_fields_k, gen_fields_k)
-            obs_q, gen_q = qq_data(gt_fields_k, gen_fields_k)
 
-            # Second-order: R(tau), J.
-            obs_mean_2d = np.mean(gt_fields_k, axis=0).reshape(resolution, resolution)
-            R_obs_e1, R_obs_e2 = directional_correlation(obs_mean_2d)
+            obs_corr = ensemble_directional_correlation(gt_fields_k, resolution)
+            R_obs_e1 = obs_corr["R_e1_mean"]
+            R_obs_e2 = obs_corr["R_e2_mean"]
             gen_corr = ensemble_directional_correlation(gen_fields_k, resolution)
             J_res = tran_J_mismatch(
                 R_obs_e1, R_obs_e2,
@@ -976,10 +982,10 @@ def main() -> None:
             lam_gen = characteristic_wavelength(gen_psd["k_bins"], gen_psd["psd_mean"])
 
             trajectory_results[k] = {
-                "wasserstein1": w1_res,
-                "moments": mom_res,
-                "qq_obs": obs_q,
-                "qq_gen": gen_q,
+                "wasserstein1": first_order_k["wasserstein1"],
+                "moments": first_order_k["moments"],
+                "qq_obs": first_order_k["qq_obs"],
+                "qq_gen": first_order_k["qq_gen"],
                 "R_obs_e1": R_obs_e1,
                 "R_obs_e2": R_obs_e2,
                 "gen_correlation": gen_corr,
@@ -994,15 +1000,20 @@ def main() -> None:
                 "psd_mismatch": dpsd,
                 "wavelength_obs": lam_obs,
                 "wavelength_gen": lam_gen,
-                # Store field references for plotting (PDFs).
-                "_obs_fields": gt_fields_k,
-                "_gen_fields": gen_fields_k,
+                "_obs_values": first_order_k["obs_values"],
+                "_gen_values": first_order_k["gen_values"],
+                "_sampling": first_order_k["sampling"],
             }
 
+            w1_res = first_order_k["wasserstein1"]
             print(f"  Knot {k} (H={H_val:.2f}): "
                   f"W1_norm={w1_res['w1_normalised']:.6f}  "
                   f"J_norm={J_res['J_normalised']:.6f}  "
                   f"dPSD={dpsd:.4f}")
+            print(
+                f"           spacing={int(first_order_k['sampling']['spacing_pixels'])} px  "
+                f"xi_obs=({first_order_k['sampling']['xi_e1_pixels']:.2f}, {first_order_k['sampling']['xi_e2_pixels']:.2f}) px"
+            )
 
         # Print trajectory summary.
         traj_summary = print_trajectory_summary_table(
@@ -1195,7 +1206,7 @@ def main() -> None:
         # Figs 3-9: All use eval-scoped detail bands (raw micro excluded).
         plot_detail_bands(obs_single_details, gen_details, resolution, out_dir,
                           H_schedule=label_H_schedule)
-        plot_pdfs(obs_ensemble_details, gen_details, out_dir,
+        plot_pdfs(first_order, out_dir,
                   H_schedule=label_H_schedule)
         plot_qq(first_order, out_dir, H_schedule=label_H_schedule)
         plot_directional_correlation(second_order, pixel_size, out_dir,
@@ -1206,10 +1217,11 @@ def main() -> None:
 
         # Figs 10-11: Direct-field (non-detail-band) comparisons.
         plot_direct_field_pdfs(
-            eval_gt_fields, gen_filtered, label_H_schedule, out_dir,
+            eval_gt_ensemble_fields, gen_filtered, label_H_schedule, out_dir,
+            min_spacing_pixels=args.min_spacing_pixels,
         )
         plot_direct_field_correlation(
-            eval_gt_fields, gen_filtered, label_H_schedule,
+            eval_gt_ensemble_fields, gen_filtered, label_H_schedule,
             resolution, pixel_size, out_dir,
         )
 
