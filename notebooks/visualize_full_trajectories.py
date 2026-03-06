@@ -15,11 +15,14 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+import colormaps as cmaps
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib import cm
 from matplotlib.collections import LineCollection
 from matplotlib.lines import Line2D
+
+_CMAP = cmaps.lipari
 
 # Make repo importable
 path_root = Path(__file__).resolve().parent.parent
@@ -167,6 +170,14 @@ def _fit_pca_embedding(
     if extra is not None:
         fit = np.concatenate([fit, extra.reshape(-1, K)], axis=0)
 
+    finite_mask = np.isfinite(fit).all(axis=1)
+    fit = fit[finite_mask]
+    if fit.shape[0] < max(10, dim):
+        raise ValueError(
+            "Not enough finite points to fit PCA embedding. "
+            f"Found {fit.shape[0]} finite rows."
+        )
+
     try:
         from sklearn.decomposition import PCA
 
@@ -198,6 +209,14 @@ def _subsample_per_time(latents: np.ndarray, n: int, seed: int) -> np.ndarray:
         idx = rng.choice(N, size=n_use, replace=False)
         out.append(latents[t, idx])
     return np.stack(out, axis=0)
+
+
+def _finite_summary_stats(values: np.ndarray) -> tuple[float, float, float, float]:
+    arr = np.asarray(values, dtype=np.float64).ravel()
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return float("nan"), float("nan"), float("nan"), float("nan")
+    return float(arr.mean()), float(arr.std()), float(arr.min()), float(arr.max())
 
 
 embed_dim_eff = min(embed_dim, latent_dim)
@@ -252,14 +271,15 @@ print(f"Transformed to {embed_dim_eff}D embedding")
 # ## Plot helpers (style consistent with `fae_latent_msbm_latent_viz.py`)
 
 # %%
-def _time_colors(times: np.ndarray, cmap_name: str = "viridis", *, vmin: float | None = None, vmax: float | None = None):
+def _time_colors(times: np.ndarray, cmap=None, *, vmin: float | None = None, vmax: float | None = None):
+    if cmap is None:
+        cmap = _CMAP
     times = np.asarray(times, dtype=np.float32)
     if vmin is None:
         vmin = float(times.min())
     if vmax is None:
         vmax = float(times.max())
     norm = plt.Normalize(vmin=float(vmin), vmax=float(vmax))
-    cmap = cm.get_cmap(cmap_name)
     return norm, cmap
 
 
@@ -294,13 +314,12 @@ def plot_manifold_2d(
     latent_e: np.ndarray,  # (T,n,2)
     times: np.ndarray,  # (T,)
     *,
-    title: str,
     show_mean_path: bool = True,
     alpha: float = 0.12,
     s: float = 6.0,
-    cmap_name: str = "viridis",
+    cmap=None,
 ):
-    norm, cmap = _time_colors(times, cmap_name=cmap_name)
+    norm, cmap = _time_colors(times, cmap)
     fig, ax = plt.subplots(figsize=(7, 6))
     for t in range(latent_e.shape[0]):
         c = cmap(norm(float(times[t])))
@@ -308,15 +327,14 @@ def plot_manifold_2d(
 
     if show_mean_path:
         means = latent_e.mean(axis=1)
-        ax.plot(means[:, 0], means[:, 1], color="black", lw=2.0, alpha=0.8, label="marginal mean path")
+        ax.plot(means[:, 0], means[:, 1], color="black", lw=2.0, alpha=0.8, label="mean path")
         ax.scatter(means[:, 0], means[:, 1], color="black", s=25, zorder=3)
 
     sm = cm.ScalarMappable(norm=norm, cmap=cmap)
     sm.set_array([])
     cb = fig.colorbar(sm, ax=ax, fraction=0.046, pad=0.04)
-    cb.set_label("time (zt)", rotation=90)
+    cb.set_label("$H$", rotation=90)
 
-    ax.set_title(title)
     ax.set_xlabel("PC1" if embed_method == "pca" else "Latent dim 1")
     ax.set_ylabel("PC2" if embed_method == "pca" else "Latent dim 2")
     ax.grid(True, alpha=0.2)
@@ -365,7 +383,7 @@ def plot_full_trajectories_2d(
     reverse: bool = False,
     lw: float = 1.2,
     alpha: float = 0.9,
-    cmap_name: str = "viridis",
+    cmap=None,
     zorder: int = 5,
 ):
     if traj_e is None or traj_e.size == 0:
@@ -375,13 +393,13 @@ def plot_full_trajectories_2d(
     n_use = min(int(n_plot), int(traj_e.shape[1]))
 
     times_use = times_full[::-1] if bool(reverse) else times_full
-    norm, _cmap = _time_colors(times_use, cmap_name=cmap_name)
+    norm, cmap_obj = _time_colors(times_use, cmap)
     for j in range(n_use):
         pts = traj_e[:, j, :]
         if reverse:
             pts = pts[::-1]
         segs = np.concatenate([pts[:-1, None, :], pts[1:, None, :]], axis=1)
-        lc = LineCollection(segs, cmap=cm.get_cmap(cmap_name), norm=norm, linewidths=lw, alpha=alpha, zorder=zorder)
+        lc = LineCollection(segs, cmap=cmap_obj, norm=norm, linewidths=lw, alpha=alpha, zorder=zorder)
         lc.set_array(times_use[:-1])
         ax.add_collection(lc)
         ax.scatter(
@@ -404,9 +422,9 @@ def plot_full_trajectories_2d(
         )
 
 
-def add_time_colorbar(fig, ax, times_full: np.ndarray, *, cmap_name: str = "viridis", label: str = "time (zt)"):
-    norm, cmap = _time_colors(times_full, cmap_name=cmap_name)
-    sm = cm.ScalarMappable(norm=norm, cmap=cmap)
+def add_time_colorbar(fig, ax, times_full: np.ndarray, *, cmap=None, label: str = "$H$"):
+    norm, cmap_obj = _time_colors(times_full, cmap)
+    sm = cm.ScalarMappable(norm=norm, cmap=cmap_obj)
     sm.set_array([])
     cb = fig.colorbar(sm, ax=ax, fraction=0.046, pad=0.04)
     cb.set_label(label, rotation=90)
@@ -430,7 +448,6 @@ elif latent_sub_e is not None:
     fig, _ax = plot_manifold_2d(
         latent_sub_e,
         zt,
-        title=f"FAE latent manifold (PCA) [{manifold_split} split]  |  latent_dim={latent_dim}",
         show_mean_path=True,
     )
     fig.savefig(viz_dir / "latent_manifold_only_2d.png", dpi=150)
@@ -462,7 +479,7 @@ else:
 
         # Add marginal knots with a professional marker style (diamond), colored by marginal time.
         if overlay_knots and knots_f_e is not None:
-            knot_norm, knot_cmap = _time_colors(zt, cmap_name="viridis")
+            knot_norm, knot_cmap = _time_colors(zt)
             for t_idx in range(len(zt)):
                 c = knot_cmap(knot_norm(float(zt[t_idx])))
                 ax.scatter(
@@ -477,10 +494,9 @@ else:
                 )
         add_start_end_legend(ax)
 
-        ax.set_title(f"Full SDE trajectories - Forward policy\n{n_use} samples, {traj_f_e.shape[0]} SDE steps")
         ax.set_xlabel("PC1" if embed_method == "pca" else "Latent dim 1")
         ax.set_ylabel("PC2" if embed_method == "pca" else "Latent dim 2")
-        ax.grid(True, alpha=0.3)
+        ax.grid(True, alpha=0.2)
         ax.set_aspect('equal', adjustable='box')
         fig.tight_layout()
         fig.savefig(viz_dir / "full_trajectories_forward_only_2d.png", dpi=150)
@@ -498,7 +514,7 @@ else:
         # add_time_colorbar(fig, ax, times_b, cmap_name="viridis", label="time (zt)")
 
         if overlay_knots and knots_b_e is not None:
-            knot_norm, knot_cmap = _time_colors(zt, cmap_name="viridis")
+            knot_norm, knot_cmap = _time_colors(zt)
             for t_idx in range(len(zt)):
                 c = knot_cmap(knot_norm(float(zt[t_idx])))
                 ax.scatter(
@@ -513,10 +529,9 @@ else:
                 )
         add_start_end_legend(ax)
 
-        ax.set_title(f"Full SDE trajectories - Backward policy\n{n_use} samples, {traj_b_e.shape[0]} SDE steps")
         ax.set_xlabel("PC1" if embed_method == "pca" else "Latent dim 1")
         ax.set_ylabel("PC2" if embed_method == "pca" else "Latent dim 2")
-        ax.grid(True, alpha=0.3)
+        ax.grid(True, alpha=0.2)
         ax.set_aspect('equal', adjustable='box')
         fig.tight_layout()
         fig.savefig(viz_dir / "full_trajectories_backward_only_2d.png", dpi=150)
@@ -544,7 +559,6 @@ elif latent_sub_e is not None:
         fig, ax = plot_manifold_2d(
             latent_sub_e,
             zt,
-            title="FAE latent manifold + Full SDE trajectories (forward)",
             show_mean_path=False,
         )
         n_use = min(n_traj_plot, traj_f_e.shape[1])
@@ -553,7 +567,7 @@ elif latent_sub_e is not None:
 
         # Overlay marginal knots as distinct markers (exclude endpoints to keep start/end clear)
         if overlay_knots and knots_f_e is not None and len(zt) > 2:
-            knot_norm, knot_cmap = _time_colors(zt, cmap_name="viridis")
+            knot_norm, knot_cmap = _time_colors(zt)
             for t_idx in range(1, len(zt) - 1):
                 c = knot_cmap(knot_norm(float(zt[t_idx])))
                 ax.scatter(
@@ -577,7 +591,6 @@ elif latent_sub_e is not None:
         fig, ax = plot_manifold_2d(
             latent_sub_e,
             zt,
-            title="FAE latent manifold + Full SDE trajectories (backward)",
             show_mean_path=False,
         )
         n_use = min(n_traj_plot, traj_b_e.shape[1])
@@ -587,7 +600,7 @@ elif latent_sub_e is not None:
         # add_time_colorbar(fig, ax, times_b, cmap_name="viridis", label="time (zt)")
 
         if overlay_knots and knots_b_e is not None and len(zt) > 2:
-            knot_norm, knot_cmap = _time_colors(zt, cmap_name="viridis")
+            knot_norm, knot_cmap = _time_colors(zt)
             for t_idx in range(1, len(zt) - 1):
                 c = knot_cmap(knot_norm(float(zt[t_idx])))
                 ax.scatter(
@@ -603,8 +616,10 @@ elif latent_sub_e is not None:
         add_start_end_legend(ax)
 
         fig.savefig(viz_dir / "manifold_with_trajectories_backward_2d.png", dpi=150)
+        fig.savefig(viz_dir / "manifold_with_trajectories_backward_2d.pdf")
         plt.show()
         print(f"Saved: {viz_dir / 'manifold_with_trajectories_backward_2d.png'}")
+        print(f"Saved: {viz_dir / 'manifold_with_trajectories_backward_2d.pdf'}")
 else:
     print("Manifold background not available; showing trajectories only.")
 
@@ -630,11 +645,12 @@ if latent_f_full is not None and latent_f_knots is not None:
     velocity = np.diff(latent_f_full, axis=0)  # (T-1, N, K)
     speed = np.linalg.norm(velocity, axis=-1)  # (T-1, N)
 
+    speed_mean, speed_std, speed_min, speed_max = _finite_summary_stats(speed)
     print(f"\nSpeed statistics:")
-    print(f"  Mean:   {speed.mean():.6f}")
-    print(f"  Std:    {speed.std():.6f}")
-    print(f"  Min:    {speed.min():.6f}")
-    print(f"  Max:    {speed.max():.6f}")
+    print(f"  Mean:   {speed_mean:.6f}")
+    print(f"  Std:    {speed_std:.6f}")
+    print(f"  Min:    {speed_min:.6f}")
+    print(f"  Max:    {speed_max:.6f}")
 
     # Path length
     total_length = speed.sum(axis=0)  # (N,)
@@ -643,9 +659,10 @@ if latent_f_full is not None and latent_f_knots is not None:
     direct_dist = np.linalg.norm(end - start, axis=-1)
     efficiency = total_length / (direct_dist + 1e-8)
 
+    eff_mean, eff_std, _eff_min, _eff_max = _finite_summary_stats(efficiency)
     print(f"\nPath efficiency (ratio of path length to direct distance):")
-    print(f"  Mean:   {efficiency.mean():.4f}")
-    print(f"  Std:    {efficiency.std():.4f}")
+    print(f"  Mean:   {eff_mean:.4f}")
+    print(f"  Std:    {eff_std:.4f}")
     print(f"  (1.0 = straight line, higher = more curved)")
 
 if latent_b_full is not None and latent_b_knots is not None:
@@ -665,11 +682,12 @@ if latent_b_full is not None and latent_b_knots is not None:
     velocity = np.diff(latent_b_full, axis=0)
     speed = np.linalg.norm(velocity, axis=-1)
 
+    speed_mean, speed_std, speed_min, speed_max = _finite_summary_stats(speed)
     print(f"\nSpeed statistics:")
-    print(f"  Mean:   {speed.mean():.6f}")
-    print(f"  Std:    {speed.std():.6f}")
-    print(f"  Min:    {speed.min():.6f}")
-    print(f"  Max:    {speed.max():.6f}")
+    print(f"  Mean:   {speed_mean:.6f}")
+    print(f"  Std:    {speed_std:.6f}")
+    print(f"  Min:    {speed_min:.6f}")
+    print(f"  Max:    {speed_max:.6f}")
 
     total_length = speed.sum(axis=0)
     start = latent_b_full[0]
@@ -677,9 +695,10 @@ if latent_b_full is not None and latent_b_knots is not None:
     direct_dist = np.linalg.norm(end - start, axis=-1)
     efficiency = total_length / (direct_dist + 1e-8)
 
+    eff_mean, eff_std, _eff_min, _eff_max = _finite_summary_stats(efficiency)
     print(f"\nPath efficiency:")
-    print(f"  Mean:   {efficiency.mean():.4f}")
-    print(f"  Std:    {efficiency.std():.4f}")
+    print(f"  Mean:   {eff_mean:.4f}")
+    print(f"  Std:    {eff_std:.4f}")
 
 # %% [markdown]
 # ## Summary

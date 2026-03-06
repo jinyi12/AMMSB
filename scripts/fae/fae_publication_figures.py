@@ -57,7 +57,8 @@ from scripts.fae.fae_naive.fae_latent_utils import (
     build_attention_fae_from_checkpoint,
     make_fae_apply_fns,
 )
-from scripts.images.field_visualization import format_for_paper
+from data.transform_utils import load_transform_info, apply_inverse_transform
+from scripts.images.field_visualization import EASTERN_HUES, format_for_paper
 
 
 # ============================================================================
@@ -72,14 +73,14 @@ RUNS: List[Tuple[str, str, str, str, str]] = [
         "results/fae_film_adam_l2_99pct/run_bnqm4evk",
         "opt_l2",
         "-",
-        "#d62728",   # red
+        EASTERN_HUES[4],   # red
     ),
     (
         r"Muon + $\ell_2$",
         "results/fae_deterministic_film_multiscale/run_ujlkslav",
         "opt_l2",
         "-",
-        "#2ca02c",   # green (best)
+        EASTERN_HUES[2],   # deep green
     ),
     # ── Optimizer study (NTK-scaled loss): σ = {1, 2, 4, 8} ────────────────
     (
@@ -87,14 +88,14 @@ RUNS: List[Tuple[str, str, str, str, str]] = [
         "results/fae_film_adam_ntk_99pct/run_2hnr5shv",
         "opt_ntk",
         "--",
-        "#ff7f0e",   # orange
+        EASTERN_HUES[0],   # gold
     ),
     (
         "Muon + NTK",
         "results/fae_film_muon_ntk_99pct/run_tug7ucuw",
         "opt_ntk",
         "-.",
-        "#9467bd",   # purple
+        EASTERN_HUES[3],   # teal
     ),
     # ── Scale study: vary σ, fixed Muon + L2 ────────────────────────────────
     (
@@ -102,14 +103,14 @@ RUNS: List[Tuple[str, str, str, str, str]] = [
         "results/fae_deterministic_film/run_90ndogk3",
         "scale",
         "--",
-        "#1f77b4",   # blue
+        EASTERN_HUES[7],   # steel blue
     ),
     (
         r"Muon + $\ell_2$",
         "results/fae_deterministic_film_multiscale/run_ujlkslav",
         "scale",
         "-",
-        "#2ca02c",   # green
+        EASTERN_HUES[2],   # deep green
     ),
     # ── Architecture study: Muon+L2 vs Adam+L2+Prior ───────────────────────
     (
@@ -117,14 +118,14 @@ RUNS: List[Tuple[str, str, str, str, str]] = [
         "results/fae_deterministic_film_multiscale/run_ujlkslav",
         "arch",
         "-",
-        "#2ca02c",   # green
+        EASTERN_HUES[2],   # deep green
     ),
     (
         r"Adam + $\ell_2$ + Prior",
         "results/fae_film_prior_multiscale/run_66nrnp5e",
         "arch",
         "--",
-        "#8c564b",   # brown
+        EASTERN_HUES[1],   # brown
     ),
     # ── Denoiser study: single-scale and default multiscale ────────────────
     (
@@ -132,14 +133,14 @@ RUNS: List[Tuple[str, str, str, str, str]] = [
         "results/fae_denoiser_film_heek/run_ezndnxw0",
         "den",
         "--",
-        "#e377c2",   # pink
+        EASTERN_HUES[6],   # terracotta
     ),
     (
         "Denoiser",
         "results/fae_denoiser_film_heek_multiscale/run_9vl5sblh",
         "den",
         "-",
-        "#17becf",   # cyan
+        EASTERN_HUES[3],   # teal
     ),
     # ── NTK + prior study: film & denoiser with prior_loss_weight=1 ─────
     (
@@ -147,28 +148,28 @@ RUNS: List[Tuple[str, str, str, str, str]] = [
         "results/adam_ntk_prior/run_zaql9zhd",
         "ntk_prior",
         "--",
-        "#bcbd22",   # olive
+        EASTERN_HUES[5],   # dark brown
     ),
     (
         "Muon + NTK + Prior",
         "results/muon_ntk_prior/run_r6flmspu",
         "ntk_prior",
         "-",
-        "#17becf",   # teal
+        EASTERN_HUES[3],   # teal
     ),
     (
         "Denoiser + Adam + NTK + Prior",
         "results/fae_denoiser_adam_ntk_prior/run_kz7gp1ny",
         "den_prior",
         "--",
-        "#e377c2",   # pink
+        EASTERN_HUES[6],   # terracotta
     ),
     (
         "Denoiser + Muon + NTK + Prior",
         "results/denoiser_muon_ntk_prior/run_l41wdiei",
         "den_prior",
         "-",
-        "#7f7f7f",   # gray
+        EASTERN_HUES[1],   # brown
     ),
 ]
 
@@ -201,10 +202,11 @@ FONT_LABEL  = 7
 FONT_LEGEND = 6.5
 FONT_TICK   = 7
 
-C_OBS    = "#2166ac"
-C_GEN    = "#b2182b"
-C_FILL   = "#d6604d"
+C_OBS    = EASTERN_HUES[7]   # steel blue
+C_GEN    = EASTERN_HUES[4]   # red
+C_FILL   = EASTERN_HUES[6]   # terracotta
 C_GRID   = "#cccccc"
+CMAP_FIELD = "cividis"
 
 # EMA decay for training-curve smoothing
 EMA_ALPHA = 0.15
@@ -395,19 +397,12 @@ def fig1_training_convergence(out_dir: Path, max_steps: int = 50_000) -> None:
         ax.set_yscale("log")
         ax.set_xlabel("Training step ($\\times 10^3$)", fontsize=FONT_LABEL)
         ax.set_ylabel("Training loss (log scale)", fontsize=FONT_LABEL)
-        ax.set_title(title, fontsize=FONT_TITLE)
         ax.grid(which="both", alpha=0.25, color=C_GRID)
         ax.legend(fontsize=FONT_LEGEND, framealpha=0.9, loc="upper right")
         _set_tick_fontsize(ax)
 
-    _plot_panel(
-        ax_l2, l2_runs,
-        r"(a) $\ell_2$ loss",
-    )
-    _plot_panel(
-        ax_ntk, ntk_runs,
-        r"(b) NTK-scaled loss",
-    )
+    _plot_panel(ax_l2, l2_runs, "")
+    _plot_panel(ax_ntk, ntk_runs, "")
 
     plt.tight_layout()
     _save_fig(fig, out_dir, "fig1_training_convergence")
@@ -472,10 +467,6 @@ def fig2_performance_bars(out_dir: Path) -> None:
     ax.set_xticks(x)
     ax.set_xticklabels(labels, fontsize=FONT_LABEL, rotation=25, ha="right")
     ax.set_ylabel("Test relative MSE", fontsize=FONT_LABEL)
-    ax.set_title(
-        "FAE reconstruction quality — full model comparison",
-        fontsize=FONT_TITLE,
-    )
     ax.set_ylim(0, max(vals) * 1.20)
     ax.grid(axis="y", alpha=0.3, color=C_GRID)
     ax.yaxis.set_major_formatter(mticker.FormatStrFormatter("%.4f"))
@@ -534,10 +525,6 @@ def fig3_observation_time(out_dir: Path) -> None:
     ax.set_xlabel("Observation time fraction $t/T$", fontsize=FONT_LABEL)
     ax.set_ylabel("Relative MSE at time $t$", fontsize=FONT_LABEL)
     ax.set_yscale("log")
-    ax.set_title(
-        r"Reconstruction quality vs.\ observation time",
-        fontsize=FONT_TITLE,
-    )
     ax.grid(which="both", alpha=0.25, color=C_GRID)
     ax.legend(fontsize=FONT_LEGEND, framealpha=0.9, loc="upper right")
     _set_tick_fontsize(ax)
@@ -604,8 +591,6 @@ def fig4_held_out(out_dir: Path) -> None:
     ax.set_xticks(x)
     ax.set_xticklabels(labels_plot, fontsize=FONT_LABEL, rotation=25, ha="right")
     ax.set_ylabel("Relative MSE (held-out)", fontsize=FONT_LABEL)
-    ax.set_title("Held-out interpolation accuracy — full model comparison",
-                 fontsize=FONT_TITLE)
     ax.set_ylim(0, max(max(r1s), max(r2s)) * 1.25)
     ax.yaxis.set_major_formatter(mticker.FormatStrFormatter("%.4f"))
     ax.grid(axis="y", alpha=0.3, color=C_GRID)
@@ -614,93 +599,6 @@ def fig4_held_out(out_dir: Path) -> None:
 
     plt.tight_layout()
     _save_fig(fig, out_dir, "fig4_held_out")
-
-
-# ============================================================================
-# Figure 5: Latent-space quality — collapse diagnostics
-# ============================================================================
-
-def fig5_latent_diagnostics(out_dir: Path) -> None:
-    """Latent-space collapse diagnostics for runs with complete eval.
-
-    Three horizontal-bar subplots following the report.py visual language:
-      (a) ``decode_sensitivity``  — ratio of zero-latent MSE to full MSE;
-          value >> 1 means the decoder genuinely uses the latent code.
-      (b) ``zero_latent_mse / test_mse``  — how much worse a zero-code
-          decode is; large ratio = healthy utilisation.
-      (c) ``latent_var_mean``  — mean variance of latent codes across the
-          test batch; near-zero indicates posterior collapse.
-
-    Uses per-run colours from the RUNS registry for consistency with all
-    other publication figures.  Value annotations are placed inline.
-    """
-    entries: list = []
-    for label, d, grp, ls, color in RUNS:
-        if grp not in COMPARISON_GROUPS:
-            continue
-        ev = _load_eval(d)
-        if ev is None or not ev.get("collapse_diagnostics"):
-            continue
-        cd = ev["collapse_diagnostics"]
-        test_mse = float(ev.get("test_mse", 1e-12))
-        entries.append((label, cd, color, test_mse))
-
-    # Deduplicate by label
-    seen: set = set()
-    unique: list = []
-    for e in entries:
-        if e[0] not in seen:
-            seen.add(e[0])
-            unique.append(e)
-    entries = unique
-
-    if not entries:
-        return
-
-    labels  = [e[0] for e in entries]
-    colors  = [e[2] for e in entries]
-    sens    = [float(e[1]["decode_sensitivity"]) for e in entries]
-    zlr     = [float(e[1]["zero_latent_mse"]) / max(1e-12, e[3])
-               for e in entries]
-    latvar  = [float(e[1]["latent_var_mean"]) for e in entries]
-
-    fig, axes = plt.subplots(1, 3,
-                             figsize=(FIG_WIDTH, SUBPLOT_HEIGHT + 0.3),
-                             sharey=True)
-
-    def _hbar(ax: plt.Axes, vals: List[float], title: str,
-              xlabel: str, fmt: str = "%.2f",
-              ref_line: Optional[float] = None) -> None:
-        y = np.arange(len(labels))
-        bars = ax.barh(y, vals, color=colors, edgecolor="k", linewidth=0.6,
-                       height=0.55, zorder=3)
-        ax.set_yticks(y)
-        ax.set_yticklabels(labels, fontsize=FONT_TICK)
-        ax.set_xlabel(xlabel, fontsize=FONT_LABEL)
-        ax.set_title(title, fontsize=FONT_TITLE)
-        if ref_line is not None:
-            ax.axvline(ref_line, color=C_GEN, ls="--", lw=0.9, alpha=0.6,
-                       zorder=4)
-        ax.grid(axis="x", alpha=0.25, color=C_GRID)
-        _set_tick_fontsize(ax)
-        # Inline value annotations
-        for bar, v in zip(bars, vals):
-            ax.text(bar.get_width() + max(vals) * 0.02, bar.get_y() + bar.get_height() / 2,
-                    fmt % v, va="center", ha="left", fontsize=FONT_TICK - 0.5)
-
-    _hbar(axes[0], sens,   "(a) Decode sensitivity",
-          r"$\mathrm{MSE}_{z=0}\,/\,\mathrm{MSE}_z$", "%.2f", ref_line=1.0)
-    _hbar(axes[1], zlr,    "(b) Zero-latent ratio",
-          r"$\mathrm{MSE}_{z=0}\,/\,\mathrm{MSE}_{\mathrm{test}}$", "%.1f")
-    _hbar(axes[2], latvar, "(c) Latent variance",
-          r"mean $\mathrm{Var}[z]$", "%.4f")
-
-    axes[0].invert_yaxis()
-
-    fig.suptitle("Latent-space utilisation diagnostics", fontsize=FONT_TITLE + 1,
-                 y=1.02)
-    plt.tight_layout()
-    _save_fig(fig, out_dir, "fig5_latent_diagnostics")
 
 
 # ============================================================================
@@ -753,10 +651,6 @@ def fig6_scale_comparison(out_dir: Path) -> None:
         fontsize=FONT_LABEL,
     )
     ax.set_ylabel("Relative MSE", fontsize=FONT_LABEL)
-    ax.set_title(
-        r"Single-scale ($\sigma\!=\!1$) vs multiscale ($\sigma\!\in\!\{1,2,4,8\}$) — Muon + $\ell_2$",
-        fontsize=FONT_TITLE,
-    )
     ax.set_yscale("log")
     ax.grid(axis="y", which="both", alpha=0.25, color=C_GRID)
     ax.legend(fontsize=FONT_LEGEND, framealpha=0.9)
@@ -828,21 +722,10 @@ def fig7_architecture_comparison(out_dir: Path) -> None:
         fontsize=FONT_LABEL,
     )
     ax.set_ylabel("Relative MSE (eval with $\\ell_2$)", fontsize=FONT_LABEL)
-    ax.set_title(
-        r"Architecture comparison — Muon + $\ell_2$ vs Adam + $\ell_2$ + Prior",
-        fontsize=FONT_TITLE,
-    )
     ax.set_yscale("log")
     ax.grid(axis="y", which="both", alpha=0.25, color=C_GRID)
     ax.legend(fontsize=FONT_LEGEND, framealpha=0.9)
     _set_tick_fontsize(ax)
-
-    fig.text(
-        0.5, -0.06,
-        "Note: Adam+$\\ell_2$+Prior uses deterministic decoder + latent diffusion prior "
-        "(ELBO objective); Muon+$\\ell_2$ uses plain L2 loss.",
-        ha="center", fontsize=FONT_TICK - 0.5, style="italic",
-    )
 
     plt.tight_layout()
     _save_fig(fig, out_dir, "fig7_architecture_comparison_per_time")
@@ -942,8 +825,8 @@ def fig8_summary_table(out_dir: Path) -> None:
     ]
     cell_data = []
     row_colors = []
-    G_COLORS = {"opt_l2": "#f7f9ff", "opt_ntk": "#f0f0ff",
-                 "scale": "#f9fff7", "arch": "#fff9f7", "den": "#fff7f9"}
+    G_COLORS = {"opt_l2": "#f7f7f5", "opt_ntk": "#f5f5f3",
+                 "scale": "#f7f7f5", "arch": "#f5f5f3", "den": "#f7f7f5"}
     for r in rows:
         sens_s = "%.3f" % r["sens"] if not np.isnan(r["sens"]) else "—"
         latv_s = "%.4f" % r["latvar"] if not np.isnan(r["latvar"]) else "—"
@@ -993,9 +876,9 @@ def fig9_twoscale_training(out_dir: Path, max_steps: int = 50_000) -> None:
     Allows direct visual comparison of how multiscale affects training dynamics.
     """
     single_scale_runs = [
-        (r"Adam + $\ell_2$",   "results/fae_film_adam_l2/run_10qdkz0u",              "-",  "#d62728"),
-        ("Muon + NTK",          "results/fae_film_muon_ntk/run_zjvaw52j",             "-.", "#9467bd"),
-        (r"Muon + $\ell_2$",   "results/fae_deterministic_film/run_90ndogk3",         "-",  "#2ca02c"),
+        (r"Adam + $\ell_2$",   "results/fae_film_adam_l2/run_10qdkz0u",              "-",  EASTERN_HUES[4]),
+        ("Muon + NTK",          "results/fae_film_muon_ntk/run_zjvaw52j",             "-.", EASTERN_HUES[3]),
+        (r"Muon + $\ell_2$",   "results/fae_deterministic_film/run_90ndogk3",         "-",  EASTERN_HUES[2]),
     ]
     multi_scale_runs = [(label, d, ls, c) for label, d, grp, ls, c in RUNS
                         if grp in {"opt_l2", "opt_ntk"}]
@@ -1019,7 +902,6 @@ def fig9_twoscale_training(out_dir: Path, max_steps: int = 50_000) -> None:
         ax.set_yscale("log")
         ax.set_xlabel("Step ($\\times 10^3$)", fontsize=FONT_LABEL)
         ax.set_ylabel("Training loss", fontsize=FONT_LABEL)
-        ax.set_title(title, fontsize=FONT_TITLE)
         ax.grid(which="both", alpha=0.25, color=C_GRID)
         ax.legend(fontsize=FONT_LEGEND - 0.5, framealpha=0.9, loc="upper right")
         _set_tick_fontsize(ax)
@@ -1061,6 +943,7 @@ def fig10_reconstruction_fields(out_dir: Path) -> None:
     grid_coords = np.asarray(data["grid_coords"], dtype=np.float32)
     resolution = int(data["resolution"])
     marginal_keys = _list_marginal_keys(data)
+    transform_info = load_transform_info(data)
 
     held_out_indices = [int(i) for i in np.asarray(data.get("held_out_indices", []), dtype=np.int32)]
     data_generator = str(data.get("data_generator", ""))
@@ -1068,7 +951,9 @@ def fig10_reconstruction_fields(out_dir: Path) -> None:
         held_out_indices = sorted(set(held_out_indices) | {0})
     ho_set = set(held_out_indices)
 
-    # sample IDs requested by revision note
+    # Build H-band column labels from marginal time values.
+    marginal_t_vals = [float(str(k).replace("raw_marginal_", "")) for k in marginal_keys]
+
     sample_ids = [0, 1, 2]
 
     def _reconstruct_single(field_flat: NDArray[np.float32]) -> NDArray[np.float32]:
@@ -1085,8 +970,8 @@ def fig10_reconstruction_fields(out_dir: Path) -> None:
 
     for tidx, key in enumerate(marginal_keys):
         if tidx == 0:
-            continue  # explicit exclusion requested
-        t_val = float(str(key).replace("raw_marginal_", ""))
+            continue
+        t_val = marginal_t_vals[tidx]
         split = "held_out" if tidx in ho_set else "train"
         fields = np.asarray(data[key], dtype=np.float32)
 
@@ -1095,17 +980,28 @@ def fig10_reconstruction_fields(out_dir: Path) -> None:
                 continue
             orig = fields[sid]
             recon = _reconstruct_single(orig)
-            sample_records[sid][split].append((tidx, t_val, orig, recon))
+            # Inverse-transform to physical scale for display.
+            orig_phys = apply_inverse_transform(orig[None, :], transform_info)[0]
+            recon_phys = apply_inverse_transform(recon[None, :], transform_info)[0]
+            sample_records[sid][split].append((tidx, t_val, orig_phys, recon_phys))
+
+    def _col_label(tidx: int, t_val: float, is_ho: bool) -> str:
+        ho_tag = " (HO)" if is_ho else ""
+        return f"$H={t_val:.2f}${ho_tag}"
 
     def _plot_sample_split(sample_id: int, split: str, entries: List[Tuple[int, float, NDArray, NDArray]]) -> None:
         if not entries:
             return
         entries = sorted(entries, key=lambda x: x[0])
         n_cols = len(entries)
+        # Scale figure width proportionally so held-out panels (few columns)
+        # are not stretched to full FIG_WIDTH.
+        col_width = min(FIG_WIDTH / max(n_cols, 1), FIG_WIDTH / 5)
+        fig_w = col_width * n_cols + 0.6  # 0.6 for ylabel padding
         fig, axes = plt.subplots(
             2,
             n_cols,
-            figsize=(FIG_WIDTH, FIELD_ROW_HEIGHT * 1.35),
+            figsize=(fig_w, FIELD_ROW_HEIGHT * 1.35),
             squeeze=False,
         )
 
@@ -1115,14 +1011,16 @@ def fig10_reconstruction_fields(out_dir: Path) -> None:
             vmin = float(min(o2.min(), r2.min()))
             vmax = float(max(o2.max(), r2.max()))
 
-            axes[0, col].imshow(o2, origin="lower", cmap="viridis", vmin=vmin, vmax=vmax)
-            axes[0, col].set_title(f"$t_{{{tidx}}}$", fontsize=FONT_TITLE)
+            axes[0, col].imshow(o2, origin="lower", cmap=CMAP_FIELD, vmin=vmin, vmax=vmax)
+            axes[0, col].set_title(
+                _col_label(tidx, t_val, tidx in ho_set),
+                fontsize=FONT_TITLE,
+            )
             axes[0, col].axis("off")
 
-            axes[1, col].imshow(r2, origin="lower", cmap="viridis", vmin=vmin, vmax=vmax)
+            axes[1, col].imshow(r2, origin="lower", cmap=CMAP_FIELD, vmin=vmin, vmax=vmax)
             axes[1, col].axis("off")
 
-        # Compact publication styling: row labels only, no verbose suptitle.
         axes[0, 0].set_ylabel(
             "GT",
             fontsize=FONT_LABEL,
@@ -1208,29 +1106,32 @@ def fig11_denoiser_comparison(out_dir: Path) -> None:
     ax.set_xticks(x)
     ax.set_xticklabels(labels, fontsize=FONT_LABEL - 0.5, rotation=20, ha="right")
     ax.set_ylabel("Test relative MSE", fontsize=FONT_LABEL)
-    ax.set_title(
-        "Denoiser and latent-prior architectures — test reconstruction quality",
-        fontsize=FONT_TITLE,
-    )
     ax.set_ylim(0, max(vals) * 1.25)
     ax.grid(axis="y", alpha=0.3, color=C_GRID)
     ax.yaxis.set_major_formatter(mticker.FormatStrFormatter("%.4f"))
     _set_tick_fontsize(ax)
-
-    fig.text(
-        0.5, -0.06,
-        "Caveat: Denoiser uses iterative denoising at eval (32 steps by default). "
-        "Increasing --denoiser-eval-sample-steps may improve results.",
-        ha="center", fontsize=FONT_TICK - 0.5, style="italic",
-    )
 
     plt.tight_layout()
     _save_fig(fig, out_dir, "fig11_denoiser_comparison")
 
 
 # ============================================================================
-# Figure 12: PSD spectral analysis (placeholder — needs raw reconstruction data)
+# Figure 12: PSD spectral analysis
 # ============================================================================
+
+def _psd_time_label(tk: str) -> str:
+    """Convert PSD time key like ``t1_train`` to an H-band label.
+
+    Uses ``$H_i$`` format (ordinal index) because the actual filter-width
+    value is not stored in the PSD npz.  Consistent with the ``$H=value$``
+    convention used in field panels where the value is available.
+    """
+    parts = str(tk).split("_", 1)
+    tidx_str = parts[0]  # e.g. "t1"
+    split_raw = parts[1] if len(parts) > 1 else ""
+    ho_tag = " (HO)" if "held_out" in split_raw else ""
+    return f"$H_{{{tidx_str[1:]}}}${ho_tag}"
+
 
 def fig12_psd_spectral(out_dir: Path) -> None:
     """Time-resolved PSD analysis (no averaging across times).
@@ -1238,9 +1139,6 @@ def fig12_psd_spectral(out_dir: Path) -> None:
     Generates:
       1) ``fig12_psd_spectral_per_time``: per-time PSD overlays.
       2) ``fig12b_psd_mismatch_per_time``: per-time log-PSD mismatch trends.
-
-    This follows the Tran-evaluation philosophy where spectral diagnostics are
-    analyzed per scale/time, not collapsed into a single global average.
     """
     psd_path = out_dir / "psd_data.npz"
     if not psd_path.exists():
@@ -1281,9 +1179,9 @@ def fig12_psd_spectral(out_dir: Path) -> None:
             color = colors_psd[i]
             ax.loglog(freqs, data[key], color=color, linewidth=1.1, alpha=0.9, label=lbl_str, zorder=3)
 
-        ax.set_title(tk, fontsize=FONT_TITLE)
+        ax.set_title(_psd_time_label(str(tk)), fontsize=FONT_TITLE)
         ax.grid(which="both", alpha=0.22, color=C_GRID)
-        ax.set_xlabel("k", fontsize=FONT_LABEL)
+        ax.set_xlabel("$k$", fontsize=FONT_LABEL)
         ax.set_ylabel("PSD", fontsize=FONT_LABEL)
         _set_tick_fontsize(ax)
 
@@ -1294,38 +1192,8 @@ def fig12_psd_spectral(out_dir: Path) -> None:
     for i, lbl_str in enumerate(labels_text):
         handles.append(Line2D([0], [0], color=colors_psd[i], lw=1.3, label=lbl_str))
     fig.legend(handles=handles, loc="upper center", ncol=min(len(handles), 4), fontsize=FONT_LEGEND, framealpha=0.9)
-    fig.suptitle("Time-resolved PSD comparison", fontsize=FONT_TITLE + 1, y=1.02)
     fig.tight_layout(rect=[0, 0, 1, 0.95])
     _save_fig(fig, out_dir, "fig12_psd_spectral_per_time")
-    # Backward-compatible name used elsewhere in the pipeline.
-    fig_alias, ax_alias = plt.subplots(1, 1, figsize=(1, 1))
-    plt.close(fig_alias)
-    # Re-render quickly from saved object by plotting same data to legacy name.
-    # Keep both names in output to avoid stale-file ambiguity.
-    fig_legacy, axes_legacy = plt.subplots(n_rows, n_cols, figsize=(FIG_WIDTH, SUBPLOT_HEIGHT * n_rows))
-    axes_legacy = np.atleast_2d(axes_legacy)
-    for idx, tk in enumerate(time_keys):
-        ax = axes_legacy[idx // n_cols, idx % n_cols]
-        gt_key = f"psd_gt_{tk}"
-        if gt_key in data:
-            ax.loglog(freqs, data[gt_key], "k-", linewidth=1.8, label="GT", alpha=0.8, zorder=4)
-        for i, lbl_str in enumerate(labels_text):
-            key = f"psd_{_safe_key(lbl_str)}_{tk}"
-            if key not in data:
-                continue
-            color = colors_psd[i]
-            ax.loglog(freqs, data[key], color=color, linewidth=1.1, alpha=0.9, label=lbl_str, zorder=3)
-        ax.set_title(tk, fontsize=FONT_TITLE)
-        ax.grid(which="both", alpha=0.22, color=C_GRID)
-        ax.set_xlabel("k", fontsize=FONT_LABEL)
-        ax.set_ylabel("PSD", fontsize=FONT_LABEL)
-        _set_tick_fontsize(ax)
-    for idx in range(n, n_rows * n_cols):
-        axes_legacy[idx // n_cols, idx % n_cols].set_visible(False)
-    fig_legacy.legend(handles=handles, loc="upper center", ncol=min(len(handles), 4), fontsize=FONT_LEGEND, framealpha=0.9)
-    fig_legacy.suptitle("Time-resolved PSD comparison", fontsize=FONT_TITLE + 1, y=1.02)
-    fig_legacy.tight_layout(rect=[0, 0, 1, 0.95])
-    _save_fig(fig_legacy, out_dir, "fig12_psd_spectral")
 
     # ------------------------------------------------------------------
     # Figure 12b: per-time mismatch curves
@@ -1352,10 +1220,9 @@ def fig12_psd_spectral(out_dir: Path) -> None:
         ax2.plot(x, y, marker="o", linewidth=1.2, color=color, label=lbl_str)
 
     ax2.set_xticks(x)
-    ax2.set_xticklabels(ordered, rotation=30, ha="right", fontsize=FONT_TICK)
+    ax2.set_xticklabels([_psd_time_label(tk) for tk in ordered], rotation=30, ha="right", fontsize=FONT_TICK)
     ax2.set_ylabel("log-PSD mismatch", fontsize=FONT_LABEL)
-    ax2.set_xlabel("time/split", fontsize=FONT_LABEL)
-    ax2.set_title("Per-time spectral mismatch (lower is better)", fontsize=FONT_TITLE)
+    ax2.set_xlabel("Scale band", fontsize=FONT_LABEL)
     ax2.grid(alpha=0.25, color=C_GRID)
     ax2.legend(fontsize=FONT_LEGEND, framealpha=0.9)
     _set_tick_fontsize(ax2)
@@ -1363,351 +1230,8 @@ def fig12_psd_spectral(out_dir: Path) -> None:
     _save_fig(fig2, out_dir, "fig12b_psd_mismatch_per_time")
 
 
-# ============================================================================
-# Figure 13: Latent-regularization evidence
-# ============================================================================
-
-def fig13_latent_regularization(out_dir: Path) -> None:
-    """Plot latent-regularization evidence from psd_latent_metrics.json.
-
-    Uses checkpoint-based diagnostics to compare:
-      - latent variance magnitude,
-      - effective rank,
-      - variance spread (q90/q10),
-      - time-wise reconstruction imbalance (MSE CV).
-
-    Lower spread/CV and balanced effective rank support stronger latent
-    regularization and less over-optimization of specific fields.
-
-    Colour scheme: uses per-run colours from the RUNS registry (resolved
-    via label matching) for visual consistency with all other figures.
-    Falls back to the report.py ``C_OBS`` / ``C_GEN`` alternation.
-    """
-    metrics_path = out_dir / "psd_latent_metrics.json"
-    if not metrics_path.exists():
-        print("  [fig13] psd_latent_metrics.json not found — run compute_psd.py first. Skipping.")
-        return
-
-    with metrics_path.open() as f:
-        metrics = json.load(f)
-
-    if not metrics:
-        print("  [fig13] empty metrics json, skipping.")
-        return
-
-    labels = list(metrics.keys())
-    x = np.arange(len(labels), dtype=np.float64)
-
-    # Resolve colours from RUNS registry for visual consistency.
-    colors = _resolve_run_colors(labels)
-
-    lat_var = [float(metrics[k].get("latent", {}).get("latent_var_mean", np.nan)) for k in labels]
-    eff_rank = [float(metrics[k].get("latent", {}).get("effective_rank", np.nan)) for k in labels]
-    spread = [float(metrics[k].get("latent", {}).get("latent_var_spread_q90_q10", np.nan)) for k in labels]
-    time_cv = [float(metrics[k].get("time_recon_balance", {}).get("mse_cv", np.nan)) for k in labels]
-
-    fig, axes = plt.subplots(2, 2, figsize=(FIG_WIDTH, SUBPLOT_HEIGHT * 2.0))
-    axes = np.asarray(axes)
-
-    entries = [
-        (axes[0, 0], lat_var,  "(a) Latent variance mean",
-         r"mean $\mathrm{Var}[z]$", "%.4f", False),
-        (axes[0, 1], eff_rank, "(b) Effective rank",
-         r"$\exp(H(\mathbf{p}))$", "%.1f", False),
-        (axes[1, 0], spread,   "(c) Variance spread",
-         r"$q_{90}/q_{10}$", "%.1f", True),
-        (axes[1, 1], time_cv,  "(d) Reconstruction imbalance",
-         r"CV of MSE across times", "%.3f", True),
-    ]
-
-    for ax, vals, title, ylabel, fmt, lower_better in entries:
-        bars = ax.bar(x, vals, color=colors, edgecolor="k", linewidth=0.6, zorder=3,
-                      width=0.6)
-        ax.set_title(title, fontsize=FONT_TITLE)
-        ax.set_ylabel(ylabel, fontsize=FONT_LABEL)
-        ax.set_xticks(x)
-        ax.set_xticklabels(labels, rotation=25, ha="right", fontsize=FONT_TICK)
-        ax.grid(axis="y", alpha=0.25, color=C_GRID)
-        _set_tick_fontsize(ax)
-
-        # Value annotations on top of each bar
-        arr = np.asarray(vals, dtype=np.float64)
-        y_max = float(np.nanmax(arr)) if np.any(np.isfinite(arr)) else 1.0
-        for bar, v in zip(bars, vals):
-            if np.isfinite(v):
-                ax.text(bar.get_x() + bar.get_width() / 2.0,
-                        v + y_max * 0.02,
-                        fmt % v,
-                        ha="center", va="bottom",
-                        fontsize=FONT_TICK - 0.5)
-
-        # Highlight best method with a thicker dark edge
-        finite = np.isfinite(arr)
-        if np.any(finite):
-            idx_best = int(np.nanargmin(arr) if lower_better else np.nanargmax(arr))
-            bars[idx_best].set_linewidth(2.0)
-            bars[idx_best].set_edgecolor("k")
-
-        # Direction arrow annotation
-        direction_text = r"$\leftarrow$ lower = better" if lower_better else r"$\rightarrow$ higher = better"
-        ax.annotate(direction_text, xy=(0.98, 0.95), xycoords="axes fraction",
-                    ha="right", va="top", fontsize=FONT_LEGEND,
-                    fontstyle="italic", color="#555555")
-
-    fig.suptitle("Latent-regularization evidence (checkpoint diagnostics)",
-                 fontsize=FONT_TITLE + 1, y=1.02)
-    fig.tight_layout()
-    _save_fig(fig, out_dir, "fig13_latent_regularization")
-
-
-# ============================================================================
-# Figure 14: Per-marginal latent diagnostics (effective rank + isotropy)
-# ============================================================================
-
-def fig14_per_marginal_latent(out_dir: Path) -> None:
-    """Per-marginal latent diagnostics across time indices.
-
-    Two-panel line plot:
-      (a) Effective rank per marginal — shows whether the diffusion prior
-          maintains high-dimensional utilisation uniformly across scales,
-          or whether certain time indices suffer rank collapse.
-      (b) Isotropy ratio per marginal — smallest/largest eigenvalue ratio.
-          Values near 1 indicate near-isotropic latents; near 0 indicates
-          dominant directions.
-
-    Each method is a separate curve.  Time indices on the x-axis are
-    labelled with their train/held-out status.  Consistent per-run
-    colours from the RUNS registry.
-    """
-    metrics_path = out_dir / "psd_latent_metrics.json"
-    if not metrics_path.exists():
-        print("  [fig14] psd_latent_metrics.json not found — run compute_psd.py first. Skipping.")
-        return
-
-    with metrics_path.open() as f:
-        metrics = json.load(f)
-
-    if not metrics:
-        print("  [fig14] empty metrics json, skipping.")
-        return
-
-    # Collect all time keys across runs
-    all_time_keys: set = set()
-    for label in metrics:
-        pml = metrics[label].get("per_marginal_latent", {})
-        all_time_keys.update(pml.keys())
-
-    if not all_time_keys:
-        print("  [fig14] no per_marginal_latent data found — rerun compute_psd.py. Skipping.")
-        return
-
-    ordered_tkeys = sorted(all_time_keys, key=lambda s: (int(s.split("_")[0][1:]), s))
-
-    # Resolve per-run colours
-    labels = list(metrics.keys())
-    colors = _resolve_run_colors(labels)
-
-    fig, (ax_rank, ax_iso) = plt.subplots(
-        1, 2, figsize=(FIG_WIDTH, SUBPLOT_HEIGHT + 0.2), sharey=False,
-    )
-
-    x = np.arange(len(ordered_tkeys), dtype=np.float64)
-
-    for i, label in enumerate(labels):
-        pml = metrics[label].get("per_marginal_latent", {})
-        eff_ranks = [float(pml.get(tk, {}).get("effective_rank", np.nan))
-                     for tk in ordered_tkeys]
-        isotropy = [float(pml.get(tk, {}).get("isotropy_ratio", np.nan))
-                    for tk in ordered_tkeys]
-
-        ax_rank.plot(x, eff_ranks, marker="o", markersize=4, linewidth=1.4,
-                     color=colors[i], label=label, zorder=3)
-        ax_iso.plot(x, isotropy, marker="s", markersize=4, linewidth=1.4,
-                    color=colors[i], label=label, zorder=3)
-
-    # Format x-axis: show time index and train/held-out
-    tick_labels = []
-    for tk in ordered_tkeys:
-        tidx = tk.split("_")[0]
-        split = "HO" if "held_out" in tk else "Tr"
-        tick_labels.append(f"{tidx}\n({split})")
-
-    for ax, title, ylabel in [
-        (ax_rank, "(a) Effective rank per marginal",
-         r"$\exp(H(\mathbf{p}))$"),
-        (ax_iso, "(b) Isotropy ratio per marginal",
-         r"$\lambda_{\min}/\lambda_{\max}$"),
-    ]:
-        ax.set_xticks(x)
-        ax.set_xticklabels(tick_labels, fontsize=FONT_TICK - 0.5)
-        ax.set_xlabel("Time index (marginal)", fontsize=FONT_LABEL)
-        ax.set_ylabel(ylabel, fontsize=FONT_LABEL)
-        ax.set_title(title, fontsize=FONT_TITLE)
-        ax.grid(which="both", alpha=0.25, color=C_GRID)
-        _set_tick_fontsize(ax)
-
-    # Legend outside on the right to avoid crowding with x tick labels.
-    handles, leg_labels = ax_rank.get_legend_handles_labels()
-    fig.legend(
-        handles,
-        leg_labels,
-        loc="center left",
-        ncol=1,
-        fontsize=FONT_LEGEND,
-        framealpha=0.9,
-        bbox_to_anchor=(0.99, 0.5),
-    )
-
-    fig.tight_layout()
-    fig.subplots_adjust(right=0.80)
-    _save_fig(fig, out_dir, "fig14_per_marginal_latent")
-
-
-# ============================================================================
-# Figure 15: Inter-marginal distance regularity
-# ============================================================================
-
-def fig15_inter_marginal_distance(out_dir: Path) -> None:
-    """Inter-marginal Bures-Wasserstein distance regularity.
-
-    Two-panel figure:
-      (a) W2 distance between consecutive time-index marginals in latent
-          space.  For the MSBM, evenly spaced marginals are easier to
-          transport between — the score network sees a consistent step size.
-          Large jumps indicate scale-specific latent clustering.
-      (b) Decomposition: mean-shift (L2 distance between centroids) vs
-          covariance (Bures) component.  Reveals whether distance variation
-          comes from centroid drift or shape change.
-
-    A well-regularised latent space (e.g. diffusion prior) should show
-    more uniform W2 steps and lower Bures covariance contribution.
-    """
-    metrics_path = out_dir / "psd_latent_metrics.json"
-    if not metrics_path.exists():
-        print("  [fig15] psd_latent_metrics.json not found — run compute_psd.py first. Skipping.")
-        return
-
-    with metrics_path.open() as f:
-        metrics = json.load(f)
-
-    if not metrics:
-        print("  [fig15] empty metrics json, skipping.")
-        return
-
-    # Collect all inter-marginal pair keys across runs
-    all_pair_keys: set = set()
-    for label in metrics:
-        imd = metrics[label].get("inter_marginal_w2", {})
-        all_pair_keys.update(imd.keys())
-
-    if not all_pair_keys:
-        print("  [fig15] no inter_marginal_w2 data found — rerun compute_psd.py. Skipping.")
-        return
-
-    # Order by first time index in the pair
-    def _pair_sort_key(pk: str) -> tuple:
-        # e.g. "t1_train_to_t3_train"
-        parts = pk.split("_to_")
-        t0 = int(parts[0].split("_")[0][1:])
-        t1 = int(parts[1].split("_")[0][1:]) if len(parts) > 1 else t0
-        return (t0, t1)
-
-    ordered_pairs = sorted(all_pair_keys, key=_pair_sort_key)
-
-    labels = list(metrics.keys())
-    colors = _resolve_run_colors(labels)
-
-    fig, (ax_w2, ax_decomp) = plt.subplots(
-        1, 2, figsize=(FIG_WIDTH, SUBPLOT_HEIGHT + 0.3), sharey=False,
-    )
-
-    x = np.arange(len(ordered_pairs), dtype=np.float64)
-    bar_width = 0.7 / max(len(labels), 1)
-
-    # Panel (a): W2 line plot per run
-    for i, label in enumerate(labels):
-        imd = metrics[label].get("inter_marginal_w2", {})
-        w2_vals = [float(imd.get(pk, {}).get("w2", np.nan))
-                   for pk in ordered_pairs]
-        ax_w2.plot(x, w2_vals, marker="o", markersize=4, linewidth=1.4,
-                   color=colors[i], label=label, zorder=3)
-
-        # Annotate CV of W2 distances (regularity measure)
-        w2_arr = np.asarray(w2_vals, dtype=np.float64)
-        finite = w2_arr[np.isfinite(w2_arr)]
-        if len(finite) > 1:
-            cv = float(np.std(finite) / (np.mean(finite) + 1e-12))
-            ax_w2.annotate(
-                f"CV={cv:.2f}",
-                xy=(x[-1], w2_vals[-1] if np.isfinite(w2_vals[-1]) else 0),
-                xytext=(5, 5 + i * 12), textcoords="offset points",
-                fontsize=FONT_TICK - 0.5, color=colors[i],
-            )
-
-    # Panel (b): Stacked bars — mean shift vs Bures covariance component
-    n_runs = len(labels)
-    offsets = np.linspace(-(0.7 - bar_width) / 2, (0.7 - bar_width) / 2, n_runs) if n_runs > 1 else [0.0]
-
-    for i, label in enumerate(labels):
-        imd = metrics[label].get("inter_marginal_w2", {})
-        mean_l2 = [float(imd.get(pk, {}).get("mean_l2", np.nan))
-                   for pk in ordered_pairs]
-        bures = [float(np.sqrt(max(0, imd.get(pk, {}).get("bures_covariance_term", 0))))
-                 for pk in ordered_pairs]
-
-        ax_decomp.bar(x + offsets[i], mean_l2, width=bar_width,
-                      color=colors[i], edgecolor="k", linewidth=0.5,
-                      alpha=0.8, zorder=3, label=f"{label} (mean)" if i == 0 else None)
-        ax_decomp.bar(x + offsets[i], bures, width=bar_width,
-                      bottom=mean_l2, color=colors[i], edgecolor="k",
-                      linewidth=0.5, alpha=0.4, hatch="///", zorder=3,
-                      label=f"{label} (Bures)" if i == 0 else None)
-
-    # Pair labels: "t1→t3", "t3→t4", etc.
-    pair_labels = []
-    for pk in ordered_pairs:
-        parts = pk.split("_to_")
-        t0 = parts[0].split("_")[0]
-        t1 = parts[1].split("_")[0] if len(parts) > 1 else "?"
-        pair_labels.append(f"{t0}$\\to${t1}")
-
-    for ax, title, ylabel in [
-        (ax_w2, "(a) Bures-Wasserstein $W_2$ between consecutive marginals",
-         r"$W_2(z_{t_i}, z_{t_{i+1}})$"),
-        (ax_decomp, "(b) Decomposition: centroid shift + covariance mismatch",
-         "Distance component"),
-    ]:
-        ax.set_xticks(x)
-        ax.set_xticklabels(pair_labels, fontsize=FONT_TICK - 0.5, rotation=30, ha="right")
-        ax.set_xlabel("Consecutive marginal pair", fontsize=FONT_LABEL)
-        ax.set_ylabel(ylabel, fontsize=FONT_LABEL)
-        ax.set_title(title, fontsize=FONT_TITLE)
-        ax.grid(axis="y", alpha=0.25, color=C_GRID)
-        _set_tick_fontsize(ax)
-
-    # Legend for panel (a): place outside panel to avoid overlap.
-    ax_w2.legend(
-        fontsize=FONT_LEGEND,
-        framealpha=0.9,
-        loc="upper left",
-        bbox_to_anchor=(1.02, 1.0),
-        borderaxespad=0.0,
-    )
-
-    # Custom legend for decomposition panel
-    from matplotlib.patches import Patch as _Patch
-    decomp_handles = [
-        _Patch(facecolor="#888888", edgecolor="k", alpha=0.8, label="Centroid shift"),
-        _Patch(facecolor="#888888", edgecolor="k", alpha=0.4, hatch="///", label="Bures (cov)"),
-    ]
-    ax_decomp.legend(handles=decomp_handles, fontsize=FONT_LEGEND,
-                     framealpha=0.9, loc="best")
-
-    fig.suptitle("Inter-marginal latent distance regularity",
-                 fontsize=FONT_TITLE + 1, y=1.02)
-    fig.tight_layout()
-    fig.subplots_adjust(right=0.82)
-    _save_fig(fig, out_dir, "fig15_inter_marginal_distance")
+# Figures 13-15 removed — superseded by latent-geometry metrics in
+# scripts/fae/tran_evaluation/compare_latent_geometry_models.py
 
 
 # ============================================================================
@@ -1716,9 +1240,9 @@ def fig15_inter_marginal_distance(out_dir: Path) -> None:
 
 #: Runs used in the NTK sample comparison.  Order determines row order.
 _NTK_COMPARE_RUNS: List[Tuple[str, str, str]] = [
-    (r"Adam + $\ell_2$",     "results/fae_film_adam_l2_99pct/run_bnqm4evk",  "#d62728"),
-    ("Adam + NTK",            "results/fae_film_adam_ntk_99pct/run_2hnr5shv", "#ff7f0e"),
-    ("Adam + NTK + Prior",    "results/adam_ntk_prior/run_zaql9zhd",          "#bcbd22"),
+    (r"Adam + $\ell_2$",     "results/fae_film_adam_l2_99pct/run_bnqm4evk",  EASTERN_HUES[4]),
+    ("Adam + NTK",            "results/fae_film_adam_ntk_99pct/run_2hnr5shv", EASTERN_HUES[0]),
+    ("Adam + NTK + Prior",    "results/adam_ntk_prior/run_zaql9zhd",          EASTERN_HUES[2]),
 ]
 
 
@@ -1737,7 +1261,7 @@ def fig16_ntk_sample_comparison(out_dir: Path) -> None:
         marginal) with per-pixel error maps to highlight the effect of
         NTK loss scaling on high-frequency detail.
 
-    All panels use the viridis colourmap, consistent fonts, and the
+    All panels use the cividis colourmap, consistent fonts, and the
     shared FIG_WIDTH / FONT_* constants.
     """
 
@@ -1756,6 +1280,14 @@ def fig16_ntk_sample_comparison(out_dir: Path) -> None:
     grid_coords = np.asarray(data["grid_coords"], dtype=np.float32)
     resolution = int(data["resolution"])
     marginal_keys = _list_marginal_keys(data)
+    transform_info = load_transform_info(data)
+
+    held_out_indices = [int(i) for i in np.asarray(data.get("held_out_indices", []), dtype=np.int32)]
+    data_generator = str(data.get("data_generator", ""))
+    if data_generator == "tran_inclusion":
+        held_out_indices = sorted(set(held_out_indices) | {0})
+    ho_set = set(held_out_indices)
+    marginal_t_vals = [float(str(k).replace("raw_marginal_", "")) for k in marginal_keys]
 
     # ── Build (encode, decode) for each run ─────────────────────────────────
     model_fns: List[Tuple[str, str, object, object]] = []  # (label, color, enc, dec)
@@ -1780,26 +1312,32 @@ def fig16_ntk_sample_comparison(out_dir: Path) -> None:
         u_hat = dec_fn(z, x)
         return np.asarray(u_hat[0, :, 0], dtype=np.float32)
 
+    def _col_label(tidx: int) -> str:
+        t_val = marginal_t_vals[tidx] if tidx < len(marginal_t_vals) else 0.0
+        ho_tag = " (HO)" if tidx in ho_set else ""
+        return f"$H={t_val:.2f}${ho_tag}"
+
+    def _inv(flat: NDArray) -> NDArray:
+        return apply_inverse_transform(flat[None, :], transform_info)[0]
+
     sample_ids = [0, 1, 2]
 
     for sid in sample_ids:
-        # ── Collect per-time reconstructions ────────────────────────────────
-        # entries: list of (tidx, orig_2d, {label: recon_2d})
+        # entries: list of (tidx, orig_2d_phys, {label: recon_2d_phys})
         entries: List[Tuple[int, NDArray, Dict[str, NDArray]]] = []
         for tidx, key in enumerate(marginal_keys):
             if tidx == 0:
-                continue  # skip t0
+                continue
             fields = np.asarray(data[key], dtype=np.float32)
             if sid >= fields.shape[0]:
                 continue
             orig_flat = fields[sid]
             recons: Dict[str, NDArray] = {}
             for label, color, enc_fn, dec_fn in model_fns:
-                recons[label] = _reconstruct(enc_fn, dec_fn, orig_flat).reshape(
-                    resolution, resolution
-                )
+                recon_flat = _reconstruct(enc_fn, dec_fn, orig_flat)
+                recons[label] = _inv(recon_flat).reshape(resolution, resolution)
             entries.append(
-                (tidx, orig_flat.reshape(resolution, resolution), recons)
+                (tidx, _inv(orig_flat).reshape(resolution, resolution), recons)
             )
         entries.sort(key=lambda e: e[0])
 
@@ -1824,15 +1362,15 @@ def fig16_ntk_sample_comparison(out_dir: Path) -> None:
             vmax = float(max(f.max() for f in all_fields))
 
             # Row 0: ground truth
-            axes[0, col].imshow(orig_2d, origin="lower", cmap="viridis",
+            axes[0, col].imshow(orig_2d, origin="lower", cmap=CMAP_FIELD,
                                 vmin=vmin, vmax=vmax)
-            axes[0, col].set_title(f"$t_{{{tidx}}}$", fontsize=FONT_TITLE)
+            axes[0, col].set_title(_col_label(tidx), fontsize=FONT_TITLE)
             axes[0, col].axis("off")
 
             # Rows 1+: reconstructions
             for row_i, (label, color, _, _) in enumerate(model_fns, start=1):
                 axes[row_i, col].imshow(recons[label], origin="lower",
-                                        cmap="viridis", vmin=vmin, vmax=vmax)
+                                        cmap=CMAP_FIELD, vmin=vmin, vmax=vmax)
                 axes[row_i, col].axis("off")
 
         # Row labels on the left (horizontal for publication readability)
@@ -1883,13 +1421,10 @@ def fig16_ntk_sample_comparison(out_dir: Path) -> None:
         for col_i, (label, color, _, _) in enumerate(model_fns):
             recon = recons_t7[label]
             diff = diff_maps[label]
-            rmse = float(np.sqrt(np.mean((orig_t7 - recon) ** 2)))
 
-            # Row 1: reconstruction
-            axes_z[0, col_i].imshow(recon, origin="lower", cmap="viridis",
+            axes_z[0, col_i].imshow(recon, origin="lower", cmap=CMAP_FIELD,
                                     vmin=vmin_r, vmax=vmax_r)
-            axes_z[0, col_i].set_title(f"{label}\nRMSE={rmse:.4f}",
-                                       fontsize=FONT_TITLE)
+            axes_z[0, col_i].set_title(label, fontsize=FONT_TITLE)
             axes_z[0, col_i].axis("off")
 
             # Row 2: signed difference (aligned under each method)
@@ -1931,6 +1466,166 @@ def fig16_ntk_sample_comparison(out_dir: Path) -> None:
 
 
 # ============================================================================
+# Figure 17: MSBM generated fields — multiple realizations at each knot
+# ============================================================================
+
+#: Default MSBM run directory for generated field panels.
+_MSBM_RUN_DIR: Optional[str] = None  # set by --msbm-run-dir
+
+# Number of generated realizations to display.
+_N_GEN_SHOW = 4
+
+
+def fig17_generated_fields(out_dir: Path) -> None:
+    """MSBM backward SDE generated fields at each knot time.
+
+    Rows: GT (row 0), then ``_N_GEN_SHOW`` generated realizations.
+    Columns: one per MSBM knot time, labelled ``$H=value$`` with (HO) suffix.
+    All fields displayed in inverse-transformed physical scale.
+    """
+    if _MSBM_RUN_DIR is None:
+        print("  [fig17] --msbm-run-dir not provided, skipping.")
+        return
+
+    from scripts.fae.tran_evaluation.generate import (
+        generate_backward_realizations,
+    )
+    from scripts.fae.tran_evaluation.core import (
+        build_default_H_schedule,
+        load_ground_truth,
+        load_time_index_mapping,
+    )
+
+    run_dir = Path(_MSBM_RUN_DIR)
+    if not run_dir.is_dir():
+        print(f"  [fig17] MSBM run dir not found: {run_dir}")
+        return
+
+    # Discover dataset path from args.txt
+    args_txt = run_dir / "args.txt"
+    if not args_txt.exists():
+        print(f"  [fig17] args.txt not found in {run_dir}")
+        return
+    train_cfg: Dict[str, str] = {}
+    for line in args_txt.read_text().splitlines():
+        if "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        train_cfg[k.strip()] = v.strip()
+
+    ds_path_str = train_cfg.get("data_path", "")
+    ds_path = Path(ds_path_str)
+    if not ds_path.exists():
+        ds_path = REPO_ROOT / ds_path_str
+    if not ds_path.exists():
+        print(f"  [fig17] dataset not found: {ds_path_str}")
+        return
+
+    # Load GT and time indices
+    gt = load_ground_truth(ds_path)
+    resolution = gt["resolution"]
+    time_indices = load_time_index_mapping(run_dir)
+
+    # Build H_schedule for labels
+    H_meso = [1.0, 1.25, 1.5, 2.0, 2.5, 3.0]
+    full_H_schedule = build_default_H_schedule(H_meso, 6.0)
+
+    # Determine held-out indices for labeling
+    ds_npz = np.load(ds_path, allow_pickle=True)
+    held_out_indices = [int(i) for i in np.asarray(
+        ds_npz.get("held_out_indices", []), dtype=np.int32
+    )]
+    data_generator = str(ds_npz.get("data_generator", ""))
+    if data_generator == "tran_inclusion":
+        held_out_indices = sorted(set(held_out_indices) | {0})
+    ho_set = set(held_out_indices)
+    ds_npz.close()
+
+    n_show = max(_N_GEN_SHOW, 1)
+
+    # Generate backward realizations
+    try:
+        gen = generate_backward_realizations(
+            run_dir=run_dir,
+            dataset_npz_path=ds_path,
+            n_realizations=n_show,
+            sample_idx=0,
+            seed=42,
+            use_ema=True,
+            drift_clip_norm=None,
+            device=None,
+            decode_mode="auto",
+            denoiser_num_steps=32,
+            denoiser_noise_scale=1.0,
+            denoiser_steps_schedule=None,
+        )
+    except Exception as exc:
+        print(f"  [fig17] generation failed: {exc}")
+        return
+
+    trajectory_fields = gen.get("trajectory_fields_phys")
+    if trajectory_fields is None:
+        print("  [fig17] trajectory_fields_phys not available.")
+        return
+
+    T_knots = trajectory_fields.shape[0]
+    n_real = trajectory_fields.shape[1]
+    n_show = min(n_show, n_real)
+
+    # ── Figure: GT + n_show generated realizations ─────────────────────
+    n_rows = 1 + n_show
+    n_cols = T_knots
+    fig, axes = plt.subplots(
+        n_rows, n_cols,
+        figsize=(FIG_WIDTH, FIELD_ROW_HEIGHT * n_rows),
+        squeeze=False,
+    )
+
+    for k in range(T_knots):
+        ds_idx = int(time_indices[k])
+        H_val = full_H_schedule[ds_idx] if ds_idx < len(full_H_schedule) else float(ds_idx)
+        ho_tag = " (HO)" if ds_idx in ho_set else ""
+        col_label = f"$H={H_val:.2f}${ho_tag}"
+
+        gt_field = gt["fields_by_index"][ds_idx][0]  # sample 0
+        gen_fields_k = trajectory_fields[k, :n_show]  # (n_show, res²)
+
+        # Shared colour range across GT + all shown realizations for this column
+        all_vals = np.concatenate([gt_field.ravel()] + [g.ravel() for g in gen_fields_k])
+        vmin, vmax = float(all_vals.min()), float(all_vals.max())
+
+        # Row 0: GT
+        axes[0, k].imshow(
+            gt_field.reshape(resolution, resolution),
+            origin="lower", cmap=CMAP_FIELD, vmin=vmin, vmax=vmax,
+        )
+        axes[0, k].set_title(col_label, fontsize=FONT_TITLE)
+        axes[0, k].axis("off")
+
+        # Rows 1..n_show: generated realizations
+        for r in range(n_show):
+            axes[r + 1, k].imshow(
+                gen_fields_k[r].reshape(resolution, resolution),
+                origin="lower", cmap=CMAP_FIELD, vmin=vmin, vmax=vmax,
+            )
+            axes[r + 1, k].axis("off")
+
+    # Row labels
+    axes[0, 0].set_ylabel(
+        "GT", fontsize=FONT_LABEL, rotation=0, ha="right", va="center", labelpad=16,
+    )
+    for r in range(n_show):
+        axes[r + 1, 0].set_ylabel(
+            f"Gen {r + 1}", fontsize=FONT_LABEL, rotation=0,
+            ha="right", va="center", labelpad=16,
+        )
+
+    fig.subplots_adjust(left=0.08, right=0.995, top=0.95, bottom=0.03,
+                        hspace=0.06, wspace=0.04)
+    _save_fig(fig, out_dir, "fig17_generated_fields")
+
+
+# ============================================================================
 # Helper: resolve colours from RUNS registry for metrics labels
 # ============================================================================
 
@@ -1941,8 +1636,7 @@ def _resolve_run_colors(labels: List[str]) -> List[str]:
         short = SHORT_LABEL.get(d)
         if short:
             _run_color_map[short] = c
-    _fallback = [C_OBS, C_GEN, "#ff7f0e", "#9467bd", "#2ca02c",
-                 "#8c564b", "#e377c2", "#17becf"]
+    _fallback = list(EASTERN_HUES)
 
     def _match(lbl: str, idx: int) -> str:
         if lbl in _run_color_map:
@@ -1974,7 +1668,18 @@ def main() -> None:
         default=50_000,
         help="Total training steps (used for x-axis of training curves).",
     )
+    parser.add_argument(
+        "--msbm-run-dir",
+        type=str,
+        default=None,
+        help="MSBM training run directory for fig17 (generated field panels). "
+             "If omitted, fig17 is skipped.",
+    )
     args = parser.parse_args()
+
+    # Set MSBM run dir for fig17 (generated fields).
+    global _MSBM_RUN_DIR
+    _MSBM_RUN_DIR = args.msbm_run_dir
 
     # Global publication-style matplotlib defaults (fonts/cmap/mathtext).
     format_for_paper()
@@ -1992,30 +1697,24 @@ def main() -> None:
          lambda: fig3_observation_time(out_dir)),
         ("fig4:  Held-out interpolation",
          lambda: fig4_held_out(out_dir)),
-        ("fig5:  Latent collapse diagnostics",
-         lambda: fig5_latent_diagnostics(out_dir)),
         ("fig6:  Scale comparison per time",
          lambda: fig6_scale_comparison(out_dir)),
-        ("fig7:  Architecture comparison (Muon+$\\ell_2$ vs Adam+$\\ell_2$+Prior)",
+        ("fig7:  Architecture comparison",
          lambda: fig7_architecture_comparison(out_dir)),
         ("fig8:  Summary table (PNG + .tex)",
          lambda: fig8_summary_table(out_dir)),
         ("fig9:  Two-panel training (single vs multi scale)",
          lambda: fig9_twoscale_training(out_dir, args.max_steps)),
-        ("fig10: Reconstruction fields (t1-t7, Adam+NTK+Prior)",
+        ("fig10: Reconstruction fields (physical scale)",
          lambda: fig10_reconstruction_fields(out_dir)),
-        ("fig11: Denoiser comparison (separate evaluation protocol)",
+        ("fig11: Denoiser comparison",
          lambda: fig11_denoiser_comparison(out_dir)),
         ("fig12: PSD spectral analysis (requires psd_data.npz)",
          lambda: fig12_psd_spectral(out_dir)),
-        ("fig13: Latent-regularization evidence (requires psd_latent_metrics.json)",
-         lambda: fig13_latent_regularization(out_dir)),
-        ("fig14: Per-marginal latent diagnostics (requires psd_latent_metrics.json)",
-         lambda: fig14_per_marginal_latent(out_dir)),
-        ("fig15: Inter-marginal distance regularity (requires psd_latent_metrics.json)",
-         lambda: fig15_inter_marginal_distance(out_dir)),
         ("fig16: NTK sample comparison (Adam+L2 vs Adam+NTK vs Adam+NTK+Prior)",
          lambda: fig16_ntk_sample_comparison(out_dir)),
+        ("fig17: MSBM generated fields (multiple realizations)",
+         lambda: fig17_generated_fields(out_dir)),
     ]
 
     for desc, fn in steps:

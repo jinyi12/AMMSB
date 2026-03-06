@@ -29,11 +29,12 @@ from typing import Optional
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import colormaps as cmaps
 from matplotlib import cm
 from matplotlib.collections import LineCollection
 
-# Make repo importable when running from `notebooks/`
-path_root = Path.cwd().parent
+# Make repo importable regardless of the current working directory.
+path_root = Path(__file__).resolve().parent.parent
 if str(path_root) not in sys.path:
     sys.path.insert(0, str(path_root))
 
@@ -320,9 +321,9 @@ if traj_b_e is not None:
 # ## Plot helpers
 
 # %%
-def _time_colors(times: np.ndarray, cmap_name: str = "viridis"):
+def _time_colors(times: np.ndarray, cmap_name: str = getattr(cmaps.lipari, "name", "lipari")):
     norm = plt.Normalize(vmin=float(times.min()), vmax=float(times.max()))
-    cmap = cm.get_cmap(cmap_name)
+    cmap = plt.get_cmap(cmap_name)
     return norm, cmap
 
 
@@ -333,7 +334,7 @@ def plot_manifold_2d(
     title: str,
     alpha: float = 0.12,
     s: float = 6.0,
-    cmap_name: str = "viridis",
+    cmap_name: str = getattr(cmaps.lipari, "name", "lipari"),
 ):
     norm, cmap = _time_colors(times, cmap_name=cmap_name)
     fig, ax = plt.subplots(figsize=(7, 6))
@@ -489,6 +490,3 @@ if embed_dim_eff == 3:
     fig.tight_layout()
     fig.savefig(viz_dir / "latent_manifold_with_trajectories_3d.png", dpi=150)
     plt.show()
-
-
-

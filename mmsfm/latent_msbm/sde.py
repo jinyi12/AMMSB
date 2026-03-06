@@ -14,7 +14,21 @@ Direction = Literal["forward", "backward"]
 class LatentBridgeSDE:
     """Latent-space SDE utilities for MSBM.
 
-    Uses a scalar diffusion schedule ``sigma(t)``.
+    Faithfully mirrors the SDE formulation in ``MSBM/sde.py`` for constant
+    diffusion, while providing the exact Gamma-integral bridge law for
+    time-varying schedules (for example ``exp_contract``):
+    * ``sample_bridge``:
+      - constant schedule: original MSBM time-ratio bridge moments
+      - non-constant schedule: exact time-changed Brownian bridge moments via
+        ``Gamma(a,b)=int_a^b sigma(u)^2 du``
+    * ``sample_target``:
+      - constant schedule: original ``mean=y1-y0`` target parameterization
+      - non-constant schedule: Gamma-exact target moments consistent with the
+        inhomogeneous bridge drift.
+      In both cases, the trajectory step ``y += policy * dt`` accumulates over
+      the local rollout grid.
+    * ``sample_traj`` uses the original's Euler-Maruyama stepping:
+      ``x += z * dt + sigma * dW``  (MSBM/sde.py:116-149).
     """
 
     def __init__(
@@ -26,6 +40,8 @@ class LatentBridgeSDE:
         var: float = 0.5,
     ):
         self.latent_dim = int(latent_dim)
+        self.var = float(var)
+
         # Backwards compatibility: if no schedule is provided, use a constant diffusion.
         schedule_f: SigmaSchedule = ConstantSigmaSchedule(float(var)) if schedule is None else schedule
 
@@ -43,9 +59,6 @@ class LatentBridgeSDE:
             if lam == 0.0:
                 schedule_b = schedule_f
             else:
-                # If σ_f(t)=σ0 exp(-λ t/t_ref), then with reversed labels s=t_ref-t:
-                # σ_b(s)=σ_f(t_ref-s)=σ0 exp(-λ) exp(+λ s/t_ref)
-                # which matches ExponentialContracting with (σ0_b=σ0 exp(-λ), λ_b=-λ).
                 sigma0_b = float(schedule_f.sigma_0) * math.exp(-lam)
                 schedule_b = ExponentialContractingSigmaSchedule(
                     sigma_0=sigma0_b,
@@ -57,14 +70,23 @@ class LatentBridgeSDE:
 
         self.schedule_forward: SigmaSchedule = schedule_f
         self.schedule_backward: SigmaSchedule = schedule_b
-
-        # Backwards-compat: keep `self.schedule` as the forward schedule.
         self.schedule: SigmaSchedule = self.schedule_forward
+
+        # dt is set by the agent after construction (mirrors MSBM/runner.py:120).
+        self.dt: float = 0.0
 
     def _pick_schedule(self, direction: Direction) -> SigmaSchedule:
         if direction == "backward":
             return self.schedule_backward
         return self.schedule_forward
+
+    @staticmethod
+    def _is_effectively_constant(schedule: SigmaSchedule) -> bool:
+        if isinstance(schedule, ConstantSigmaSchedule):
+            return True
+        if isinstance(schedule, ExponentialContractingSigmaSchedule):
+            return float(schedule.decay_rate) == 0.0
+        return False
 
     def g(self, t: Tensor, *, direction: Direction = "forward") -> Tensor:
         """Diffusion coefficient g(t)=sigma(t) (broadcasted)."""
@@ -74,8 +96,20 @@ class LatentBridgeSDE:
         """Integrated variance Γ(t0,t1)=∫_{t0}^{t1} sigma(u)^2 du (broadcasted)."""
         return self._pick_schedule(direction).gamma(t0, t1)
 
+    # ------------------------------------------------------------------
+    # Bridge sampling
+    # ------------------------------------------------------------------
     def sample_bridge(self, y0: Tensor, y1: Tensor, t: Tensor, *, direction: Direction = "forward") -> Tensor:
         """Sample Brownian bridge between endpoints (y0, y1) at time t[:,1].
+
+        For constant diffusion this reduces to the reference MSBM moments:
+            mean_t = ((tT-ts)/(tT-t0)) * x0 + ((ts-t0)/(tT-t0)) * x1
+            var_t  = sigma^2 * (ts-t0)*(tT-ts) / (tT-t0)
+
+        For non-constant sigma(t), use exact time-changed bridge moments:
+            mean_t = (Gamma(ts,tT)/Gamma(t0,tT))*x0 + (Gamma(t0,ts)/Gamma(t0,tT))*x1
+            var_t  = Gamma(t0,ts)*Gamma(ts,tT)/Gamma(t0,tT)
+        where Gamma(a,b)=int_a^b sigma(u)^2 du.
 
         Args:
             y0: Start points, shape (B, K)
@@ -88,7 +122,6 @@ class LatentBridgeSDE:
         """
         if t.ndim != 2 or t.shape[1] != 3:
             raise ValueError(f"Expected t with shape (B, 3); got {tuple(t.shape)}")
-        # Compute in float32 for numerical stability (avoid half-precision underflows).
         y0 = y0.float()
         y1 = y1.float()
         t = t.float()
@@ -97,33 +130,46 @@ class LatentBridgeSDE:
         ts = t[:, 1:2]
         t1 = t[:, 2:3]
 
-        # Time-changed bridge: replace (t1 - t0) by Γ(t0,t1).
-        denom_safe = torch.clamp(self.gamma(t0, t1, direction=direction).abs(), min=1e-6)
+        schedule = self._pick_schedule(direction)
+        if self._is_effectively_constant(schedule):
+            # Match MSBM/sde.py:78-85 exactly for constant sigma.
+            denom = torch.clamp((t1 - t0).abs(), min=1e-8)
+            mean_t = ((t1 - ts) / denom) * y0 + ((ts - t0) / denom) * y1
 
-        w0 = self.gamma(ts, t1, direction=direction) / denom_safe
-        w1 = self.gamma(t0, ts, direction=direction) / denom_safe
-        mean_t = w0 * y0 + w1 * y1
+            sigma = self.g(ts, direction=direction)
+            var_t = (sigma * sigma) * (ts - t0) * (t1 - ts) / denom
+            var_t = torch.clamp(var_t, min=0.0)
+        else:
+            # Exact bridge law for non-constant diffusion via integrated variance.
+            gamma_01 = self.gamma(t0, t1, direction=direction)
+            gamma_0s = self.gamma(t0, ts, direction=direction)
+            gamma_s1 = self.gamma(ts, t1, direction=direction)
+            denom = torch.clamp(gamma_01.abs(), min=1e-8)
+            mean_t = (gamma_s1 / denom) * y0 + (gamma_0s / denom) * y1
+            var_t = torch.clamp((gamma_0s * gamma_s1) / denom, min=0.0)
 
-        var_t = (self.gamma(t0, ts, direction=direction) * self.gamma(ts, t1, direction=direction)) / denom_safe
-        var_t = torch.clamp(var_t, min=0.0)  # numerical guard
         z_t = torch.randn_like(y0)
         return mean_t + torch.sqrt(var_t) * z_t
 
+    # ------------------------------------------------------------------
+    # Target sampling
+    # ------------------------------------------------------------------
     def sample_target(self, y0: Tensor, y1: Tensor, t: Tensor, *, direction: Direction = "forward") -> Tensor:
         """Compute regression target for MSBM policy training.
 
-        The target corresponds to the (time-inhomogeneous) reference bridge drift
-        evaluated at the bridge marginal, decomposed into a deterministic term
-        and an explicit Gaussian noise term.
+        Constant schedule (reference MSBM target):
+            mean_t = x1 - x0
+            var_t  = sigma^2 * (ts - t0) / (tT - ts)
 
-        For diffusion σ(t), define Γ(a,b)=∫_a^b σ(u)^2 du. Then:
-            target = (σ(ts)^2 / Γ(t0,t1)) (y1 - y0)
-                     - σ(ts)^2 * sqrt( Γ(t0,ts) / (Γ(t0,t1) Γ(ts,t1)) ) * z
-        with z ~ N(0, I).
+        Non-constant schedule (Gamma-exact extension):
+            mean_t = (sigma(ts)^2 / Gamma(t0,tT)) * (x1 - x0)
+            var_t  = sigma(ts)^4 * Gamma(t0,ts) / (Gamma(t0,tT) * Gamma(ts,tT))
+
+        In both cases:
+            target = mean_t - sqrt(var_t) * z,   z ~ N(0, I)
         """
         if t.ndim != 2 or t.shape[1] != 3:
             raise ValueError(f"Expected t with shape (B, 3); got {tuple(t.shape)}")
-        # Compute in float32 for numerical stability (avoid half-precision underflows).
         y0 = y0.float()
         y1 = y1.float()
         t = t.float()
@@ -132,21 +178,31 @@ class LatentBridgeSDE:
         ts = t[:, 1:2]
         t1 = t[:, 2:3]
 
-        gamma_01 = self.gamma(t0, t1, direction=direction)
-        gamma_01_safe = torch.clamp(gamma_01.abs(), min=1e-6)
-        gamma_s1 = self.gamma(ts, t1, direction=direction)
-        gamma_s1_safe = torch.clamp(gamma_s1.abs(), min=1e-6)
+        schedule = self._pick_schedule(direction)
+        sigma = self.g(ts, direction=direction)
+        sigma2 = sigma * sigma
+        if self._is_effectively_constant(schedule):
+            # Match MSBM/sde.py:87-94 exactly for constant sigma.
+            mean_t = y1 - y0
+            var_t = sigma2 * (ts - t0) / torch.clamp((t1 - ts).abs(), min=1e-8)
+            var_t = torch.clamp(var_t, min=0.0)
+        else:
+            # Exact inhomogeneous-bridge target moments.
+            gamma_01 = self.gamma(t0, t1, direction=direction)
+            gamma_0s = self.gamma(t0, ts, direction=direction)
+            gamma_s1 = self.gamma(ts, t1, direction=direction)
+            gamma_01_safe = torch.clamp(gamma_01.abs(), min=1e-8)
+            gamma_s1_safe = torch.clamp(gamma_s1.abs(), min=1e-8)
+            mean_t = (sigma2 / gamma_01_safe) * (y1 - y0)
+            var_t = sigma2 * sigma2 * gamma_0s / (gamma_01_safe * gamma_s1_safe)
+            var_t = torch.clamp(var_t, min=0.0)
 
-        sigma_ts = self.g(ts, direction=direction)
-        sigma2 = sigma_ts * sigma_ts
-
-        mean_t = (sigma2 / gamma_01_safe) * (y1 - y0)
-        noise_scale = sigma2 * torch.sqrt(
-            torch.clamp(self.gamma(t0, ts, direction=direction) / (gamma_01_safe * gamma_s1_safe), min=0.0)
-        )
         z_t = torch.randn_like(y0)
-        return mean_t - noise_scale * z_t
+        return mean_t - torch.sqrt(var_t) * z_t
 
+    # ------------------------------------------------------------------
+    # Trajectory sampling — matches MSBM/sde.py:116-149
+    # ------------------------------------------------------------------
     @torch.no_grad()
     def sample_traj(
         self,
@@ -158,23 +214,44 @@ class LatentBridgeSDE:
         t_final: Optional[Tensor] = None,
         save_traj: bool = True,
         drift_clip_norm: Optional[float] = None,
-        direction: Direction = "forward",
+        direction: Optional[Direction] = None,
     ) -> tuple[Optional[Tensor], Tensor]:
-        """Euler–Maruyama trajectory sampling (MSBM-style).
+        """Euler-Maruyama trajectory sampling, matching the original MSBM.
+
+        Reference (MSBM/sde.py:116-149):
+            for t in ts:
+                t_ = t0s + t
+                z  = policy(x, t_)
+                dw = randn * sqrt(dt)
+                x  = x + z * dt + sigma * dw
+
+        The local time grid ``ts`` runs from 0 to T (typically T=1).
+        Each particle's absolute time is ``t_init + t_local``, matching
+        the original's ``t0s + t`` pattern.  The step size ``dt`` is
+        computed from the local grid spacing.
 
         Args:
-            ts: Local time grid on [t0, T], shape (S,). Must be increasing.
+            ts: Local time grid on [0, T], shape (S,). Must be increasing.
             policy: Policy network mapping (y, t) -> drift, shape (B,K).
             y_init: Initial latent points, shape (B, K).
             t_init: Initial times, shape (B,) or (B, 1) or scalar.
-            t_final: Optional final time for the rollout (scales the local grid duration).
+            t_final: Unused (kept for API compat). The rollout duration is
+                     determined by the ts grid alone, matching the original.
             save_traj: If True, returns the full trajectory.
+            drift_clip_norm: Optional max-norm for drift clipping.
             direction: Which diffusion schedule to use ("forward" or "backward").
+                       If None, infer from ``policy.direction`` and fall back to
+                       "forward" when the attribute is missing.
 
         Returns:
-            traj: Optional tensor of shape (B, S, K) containing latent states aligned with `ts`.
-            y: Final state at `t_final` (or `t_init + 1` if `t_final` is None).
+            traj: Optional tensor of shape (B, S, K).
+            y: Final state after the last step.
         """
+        if direction is None:
+            direction = getattr(policy, "direction", "forward")
+        if direction not in ("forward", "backward"):
+            raise ValueError(f"direction must be 'forward' or 'backward'; got {direction!r}")
+
         if ts.ndim != 1:
             raise ValueError(f"Expected ts with shape (S,); got {tuple(ts.shape)}")
         if not torch.all(ts[1:] >= ts[:-1]):
@@ -191,16 +268,8 @@ class LatentBridgeSDE:
         if t0.ndim == 1:
             t0 = t0.unsqueeze(-1)  # (B, 1)
 
-        duration = None
-        if t_final is None:
-            duration = torch.ones_like(t0)
-        else:
-            t1 = t_final
-            if t1.ndim == 0:
-                t1 = t1.expand(batch_size)
-            if t1.ndim == 1:
-                t1 = t1.unsqueeze(-1)
-            duration = torch.clamp(t1 - t0, min=0.0)
+        # Fixed step size from the local time grid — matches MSBM's self.dt.
+        dt_val = float(ts[1] - ts[0])
 
         traj = None
         if save_traj:
@@ -209,22 +278,22 @@ class LatentBridgeSDE:
 
         for i in range(ts.numel() - 1):
             t_local = ts[i]
-            dt_local = (ts[i + 1] - ts[i]).to(y.device)
-            dt = dt_local * duration  # (B,1)
-            t_abs = t0 + (t_local * duration)  # (B, 1)
+            # Absolute time: t_init + t_local  (matches MSBM: t_ = t0s + t)
+            t_abs = t0 + t_local  # (B, 1)
 
             drift = policy(y, t_abs.squeeze(-1))
             if drift_clip_norm is not None:
-                # Clip drift vector norm to avoid rare blow-ups during rollout.
                 clip = float(drift_clip_norm)
                 if clip > 0.0:
                     drift_norm = torch.linalg.vector_norm(drift, dim=-1, keepdim=True)
                     scale = torch.clamp(clip / (drift_norm + 1e-8), max=1.0)
                     scale = torch.where(torch.isfinite(scale), scale, torch.zeros_like(scale))
                     drift = torch.nan_to_num(drift * scale, nan=0.0, posinf=0.0, neginf=0.0)
-            noise = torch.randn_like(y) * torch.sqrt(dt)
+
+            # Euler-Maruyama: y += z * dt + sigma * dW   (MSBM/sde.py:143)
+            dw = torch.randn_like(y) * math.sqrt(dt_val)
             sigma = self.g(t_abs, direction=direction)
-            y = y + drift * dt + sigma * noise
+            y = y + drift * dt_val + sigma * dw
 
             if traj is not None:
                 traj[:, i + 1, :] = y
