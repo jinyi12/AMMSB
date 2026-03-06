@@ -74,6 +74,28 @@ from mmsfm.latent_msbm.noise_schedule import (
 )
 
 
+def _build_t_dists_from_cfg(zt: np.ndarray, train_cfg: dict[str, Any]) -> np.ndarray:
+    """Reconstruct MSBM internal times from saved training config."""
+    zt_np = np.asarray(zt, dtype=np.float64).reshape(-1)
+    t_scale = float(train_cfg.get("t_scale", 1.0))
+    mode = str(train_cfg.get("time_dist_mode", "uniform")).lower()
+
+    if zt_np.size <= 1:
+        return np.zeros((int(zt_np.size),), dtype=np.float32)
+
+    if mode == "zt":
+        dz = zt_np - float(zt_np[0])
+        span = float(dz[-1])
+        if np.isfinite(span) and span > 0.0:
+            horizon = float((zt_np.size - 1) * t_scale)
+            return ((dz / span) * horizon).astype(np.float32)
+        print("Warning: invalid/degenerate zt span; falling back to uniform t_dists.")
+    elif mode != "uniform":
+        print(f"Warning: unknown time_dist_mode='{mode}', falling back to uniform t_dists.")
+
+    return (np.linspace(0, zt_np.size - 1, zt_np.size, dtype=np.float64) * t_scale).astype(np.float32)
+
+
 # ============================================================================
 # W1/W2 computation
 # ============================================================================
@@ -263,6 +285,7 @@ def _sample_backward_one_interval(
             ts_rel, policy, y, t0_rev, t_final=t1_rev,
             save_traj=False,
             drift_clip_norm=drift_clip_norm,
+            direction=getattr(policy, "direction", "backward"),
         )
         results.append(y_end)
 
@@ -400,7 +423,8 @@ def main() -> None:
     # ------------------------------------------------------------------
     # Rebuild MSBM agent
     # ------------------------------------------------------------------
-    t_ref_default = float(max(1.0, (T - 1) * float(train_cfg.get("t_scale", 1.0))))
+    t_dists_np = _build_t_dists_from_cfg(zt, train_cfg)
+    t_ref_default = float(max(1.0, float(t_dists_np[-1] - t_dists_np[0])))
     var_time_ref_val = train_cfg.get("var_time_ref", None)
     t_ref = float(var_time_ref_val) if var_time_ref_val is not None else t_ref_default
 
@@ -426,6 +450,7 @@ def main() -> None:
         var=float(train_cfg.get("var", 0.5)),
         sigma_schedule=sigma_schedule,
         t_scale=float(train_cfg.get("t_scale", 1.0)),
+        t_dists=t_dists_np,
         interval=int(train_cfg.get("interval", 100)),
         use_t_idx=bool(train_cfg.get("use_t_idx", False)),
         lr=float(train_cfg.get("lr", 1e-4)),

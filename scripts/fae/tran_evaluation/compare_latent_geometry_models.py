@@ -175,15 +175,16 @@ def _write_effect_tables(
     out_dir: Path,
 ) -> None:
     """Write paired NTK/prior effects as tables for presentation."""
+    scale_scope = str(effects.get("effect_scale_scope", "")).strip() or "selected scale"
     effect_specs = [
         (
             "ntk_effect",
-            "NTK effect: L2 → NTK-scaled (multi_1248, prior=0)",
+            f"NTK effect: L2 → NTK-scaled ({scale_scope}, prior=0)",
             "latent_geom_ntk_effect_table",
         ),
         (
             "prior_effect",
-            "Prior effect (on top of NTK): NTK → NTK+Prior (multi_1248)",
+            f"Prior effect (on top of NTK): NTK → NTK+Prior ({scale_scope})",
             "latent_geom_prior_effect_table",
         ),
     ]
@@ -273,6 +274,16 @@ def _parse_args() -> argparse.Namespace:
         description="Compare latent-geometry robustness across multiple FAE runs.",
     )
     parser.add_argument(
+        "--run_dir",
+        dest="run_dirs",
+        action="append",
+        default=[],
+        help=(
+            "Explicit FAE run directory containing args.json and checkpoints. "
+            "Repeat to bypass registry selection."
+        ),
+    )
+    parser.add_argument(
         "--registry_csv",
         type=str,
         default="docs/experiments/combinatorial_run_registry.csv",
@@ -311,6 +322,21 @@ def _parse_args() -> argparse.Namespace:
         help="Recompute latent geometry even if cached per-run results exist.",
     )
     parser.add_argument(
+        "--check_existing_metrics",
+        action="store_true",
+        default=True,
+        help=(
+            "Check for existing per-run latent_geometry_metrics.json artifacts before "
+            "recomputing. Enabled by default."
+        ),
+    )
+    parser.add_argument(
+        "--no_check_existing_metrics",
+        action="store_false",
+        dest="check_existing_metrics",
+        help="Disable reuse of existing latent geometry metric artifacts.",
+    )
+    parser.add_argument(
         "--latent_geom_budget",
         type=str,
         default="standard",
@@ -344,6 +370,15 @@ def _parse_args() -> argparse.Namespace:
         type=str,
         default="deterministic_primary",
         help="Track scope for paired NTK/prior effect baselines.",
+    )
+    parser.add_argument(
+        "--effect_scale_scope",
+        type=str,
+        default="multi_1248",
+        help=(
+            "Scale label used when building paired L2→NTK→NTK+Prior effect tables. "
+            "Set to the shared scale tag for explicit --run_dir selections."
+        ),
     )
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
@@ -440,12 +475,174 @@ def _resolve_checkpoint(run_dir: Path) -> Path:
     raise FileNotFoundError(f"No FAE checkpoint found in {run_dir}")
 
 
+def _resolve_explicit_run_dir(run_dir: Path) -> Path:
+    run_dir = run_dir.expanduser().resolve()
+    if (run_dir / "args.json").exists():
+        return run_dir
+
+    candidates: list[tuple[tuple[int, float], Path]] = []
+    for child in sorted(run_dir.glob("run_*")):
+        if not (child / "args.json").exists():
+            continue
+        try:
+            _resolve_checkpoint(child)
+        except Exception:
+            continue
+        eval_file = child / "eval_results.json"
+        score = (
+            1 if eval_file.exists() else 0,
+            eval_file.stat().st_mtime if eval_file.exists() else (child / "args.json").stat().st_mtime,
+        )
+        candidates.append((score, child))
+
+    if candidates:
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        return candidates[0][1].resolve()
+    return run_dir
+
+
 def _resolve_data_path(run_dir: Path) -> Path:
     args_json = _load_json(run_dir / "args.json")
     data_path = _resolve_existing_path(args_json.get("data_path"), [run_dir, Path.cwd()])
     if data_path is None:
         raise FileNotFoundError(f"Could not resolve data_path from {run_dir / 'args.json'}")
     return data_path
+
+
+def _load_existing_metrics(path: Path) -> Optional[dict[str, Any]]:
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text())
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return payload
+
+
+def _has_valid_model_metadata(payload: dict[str, Any]) -> bool:
+    meta = payload.get("model_metadata", {})
+    if not isinstance(meta, dict):
+        return False
+    required = ("decoder_type", "optimizer", "loss_type", "scale", "prior_flag")
+    return all(meta.get(key) not in (None, "") for key in required)
+
+
+def _existing_metrics_score(path: Path, payload: dict[str, Any]) -> tuple[int, int, int]:
+    score = 0
+    if _has_valid_model_metadata(payload):
+        score += 100
+    path_text = str(path)
+    if "latent_geometry_latent128_ablation" in path_text:
+        score += 40
+    if "/per_run/" in path_text:
+        score += 20
+    if "/tran_evaluation/" in path_text:
+        score -= 10
+    mtime = int(path.stat().st_mtime) if path.exists() else 0
+    return score, mtime, -len(path_text)
+
+
+def _find_existing_metrics_for_run(run_dir: Path) -> Optional[tuple[Path, dict[str, Any]]]:
+    direct_candidates = [
+        run_dir / "tran_evaluation" / "latent_geometry_metrics.json",
+        run_dir / "latent_geometry_eval" / "latent_geometry_metrics.json",
+        run_dir / "latent_geometry_metrics.json",
+    ]
+    matches: list[tuple[tuple[int, int, int], Path, dict[str, Any]]] = []
+    for candidate in direct_candidates:
+        payload = _load_existing_metrics(candidate)
+        if payload is not None:
+            matches.append((_existing_metrics_score(candidate, payload), candidate, payload))
+
+    results_root = REPO_ROOT / "results"
+    if results_root.exists():
+        for candidate in results_root.rglob("latent_geometry_metrics.json"):
+            payload = _load_existing_metrics(candidate)
+            if payload is None:
+                continue
+            payload_run_dir = str(payload.get("run_dir", "")).strip()
+            if payload_run_dir and Path(payload_run_dir).expanduser().resolve() == run_dir:
+                matches.append((_existing_metrics_score(candidate, payload), candidate, payload))
+
+    if not matches:
+        return None
+    matches.sort(key=lambda item: item[0], reverse=True)
+    _score, best_path, best_payload = matches[0]
+    return best_path, best_payload
+
+
+def _infer_scale_label(args_json: dict[str, Any], run_dir: Path) -> str:
+    scale = str(args_json.get("scale", "") or "").strip()
+    if scale:
+        return scale
+
+    for key in ("encoder_multiscale_sigmas", "decoder_multiscale_sigmas"):
+        raw = str(args_json.get(key, "") or "").strip()
+        if raw:
+            try:
+                sigmas = tuple(int(round(float(tok.strip()))) for tok in raw.split(",") if tok.strip())
+            except Exception:
+                sigmas = ()
+            if sigmas == (1, 2, 4, 8):
+                return "multi_1248"
+            if len(sigmas) == 1:
+                return f"single_{sigmas[0]}"
+
+    latent_dim = args_json.get("latent_dim")
+    try:
+        latent_dim_int = int(latent_dim)
+    except Exception:
+        latent_dim_int = None
+
+    parent_name = run_dir.parent.name.lower()
+    run_name = run_dir.name.lower()
+    path_blob = f"{parent_name} {run_name}"
+
+    if latent_dim_int is not None and "latent" in path_blob:
+        return f"latent{latent_dim_int}"
+    if latent_dim_int is not None:
+        return f"latent{latent_dim_int}"
+    if "single" in path_blob or "sigma1" in path_blob:
+        return "single"
+    if "multi" in path_blob:
+        return "multi"
+    return "unspecified"
+
+
+def _registry_run_from_explicit_dir(run_dir: Path) -> RegistryRun:
+    run_dir = _resolve_explicit_run_dir(run_dir)
+    args_json = _load_json(run_dir / "args.json")
+    if not args_json:
+        raise FileNotFoundError(f"Missing or invalid args.json in {run_dir}")
+
+    optimizer = str(args_json.get("optimizer", "")).strip().lower() or "unknown"
+    loss_type = str(args_json.get("loss_type", "")).strip().lower() or "unknown"
+    decoder_type = str(args_json.get("decoder_type", "")).strip().lower() or "unknown"
+    use_prior = bool(args_json.get("use_prior", False))
+    scale = _infer_scale_label(args_json, run_dir)
+
+    return RegistryRun(
+        matrix_cell_id=run_dir.parent.name or run_dir.name,
+        decoder_type=decoder_type,
+        optimizer=optimizer,
+        loss_type=loss_type,
+        scale=scale,
+        prior_flag=int(use_prior),
+        track="manual",
+        status="complete",
+        paper_track="manual",
+        best_run_dir=str(run_dir.resolve()),
+        notes="explicit_run_dir",
+    )
+
+
+def _normalise_results_for_run(results: dict[str, Any], run: RegistryRun) -> dict[str, Any]:
+    payload = dict(results)
+    payload["run_dir"] = str(Path(run.best_run_dir).resolve())
+    payload["model_metadata"] = asdict(run)
+    return payload
 
 
 def _load_time_data(
@@ -714,6 +911,7 @@ def _compute_effect_tables(
     summaries: list[dict[str, Any]],
     *,
     effect_baseline_scope: str = "deterministic_primary",
+    effect_scale_scope: str = "multi_1248",
 ) -> dict[str, Any]:
     metrics = MODEL_METRICS
     optimizers = ["adam", "muon"]
@@ -727,7 +925,7 @@ def _compute_effect_tables(
             decoder_type="film",
             optimizer=optimizer,
             loss_type="l2",
-            scale="multi_1248",
+            scale=effect_scale_scope,
             prior_flag=0,
             track=effect_baseline_scope,
         )
@@ -736,7 +934,7 @@ def _compute_effect_tables(
             decoder_type="film",
             optimizer=optimizer,
             loss_type="ntk_scaled",
-            scale="multi_1248",
+            scale=effect_scale_scope,
             prior_flag=0,
             track=effect_baseline_scope,
         )
@@ -756,7 +954,7 @@ def _compute_effect_tables(
             decoder_type="film",
             optimizer=optimizer,
             loss_type="ntk_scaled",
-            scale="multi_1248",
+            scale=effect_scale_scope,
             prior_flag=1,
             track=effect_baseline_scope,
         )
@@ -794,6 +992,7 @@ def _compute_effect_tables(
 
     return {
         "effect_baseline_scope": effect_baseline_scope,
+        "effect_scale_scope": effect_scale_scope,
         "metrics": [metric["key"] for metric in metrics],
         "sign_conventions": sign_conventions,
         "ntk_effect": ntk_rows,
@@ -1120,16 +1319,20 @@ def main() -> None:
     if args.include_denoiser_secondary:
         tracks.add("denoiser_secondary")
 
-    registry_rows = _read_registry(Path(args.registry_csv))
-    selected = [
-        row for row in registry_rows
-        if row.track in tracks
-        and (not args.paper_track or row.paper_track == args.paper_track)
-    ]
-    if args.max_runs > 0:
-        selected = selected[: args.max_runs]
-    if not selected:
-        raise RuntimeError("No runs selected from registry with the requested filters.")
+    explicit_run_dirs = [Path(run_raw).resolve() for run_raw in args.run_dirs if str(run_raw).strip()]
+    if explicit_run_dirs:
+        selected = [_registry_run_from_explicit_dir(run_dir) for run_dir in explicit_run_dirs]
+    else:
+        registry_rows = _read_registry(Path(args.registry_csv))
+        selected = [
+            row for row in registry_rows
+            if row.track in tracks
+            and (not args.paper_track or row.paper_track == args.paper_track)
+        ]
+        if args.max_runs > 0:
+            selected = selected[: args.max_runs]
+        if not selected:
+            raise RuntimeError("No runs selected from registry with the requested filters.")
 
     format_for_paper()
     cfg = LatentGeometryConfig.from_preset(
@@ -1153,8 +1356,30 @@ def main() -> None:
         cache_path = run_cache_dir / "latent_geometry_metrics.json"
 
         print(f"[{i}/{len(selected)}] {run.best_run_dir}")
-        if cache_path.exists() and not args.force_recompute:
-            results = json.loads(cache_path.read_text())
+        cache_payload = _load_existing_metrics(cache_path)
+        if (
+            cache_payload is not None
+            and not args.force_recompute
+            and (not args.check_existing_metrics or _has_valid_model_metadata(cache_payload))
+        ):
+            results = cache_payload
+        elif args.check_existing_metrics and not args.force_recompute:
+            existing = _find_existing_metrics_for_run(Path(run.best_run_dir))
+            if existing is not None:
+                existing_path, results = existing
+                print(f"  Reusing existing latent geometry metrics from {existing_path}")
+                results = _normalise_results_for_run(results, run)
+                cache_path.write_text(json.dumps(results, indent=2))
+            else:
+                results = _compute_run_latent_geometry(
+                    run,
+                    cfg=cfg,
+                    split=args.latent_geom_split,
+                    max_samples_per_time=args.latent_geom_max_samples_per_time,
+                    seed=args.seed,
+                )
+                results = _normalise_results_for_run(results, run)
+                cache_path.write_text(json.dumps(results, indent=2))
         else:
             results = _compute_run_latent_geometry(
                 run,
@@ -1163,24 +1388,32 @@ def main() -> None:
                 max_samples_per_time=args.latent_geom_max_samples_per_time,
                 seed=args.seed,
             )
+            results = _normalise_results_for_run(results, run)
             cache_path.write_text(json.dumps(results, indent=2))
+
+        results = _normalise_results_for_run(results, run)
 
         summaries.append(_summarise_run(results))
 
     summaries = sorted(summaries, key=_summary_sort_key)
     # Publication plots compare multi-sigma runs only.
-    summaries_plot = [s for s in summaries if str(s.get("scale", "")) == "multi_1248"]
+    summaries_plot = [s for s in summaries if str(s.get("scale", "")) == args.effect_scale_scope]
+    if not summaries_plot:
+        summaries_plot = list(summaries)
     paired_effects = _compute_effect_tables(
         summaries,
         effect_baseline_scope=args.effect_baseline_scope,
+        effect_scale_scope=args.effect_scale_scope,
     )
 
     selection = {
+        "explicit_run_dirs": [str(path) for path in explicit_run_dirs],
         "tracks": sorted(tracks),
         "paper_track": args.paper_track,
         "max_runs": int(args.max_runs),
         "effect_baseline_scope": args.effect_baseline_scope,
-        "scale_filter": "multi_1248",
+        "effect_scale_scope": args.effect_scale_scope,
+        "check_existing_metrics": bool(args.check_existing_metrics),
     }
 
     _write_summary_files(

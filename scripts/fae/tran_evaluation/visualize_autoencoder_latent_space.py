@@ -265,7 +265,7 @@ def _plot_single_run(
     t_labels = np.concatenate(keep_time, axis=0)
 
     fig, ax = plt.subplots(1, 1, figsize=(5.6, 4.4))
-    cmap = plt.get_cmap("viridis", t_count)
+    cmap = plt.get_cmap("cividis", t_count)
     sc = ax.scatter(
         points[:, 0],
         points[:, 1],
@@ -305,7 +305,7 @@ def _plot_combined_grid(
     n_cols = 3
     n_rows = int(np.ceil(n_runs / float(n_cols)))
     fig, axes = plt.subplots(n_rows, n_cols, figsize=(4.6 * n_cols, 3.6 * n_rows), squeeze=False)
-    cmap = plt.get_cmap("viridis", n_times)
+    cmap = plt.get_cmap("cividis", n_times)
 
     for i in range(n_rows * n_cols):
         ax = axes[i // n_cols, i % n_cols]

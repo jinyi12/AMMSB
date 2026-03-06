@@ -46,19 +46,9 @@ The backward SDE's first marginal (after flip) is dataset index 1
 EVALUATION SCOPE
 ----------------
 The detail-field decomposition and all downstream statistics (W1, R(tau),
-J, PSD, diversity) are restricted to scales the generator actually
-produces.  The generator outputs at H=time_indices[0] (e.g., H=1.0D),
-so the evaluation ladder is::
-
-    eval_H = [0, 1.25, 1.5, 2.0, 2.5, 3.0, 6.0]
-
-where H=0 is "identity / no filtering" (= the raw generated field).
-H=1.0D is skipped because the generated field is already at that scale;
-re-filtering would introduce a double-convolution artefact.
-
-The observed detail fields use GT indices [1, 2, 3, 4, 5, 6, 7], giving
-the same 6 bands.  The raw piecewise-constant microscale (index 0, H=0)
-is excluded from ALL band comparisons because the backward SDE was never
+J, PSD, diversity) are restricted to the dataset indices actually modeled
+by the generator, namely ``time_indices``.  The raw piecewise-constant
+microscale (index 0, H=0) is excluded because the backward SDE was never
 trained to reconstruct it.
 """
 
@@ -109,9 +99,6 @@ from scripts.fae.tran_evaluation.report import (  # noqa: E402
     plot_directional_correlation,
     plot_diversity,
     plot_J_bars,
-    plot_latent_geom_flags,
-    plot_latent_geom_hessian,
-    plot_latent_geom_spectrum,
     plot_pdfs,
     plot_psd,
     plot_qq,
@@ -146,6 +133,67 @@ def parse_args_file(args_path: Path) -> dict[str, Any]:
     return parsed
 
 
+def _save_generated_data_cache(path: Path, gen: dict[str, Any]) -> None:
+    """Persist generated evaluation data for later plot-only reruns."""
+    payload: dict[str, np.ndarray] = {}
+    for key in (
+        "realizations_phys",
+        "realizations_log",
+        "trajectory_fields_phys",
+        "trajectory_fields_log",
+        "zt",
+        "time_indices",
+        "sample_indices",
+    ):
+        value = gen.get(key)
+        if value is not None:
+            payload[key] = np.asarray(value)
+
+    resolution = gen.get("resolution")
+    if resolution is not None:
+        payload["resolution"] = np.asarray(int(resolution), dtype=np.int64)
+
+    payload["is_realizations"] = np.asarray(bool(gen.get("is_realizations", False)))
+
+    decode_mode = gen.get("decode_mode")
+    if decode_mode is not None:
+        payload["decode_mode"] = np.asarray(str(decode_mode))
+
+    denoiser_steps_schedule = gen.get("denoiser_steps_schedule")
+    if denoiser_steps_schedule is not None:
+        payload["denoiser_steps_schedule"] = np.asarray(denoiser_steps_schedule)
+
+    np.savez_compressed(path, **payload)
+
+
+def _load_generated_data_cache(path: Path) -> dict[str, Any]:
+    """Load cached generated evaluation data saved by `_save_generated_data_cache`."""
+    with np.load(path, allow_pickle=True) as data:
+        gen: dict[str, Any] = {}
+        for key in (
+            "realizations_phys",
+            "realizations_log",
+            "trajectory_fields_phys",
+            "trajectory_fields_log",
+            "zt",
+            "time_indices",
+            "sample_indices",
+        ):
+            if key in data:
+                gen[key] = np.asarray(data[key])
+
+        if "resolution" in data:
+            gen["resolution"] = int(np.asarray(data["resolution"]).item())
+        if "is_realizations" in data:
+            gen["is_realizations"] = bool(np.asarray(data["is_realizations"]).item())
+        if "decode_mode" in data:
+            gen["decode_mode"] = str(np.asarray(data["decode_mode"]).item())
+        if "denoiser_steps_schedule" in data:
+            sched = np.asarray(data["denoiser_steps_schedule"])
+            gen["denoiser_steps_schedule"] = sched.tolist() if sched.ndim > 0 else sched.item()
+    return gen
+
+
 # ============================================================================
 # CLI
 # ============================================================================
@@ -176,6 +224,15 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--output_dir", type=str, default=None,
         help="Output directory.  Default: <run_dir>/tran_evaluation.",
+    )
+    p.add_argument(
+        "--generated_data_file", type=str, default=None,
+        help="Optional cache for generated backward realizations and decoded knot fields.",
+    )
+    p.add_argument(
+        "--reuse_generated_data",
+        action="store_true",
+        help="Reuse --generated_data_file when present instead of regenerating backward realizations.",
     )
 
     # --- Physics / geometry ---
@@ -568,18 +625,20 @@ def _build_eval_scope(
 ) -> tuple[list[float], dict[int, np.ndarray], "FilterLadder"]:
     """Build the evaluation-scope ladder and GT fields.
 
-    The generator outputs at scale ``H_schedule[gt_micro_dataset_idx]``
-    (e.g. H=1.0D).  The evaluation must NOT include the raw microscale
-    (H=0) or the generator's native scale (to avoid double-convolution).
+    The generator outputs at dataset indices actually present in the MSBM
+    training set, encoded by ``modeled_dataset_indices``. The evaluation
+    must therefore follow those indices instead of assuming that all
+    intermediate dataset scales are available.
 
     Returns
     -------
     eval_H_schedule : list[float]
-        ``[0.0, H_{idx+1}, H_{idx+2}, ..., H_macro]``.
-        H=0 acts as "identity / no filtering" for the generated field.
+        ``[0.0, H(modeled_1), H(modeled_2), ..., H(modeled_last)]`` where
+        H=0 acts as "identity / no filtering" for the generated field at the
+        first modeled scale.
     eval_gt_fields : dict[int, ndarray (N, res^2)]
-        GT fields remapped so that key 0 = ``gt_fields_by_index[gt_micro_dataset_idx]``,
-        key 1 = next scale, etc.
+        GT fields remapped so that key 0 = the first modeled scale,
+        key 1 = the next modeled scale, etc.
     eval_ladder : FilterLadder
         Ladder configured with ``eval_H_schedule``.
     """
@@ -629,15 +688,6 @@ def _run_latent_geometry_only(args: argparse.Namespace) -> None:
         json.dump(lg_results, f, indent=2)
     print(f"Saved latent geometry metrics to {out_dir / 'latent_geometry_metrics.json'}")
 
-    if not args.no_plot:
-        import matplotlib
-
-        matplotlib.use("Agg")
-        format_for_paper()
-        plot_latent_geom_spectrum(lg_results, None, None, out_dir)
-        plot_latent_geom_hessian(lg_results, None, None, out_dir)
-        plot_latent_geom_flags(lg_results, None, None, out_dir)
-        print(f"Saved latent geometry figures to {out_dir}")
 
     print("\nDone!")
 
@@ -670,6 +720,10 @@ def main() -> None:
             else run_dir / "tran_evaluation"
         )
         out_dir.mkdir(parents=True, exist_ok=True)
+        generated_data_path = (
+            Path(args.generated_data_file) if args.generated_data_file
+            else out_dir / "generated_realizations.npz"
+        )
 
         print(f"Run directory : {run_dir}")
         print(f"Dataset       : {ds_path}")
@@ -679,31 +733,36 @@ def main() -> None:
         time_indices = load_time_index_mapping(run_dir)
         print(f"MSBM time_indices (dataset indices): {time_indices.tolist()}")
 
-        # Generate backward SDE realisations.
-        print(f"\n--- Generating {args.n_realizations} backward realisations ---")
-        from scripts.fae.tran_evaluation.generate import (  # noqa: E402
-            generate_backward_realizations,
-        )
+        if args.reuse_generated_data and generated_data_path.exists():
+            print(f"\n--- Reusing cached generated data: {generated_data_path} ---")
+            gen = _load_generated_data_cache(generated_data_path)
+        else:
+            print(f"\n--- Generating {args.n_realizations} backward realisations ---")
+            from scripts.fae.tran_evaluation.generate import (  # noqa: E402
+                generate_backward_realizations,
+            )
 
-        device = None
-        if args.nogpu:
-            import torch
-            device = torch.device("cpu")
+            device = None
+            if args.nogpu:
+                import torch
+                device = torch.device("cpu")
 
-        gen = generate_backward_realizations(
-            run_dir=run_dir,
-            dataset_npz_path=ds_path,
-            n_realizations=args.n_realizations,
-            sample_idx=args.sample_idx,
-            seed=args.seed,
-            use_ema=args.use_ema,
-            drift_clip_norm=args.drift_clip_norm,
-            device=device,
-            decode_mode=args.decode_mode,
-            denoiser_num_steps=args.denoiser_num_steps,
-            denoiser_noise_scale=args.denoiser_noise_scale,
-            denoiser_steps_schedule=args.denoiser_steps_schedule,
-        )
+            gen = generate_backward_realizations(
+                run_dir=run_dir,
+                dataset_npz_path=ds_path,
+                n_realizations=args.n_realizations,
+                sample_idx=args.sample_idx,
+                seed=args.seed,
+                use_ema=args.use_ema,
+                drift_clip_norm=args.drift_clip_norm,
+                device=device,
+                decode_mode=args.decode_mode,
+                denoiser_num_steps=args.denoiser_num_steps,
+                denoiser_noise_scale=args.denoiser_noise_scale,
+                denoiser_steps_schedule=args.denoiser_steps_schedule,
+            )
+            _save_generated_data_cache(generated_data_path, gen)
+            print(f"Saved generated data cache to {generated_data_path}")
 
     else:
         # --- Legacy mode: pre-generated trajectories ---
@@ -753,7 +812,7 @@ def main() -> None:
         gt_micro_dataset_idx = int(time_indices[0])
         gt_macro_dataset_idx = int(time_indices[-1])
     else:
-        gt_micro_dataset_idx = 0
+        gt_micro_dataset_idx = 1 if len(full_H_schedule) > 1 else 0
         gt_macro_dataset_idx = len(full_H_schedule) - 1
 
     print(f"GT reference field: dataset index {gt_micro_dataset_idx} "
@@ -764,15 +823,17 @@ def main() -> None:
     gt_micro_sample = gt["fields_by_index"][gt_micro_dataset_idx][args.sample_idx]
     gt_macro_sample = gt["fields_by_index"][gt_macro_dataset_idx][args.sample_idx]
 
-    # --- Build evaluation-scope ladder & GT fields ---
-    # Excludes the raw piecewise-constant microscale (H=0, dataset idx 0)
-    # AND the generator's native scale (H=1.0D) from the filter ladder
     modeled_dataset_indices = (
         [int(idx) for idx in time_indices.tolist()]
         if time_indices is not None
         else list(range(max(1, gt_micro_dataset_idx), len(full_H_schedule)))
     )
 
+    # --- Build evaluation-scope ladder & GT fields ---
+    # The ladder follows the modeled dataset indices, with H=0 used only as
+    # an identity label for the generator's native scale.
+    #
+    # Both gen and GT yield aligned detail bands between consecutive modeled scales.
     eval_H_schedule, eval_gt_fields, eval_ladder = _build_eval_scope(
         full_H_schedule,
         gt["fields_by_index"],
@@ -798,8 +859,8 @@ def main() -> None:
     n_eval_bands = n_eval_scales - 1
     eval_macro_scale_idx = n_eval_scales - 1
 
-    print(f"Eval H_schedule: {eval_H_schedule}  ({n_eval_bands} detail bands)")
     print(f"Modeled dataset indices: {modeled_dataset_indices}")
+    print(f"Eval H_schedule: {eval_H_schedule}  ({n_eval_bands} detail bands)")
     print("  Excluded from evaluation: raw microscale index 0 and any held-out dataset indices")
 
     # ---------------------------------------------------------------
@@ -854,8 +915,8 @@ def main() -> None:
     )
     for b in sorted(first_order.keys()):
         w = first_order[b]["wasserstein1"]
-        print(f"  Band {b}: W1={w['w1']:.6f}  W1_norm={w['w1_normalised']:.6f}")
         samp = first_order[b]["sampling"]
+        print(f"  Band {b}: W1={w['w1']:.6f}  W1_norm={w['w1_normalised']:.6f}")
         print(
             "           "
             f"spacing={int(samp['spacing_pixels'])} px  "
@@ -905,7 +966,7 @@ def main() -> None:
     }
 
     # GT ensemble at the correct scale (gen's native, NOT raw micro).
-    gt_micro_ens = gt["fields_by_index"][gt_micro_dataset_idx][:args.n_gt_neighbors]
+    gt_micro_ens = eval_gt_ensemble_fields[0]
 
     diversity = evaluate_diversity(
         gen["realizations_phys"],
@@ -951,6 +1012,7 @@ def main() -> None:
             gen_fields_k = trajectory_fields[k]  # (N_real, res^2)
             gt_fields_k = gt["fields_by_index"][ds_idx][:args.n_gt_neighbors]  # (N_gt, res^2)
 
+            # First-order: decorrelated one-point statistics.
             first_order_k = evaluate_first_order_pair(
                 gt_fields_k,
                 gen_fields_k,
@@ -958,6 +1020,8 @@ def main() -> None:
                 args.min_spacing_pixels,
             )
 
+            # Second-order: ensemble directional correlation, matching Tran's
+            # ensemble covariance definition on both observed and generated fields.
             obs_corr = ensemble_directional_correlation(gt_fields_k, resolution)
             R_obs_e1 = obs_corr["R_e1_mean"]
             R_obs_e2 = obs_corr["R_e2_mean"]
@@ -1000,19 +1064,21 @@ def main() -> None:
                 "psd_mismatch": dpsd,
                 "wavelength_obs": lam_obs,
                 "wavelength_gen": lam_gen,
+                # Store decorrelated one-point samples for plotting.
                 "_obs_values": first_order_k["obs_values"],
                 "_gen_values": first_order_k["gen_values"],
                 "_sampling": first_order_k["sampling"],
             }
 
-            w1_res = first_order_k["wasserstein1"]
             print(f"  Knot {k} (H={H_val:.2f}): "
-                  f"W1_norm={w1_res['w1_normalised']:.6f}  "
+                  f"W1_norm={first_order_k['wasserstein1']['w1_normalised']:.6f}  "
                   f"J_norm={J_res['J_normalised']:.6f}  "
                   f"dPSD={dpsd:.4f}")
+            samp = first_order_k["sampling"]
             print(
-                f"           spacing={int(first_order_k['sampling']['spacing_pixels'])} px  "
-                f"xi_obs=({first_order_k['sampling']['xi_e1_pixels']:.2f}, {first_order_k['sampling']['xi_e2_pixels']:.2f}) px"
+                "           "
+                f"spacing={int(samp['spacing_pixels'])} px  "
+                f"xi_obs=({samp['xi_e1_pixels']:.2f}, {samp['xi_e2_pixels']:.2f}) px"
             )
 
         # Print trajectory summary.
@@ -1249,18 +1315,6 @@ def main() -> None:
             )
             plot_trajectory_qq(
                 trajectory_results, time_indices, full_H_schedule, out_dir,
-            )
-            n_figs += 6
-
-        if latent_geometry_results is not None:
-            plot_latent_geom_spectrum(
-                latent_geometry_results, latent_geom_time_indices, full_H_schedule, out_dir,
-            )
-            plot_latent_geom_hessian(
-                latent_geometry_results, latent_geom_time_indices, full_H_schedule, out_dir,
-            )
-            plot_latent_geom_flags(
-                latent_geometry_results, latent_geom_time_indices, full_H_schedule, out_dir,
             )
             n_figs += 6
 

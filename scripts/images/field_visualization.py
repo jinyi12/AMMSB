@@ -37,6 +37,7 @@ __all__ = [
 ]
 
 _NUMERIC_EPS = 1e-12
+BAMAKO_CMAP = plt.get_cmap("cividis")
 
 
 # =============================================================================
@@ -56,7 +57,7 @@ EASTERN_HUES: list[str] = [
 
 def format_for_paper() -> None:
     """Apply publication-style defaults for matplotlib figures."""
-    plt.rcParams.update({"image.cmap": "viridis"})
+    plt.rcParams.update({"image.cmap": getattr(BAMAKO_CMAP, "name", "cividis")})
     plt.rcParams.update(
         {
             "font.serif": [
@@ -227,7 +228,7 @@ def plot_field_snapshots(
     run: Any,
     n_samples: int = 5,
     score: bool = False,
-    cmap: str = "viridis",
+    cmap: Any = BAMAKO_CMAP,
     *,
     filename_prefix: str | None = None,
     wandb_key: str | None = None,
@@ -290,7 +291,7 @@ def plot_field_evolution_gif(
     run: Any,
     sample_idx: int = 0,
     score: bool = False,
-    cmap: str = "viridis",
+    cmap: Any = BAMAKO_CMAP,
     fps: int = 5,
     *,
     filename_prefix: str | None = None,
@@ -452,7 +453,7 @@ def plot_sample_comparison_grid(
     *,
     score: bool = False,
     n_samples: int = 5,
-    cmap: str = "viridis",
+    cmap: Any = BAMAKO_CMAP,
     diff_cmap: str = "RdBu_r",
     filename_prefix: str | None = None,
     wandb_key: str | None = None,
@@ -1104,7 +1105,7 @@ def plot_vector_field_streamplot(
 
         speed = np.sqrt(U**2 + V**2)
         strm = ax.streamplot(
-            xx, yy, U, V, color=speed, cmap='viridis',
+            xx, yy, U, V, color=speed, cmap=BAMAKO_CMAP,
             linewidth=1.5, density=1.5, arrowsize=1.2, arrowstyle='->'
         )
         if idx == len(time_points) - 1:
@@ -1263,7 +1264,7 @@ def plot_interpolated_probability_paths(
         
         # Plot path with color gradient by time
         n_points = len(complete_path_times)
-        colors = plt.cm.viridis(np.linspace(0, 1, n_points))
+        colors = BAMAKO_CMAP(np.linspace(0, 1, n_points))
         for i in range(n_points - 1):
             ax_paths.plot(
                 path_proj[i:i+2, 0], 
@@ -1418,7 +1419,7 @@ def plot_field_comparisons(
     if n_rows == 1:
         axes = np.expand_dims(axes, axis=0)
 
-    cmap_data = "viridis"
+    cmap_data = BAMAKO_CMAP
     cmap_err = "inferno"
 
     # Helper for global vrange
@@ -1557,7 +1558,7 @@ def plot_conditional_flow_paths(
     sigma_t = path_info['sigma_t']  # (n_times,)
     n_times = len(t_eval)
 
-    colors = cm.viridis(np.linspace(0, 1, len(zt)))
+    colors = BAMAKO_CMAP(np.linspace(0, 1, len(zt)))
 
     for row_idx, sample_idx in enumerate(sample_indices):
         # Extract data for this sample

@@ -11,7 +11,6 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib.colors import ListedColormap
 from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
 from numpy.typing import NDArray
@@ -35,7 +34,7 @@ C_ACCENT = EASTERN_HUES[3]   # light teal
 # ============================================================================
 # Colormap
 # ============================================================================
-CMAP_FIELD = "viridis"
+CMAP_FIELD = "cividis"
 CMAP_DIFF = "RdBu_r"
 
 # ============================================================================
@@ -494,8 +493,8 @@ def plot_pdfs(
 
     **What it shows.**  Histogram-based density curves (with light
     smoothing for presentation) of decorrelated point values in each
-    detail band, overlaid for the observed and generated ensembles (following
-    Tran et al., Figs. 13--14 in spirit).
+    detail band, overlaid for the observed and generated ensembles
+    (following Tran et al., Figs. 13--14 in spirit).
 
     **Diagnostic value.**  The most direct test of one-point accuracy.
     Tests whether the generator reproduces the correct marginal statistics
@@ -881,187 +880,6 @@ def plot_diversity(
 # Latent geometry diagnostics (Phase 7b)
 # ============================================================================
 
-def plot_latent_geom_spectrum(
-    lg_results: Dict,
-    time_indices: Optional[NDArray],
-    H_schedule: Optional[List[float]],
-    out_dir: Path,
-) -> None:
-    """Plot latent metric-spectrum diagnostics across modeled time indices.
-
-    This is a thin wrapper that emits one figure per metric (single-attribution).
-    """
-    per_time = lg_results.get("per_time", [])
-    if not per_time:
-        return
-
-    x = np.arange(len(per_time), dtype=np.float64)
-    if time_indices is not None and H_schedule is not None:
-        labels = [
-            f"{H_schedule[int(idx)]:.3g}" if int(idx) < len(H_schedule) else str(int(idx))
-            for idx in np.asarray(time_indices)[: len(per_time)]
-        ]
-        xlabel = "$H$"
-    else:
-        labels = [str(int(row.get("time_index", i))) for i, row in enumerate(per_time)]
-        xlabel = "Time index"
-
-    series = [
-        dict(
-            key="effective_rank_mean",
-            filename="latent_geom_effective_rank",
-            title="Effective rank",
-            ylabel=r"$r_{\mathrm{eff}}(g)$",
-            marker="o",
-            color=C_OBS,
-            ylim=None,
-            yscale=None,
-        ),
-        dict(
-            key="condition_proxy_mean",
-            filename="latent_geom_condition_proxy",
-            title="Condition proxy",
-            ylabel=r"$\kappa_{\mathrm{proxy}}$",
-            marker="s",
-            color=C_GEN,
-            ylim=None,
-            yscale="log",
-        ),
-        dict(
-            key="near_null_mass_mean",
-            filename="latent_geom_near_null_mass",
-            title="Near-null mass",
-            ylabel=r"$m_{\mathrm{null}}$",
-            marker="^",
-            color=C_FILL,
-            ylim=(-0.02, 1.02),
-            yscale=None,
-        ),
-    ]
-
-    for spec in series:
-        y = np.asarray([row.get(spec["key"], np.nan) for row in per_time], dtype=np.float64)
-        fig, ax = plt.subplots(1, 1, figsize=(6.5, 2.5))
-        ax.plot(x, y, marker=spec["marker"], color=spec["color"], lw=1.0)
-        ax.set_xticks(x)
-        ax.set_xticklabels(labels, fontsize=8, rotation=30, ha="right")
-        ax.set_xlabel(xlabel, fontsize=9)
-        ax.set_ylabel(spec["ylabel"], fontsize=9)
-        ax.set_title(spec["title"], fontsize=10)
-        ax.grid(alpha=0.2, lw=0.4)
-        ax.tick_params(axis="y", labelsize=8)
-        if spec["yscale"] is not None:
-            ax.set_yscale(spec["yscale"])
-        if spec["ylim"] is not None:
-            ax.set_ylim(*spec["ylim"])
-        fig.tight_layout()
-        _save_fig(fig, out_dir, spec["filename"], png_dpi=300)
-        plt.close(fig)
-
-
-def plot_latent_geom_hessian(
-    lg_results: Dict,
-    time_indices: Optional[NDArray],
-    H_schedule: Optional[List[float]],
-    out_dir: Path,
-) -> None:
-    """Plot decoder Hessian norm quantiles across modeled time indices."""
-    per_time = lg_results.get("per_time", [])
-    if not per_time:
-        return
-
-    x = np.arange(len(per_time), dtype=np.float64)
-    if time_indices is not None and H_schedule is not None:
-        labels = [
-            f"{H_schedule[int(idx)]:.3g}" if int(idx) < len(H_schedule) else str(int(idx))
-            for idx in np.asarray(time_indices)[: len(per_time)]
-        ]
-        xlabel = "$H$"
-    else:
-        labels = [str(int(row.get("time_index", i))) for i, row in enumerate(per_time)]
-        xlabel = "Time index"
-
-    med = np.asarray([row.get("hessian_frob_median", np.nan) for row in per_time], dtype=np.float64)
-    p90 = np.asarray([row.get("hessian_frob_p90", np.nan) for row in per_time], dtype=np.float64)
-    p99 = np.asarray([row.get("hessian_frob_p99", np.nan) for row in per_time], dtype=np.float64)
-
-    fig, ax = plt.subplots(figsize=(6.5, 2.5))
-    ax.fill_between(x, med, p90, color=C_OBS, alpha=0.18, label="Median–P90")
-    ax.fill_between(x, p90, p99, color=C_GEN, alpha=0.18, label="P90–P99")
-    ax.plot(x, med, color=C_OBS, lw=1.0, marker="o", label="Median")
-    ax.plot(x, p90, color=C_GEN, lw=1.0, marker="s", label="P90")
-    ax.plot(x, p99, color=C_FILL, lw=1.0, marker="^", label="P99")
-    ax.set_xticks(x)
-    ax.set_xticklabels(labels, fontsize=8, rotation=30, ha="right")
-    ax.set_xlabel(xlabel, fontsize=9)
-    ax.set_ylabel(r"$\|H_z D\|_F^2$", fontsize=9)
-    ax.set_title("Curvature proxy (decoder Hessian energy)", fontsize=10)
-    ax.grid(alpha=0.2, lw=0.4)
-    ax.tick_params(axis="y", labelsize=8)
-    ax.legend(fontsize=8, framealpha=0.9)
-
-    fig.tight_layout()
-    _save_fig(fig, out_dir, "latent_geom_hessian", png_dpi=300)
-    plt.close(fig)
-
-
-def plot_latent_geom_flags(
-    lg_results: Dict,
-    time_indices: Optional[NDArray],
-    H_schedule: Optional[List[float]],
-    out_dir: Path,
-) -> None:
-    """Plot traffic-light robustness flags for latent-geometry diagnostics.
-
-    Emits one figure per flag (single-attribution).
-    """
-    per_flags = lg_results.get("robustness_flags", {}).get("per_time", [])
-    if not per_flags:
-        return
-
-    n_time = len(per_flags)
-    x = np.arange(n_time, dtype=np.float64)
-    if time_indices is not None and H_schedule is not None:
-        labels = [
-            f"{H_schedule[int(idx)]:.3g}" if int(idx) < len(H_schedule) else str(int(idx))
-            for idx in np.asarray(time_indices)[:n_time]
-        ]
-        xlabel = "$H$"
-    else:
-        labels = [str(int(row.get("time_index", i))) for i, row in enumerate(per_flags)]
-        xlabel = "Time index"
-
-    specs = [
-        dict(
-            key="collapse_risk",
-            filename="latent_geom_flag_collapse",
-            title="Collapse risk indicator",
-            ylabel=r"$\mathbb{I}\{\mathrm{collapse}\}$",
-        ),
-        dict(
-            key="folding_risk",
-            filename="latent_geom_flag_folding",
-            title="Folding risk indicator",
-            ylabel=r"$\mathbb{I}\{\mathrm{folding}\}$",
-        ),
-    ]
-
-    cmap = ListedColormap([C_OK, C_RISK])
-    for spec in specs:
-        vals = np.asarray([float(bool(row.get(spec["key"], False))) for row in per_flags], dtype=np.float64)[None, :]
-        fig, ax = plt.subplots(figsize=(6.5, 1.4))
-        ax.imshow(vals, cmap=cmap, vmin=0.0, vmax=1.0, aspect="auto", interpolation="nearest")
-        ax.set_xticks(x)
-        ax.set_xticklabels(labels, fontsize=8, rotation=30, ha="right")
-        ax.set_yticks([0])
-        ax.set_yticklabels([spec["ylabel"]], fontsize=8)
-        ax.set_xlabel(xlabel, fontsize=9)
-        ax.set_title(spec["title"], fontsize=10)
-        fig.tight_layout()
-        _save_fig(fig, out_dir, spec["filename"], png_dpi=300)
-        plt.close(fig)
-
-
 # ============================================================================
 # Figure 10 – Direct-field PDFs (NEW)
 # ============================================================================
@@ -1225,9 +1043,10 @@ def plot_direct_field_correlation(
     """Directional normalised correlation R(tau) of the direct filtered fields.
 
     **What it shows.**  R(tau e_1) and R(tau e_2) for the filtered fields
-    at each evaluation scale, comparing the observed ensemble curve
-    (solid/dashed blue) against the generated ensemble mean +/- one
-    standard deviation (red with shaded envelope).  One subplot per scale.
+    at each evaluation scale, comparing the observed ensemble-mean
+    directional correlation curve (solid/dashed blue) against the generated
+    ensemble mean +/- one standard deviation (red with shaded envelope).
+    One subplot per scale.
 
     **Diagnostic value.**  Complements the detail-band correlation (Fig 6)
     by showing two-point structure of the fields themselves at each scale,
@@ -1410,55 +1229,80 @@ def plot_trajectory_fields(
     full_H_schedule: List[float],
     resolution: int,
     out_dir: Path,
+    *,
+    n_gen_show: int = 4,
 ) -> None:
     """Backward SDE trajectory fields at each knot time vs GT.
 
     **What it shows.**  Top row: ground-truth fields at each MSBM scale
-    (one per knot time).  Bottom row: a single generated realisation at
-    each knot time.  Columns are ordered from finest (left) to coarsest
-    (right).
+    (one per knot time).  Rows 1..n_gen_show: distinct generated
+    realisations at each knot time.  Columns are ordered from finest
+    (left) to coarsest (right).
 
     **Diagnostic value.**  Visual check that the backward SDE produces
     fields with the correct spatial texture, value range, and smoothness
     at every intermediate scale — not just the final (finest) output.
+    Multiple realisations show inter-sample variability.
 
-    **Pass / fail.**  Visual: the two rows should look qualitatively
-    similar at each scale.  The generated field should become
-    progressively smoother from left to right, matching GT.
+    **Pass / fail.**  Visual: all rows should look qualitatively
+    similar at each scale.  Generated fields should become progressively
+    smoother from left to right, matching GT.
     """
     T_knots = trajectory_fields.shape[0]
-    sample_idx = 0  # Show first GT sample and first gen realisation.
+    n_real = trajectory_fields.shape[1]
+    n_show = min(max(n_gen_show, 1), n_real)
+    sample_idx = 0  # GT sample index.
 
-    fig, axes = plt.subplots(2, T_knots, figsize=(FIG_WIDTH, 2 * FIELD_ROW_HEIGHT))
-    if T_knots == 1:
-        axes = axes[:, None]
+    n_rows = 1 + n_show  # GT row + generated rows
+    fig, axes = plt.subplots(
+        n_rows, T_knots,
+        figsize=(FIG_WIDTH, FIELD_ROW_HEIGHT * n_rows),
+        squeeze=False,
+    )
 
+    im = None  # for colorbar reference
     for k in range(T_knots):
         ds_idx = int(time_indices[k])
         H_val = full_H_schedule[ds_idx] if ds_idx < len(full_H_schedule) else ds_idx
 
         gt_field = gt_fields_by_index[ds_idx][sample_idx]
-        gen_field = trajectory_fields[k, 0]  # First realisation.
+        gen_fields_k = trajectory_fields[k, :n_show]
 
-        all_vals = np.concatenate([gt_field.ravel(), gen_field.ravel()])
+        # Shared colour range across GT and all shown realisations.
+        all_vals = np.concatenate(
+            [gt_field.ravel()] + [gen_fields_k[r].ravel() for r in range(n_show)]
+        )
         vmin, vmax = float(all_vals.min()), float(all_vals.max())
 
-        ax_gt = axes[0, k]
-        ax_gt.imshow(gt_field.reshape(resolution, resolution),
-                     origin="lower", cmap=CMAP_FIELD, vmin=vmin, vmax=vmax)
-        ax_gt.set_title(f"GT $H={H_val}$", fontsize=FONT_TITLE)
-        ax_gt.axis("off")
+        axes[0, k].imshow(
+            gt_field.reshape(resolution, resolution),
+            origin="lower", cmap=CMAP_FIELD, vmin=vmin, vmax=vmax,
+        )
+        axes[0, k].set_title(f"$H={H_val:.3g}$", fontsize=FONT_TITLE)
+        axes[0, k].axis("off")
 
-        ax_gen = axes[1, k]
-        im = ax_gen.imshow(gen_field.reshape(resolution, resolution),
-                           origin="lower", cmap=CMAP_FIELD, vmin=vmin, vmax=vmax)
-        ax_gen.set_title(f"Gen $H={H_val}$", fontsize=FONT_TITLE)
-        ax_gen.axis("off")
+        for r in range(n_show):
+            im = axes[r + 1, k].imshow(
+                gen_fields_k[r].reshape(resolution, resolution),
+                origin="lower", cmap=CMAP_FIELD, vmin=vmin, vmax=vmax,
+            )
+            axes[r + 1, k].axis("off")
+
+    # Row labels on the left margin.
+    axes[0, 0].set_ylabel(
+        "GT", fontsize=FONT_LABEL, rotation=0, ha="right", va="center", labelpad=14,
+    )
+    for r in range(n_show):
+        axes[r + 1, 0].set_ylabel(
+            f"Gen {r + 1}", fontsize=FONT_LABEL, rotation=0,
+            ha="right", va="center", labelpad=14,
+        )
 
     fig.tight_layout(rect=[0.0, 0.0, 0.88, 1.0])
-    cax = fig.add_axes([0.90, 0.18, 0.02, 0.64])
-    cbar = fig.colorbar(im, cax=cax)
-    cbar.ax.tick_params(labelsize=FONT_TICK)
+    if im is not None:
+        cax = fig.add_axes([0.90, 0.18, 0.02, 0.64])
+        cbar = fig.colorbar(im, cax=cax)
+        cbar.ax.tick_params(labelsize=FONT_TICK)
 
     _save_fig(fig, out_dir, "fig12_trajectory_fields")
     plt.close(fig)
