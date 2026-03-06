@@ -16,6 +16,7 @@ import jax.numpy as jnp
 from functional_autoencoders.losses import _call_autoencoder_fn
 from functional_autoencoders.train.metrics import Metric
 from scripts.fae.fae_naive.ntk_estimators import (
+    rademacher_tree_like,
     trace_per_output_from_jvp_probe,
     trace_per_output_from_vjp_probe,
     tree_squared_l2_norm,
@@ -283,6 +284,113 @@ def _reconstruct_and_estimate_full_ntk_trace_per_output(
     n_outputs = int(u_pred.size)
     decode_only = lambda p: reconstruct(p)[0]
 
+    def _trace_per_output_from_chunked_fhutch_probe(probe_key: jax.Array) -> jax.Array:
+        """Exact FHutch probe with output-chunked JVP accumulation.
+
+        Computes ||J p||^2 by partitioning decoder output coordinates into chunks:
+            ||J p||^2 = sum_c ||J_c p||^2
+        where {J_c} are disjoint output-row blocks. This is mathematically exact
+        (up to floating-point order effects) and reduces peak JVP output memory.
+        """
+        # Fallback to full-output FHutch when chunking is disabled or incompatible.
+        if output_chunk_size <= 0 or x_dec.ndim != 3:
+            return trace_per_output_from_jvp_probe(
+                fn=decode_only,
+                params=params,
+                n_outputs=n_outputs,
+                probe_key=probe_key,
+            )
+
+        batch_size = int(x_dec.shape[0])
+        n_dec = int(x_dec.shape[1])
+        x_dim = int(x_dec.shape[2])
+        out_dim = int(u_enc.shape[-1]) if u_enc.ndim >= 3 else 1
+        flat_outputs_per_dec_point = max(batch_size * out_dim, 1)
+        points_per_chunk = max(1, int(output_chunk_size) // flat_outputs_per_dec_point)
+
+        if points_per_chunk >= n_dec:
+            return trace_per_output_from_jvp_probe(
+                fn=decode_only,
+                params=params,
+                n_outputs=n_outputs,
+                probe_key=probe_key,
+            )
+
+        n_chunks = int((n_dec + points_per_chunk - 1) // points_per_chunk)
+        padded_n = int(n_chunks * points_per_chunk)
+        pad_points = padded_n - n_dec
+        x_dec_padded = jnp.pad(
+            x_dec,
+            ((0, 0), (0, pad_points), (0, 0)),
+            mode="constant",
+            constant_values=0,
+        )
+        p_probe = rademacher_tree_like(probe_key, params)
+        chunk_indices = jnp.arange(n_chunks, dtype=jnp.int32)
+        n_dec_i = jnp.asarray(n_dec, dtype=jnp.int32)
+        points_per_chunk_i = jnp.asarray(points_per_chunk, dtype=jnp.int32)
+
+        def decode_chunk(p, x_dec_chunk):
+            latents_chunk, _ = _call_autoencoder_fn(
+                params=p,
+                batch_stats=batch_stats,
+                fn=autoencoder.encoder.apply,
+                u=u_enc,
+                x=x_enc,
+                name="encoder",
+                dropout_key=k_enc,
+            )
+            decode_latents_chunk = latents_chunk
+            if latent_noise_scale > 0.0:
+                noise_chunk = jax.random.normal(
+                    k_noise, latents_chunk.shape, dtype=latents_chunk.dtype
+                )
+                decode_latents_chunk = (
+                    latents_chunk + float(latent_noise_scale) * noise_chunk
+                )
+            u_chunk, _ = _call_autoencoder_fn(
+                params=p,
+                batch_stats=batch_stats,
+                fn=autoencoder.decoder.apply,
+                u=decode_latents_chunk,
+                x=x_dec_chunk,
+                name="decoder",
+                dropout_key=k_dec,
+            )
+            return u_chunk
+
+        def chunk_step(acc_sqnorm, chunk_idx):
+            start = chunk_idx * points_per_chunk_i
+            x_chunk = jax.lax.dynamic_slice(
+                x_dec_padded,
+                (0, start, 0),
+                (batch_size, points_per_chunk, x_dim),
+            )
+            _, jvp_chunk = jax.jvp(
+                lambda p: decode_chunk(p, x_chunk),
+                (params,),
+                (p_probe,),
+            )
+            remaining = n_dec_i - start
+            valid = jnp.minimum(
+                points_per_chunk_i,
+                jnp.maximum(remaining, jnp.asarray(0, dtype=jnp.int32)),
+            )
+            mask = (
+                jnp.arange(points_per_chunk, dtype=jnp.int32) < valid
+            ).astype(jvp_chunk.dtype)[None, :, None]
+            chunk_sq = jnp.sum(jnp.square(jvp_chunk * mask))
+            return acc_sqnorm + chunk_sq, None
+
+        sqnorm_sum, _ = jax.lax.scan(
+            chunk_step,
+            jnp.asarray(0.0, dtype=u_pred.dtype),
+            chunk_indices,
+        )
+        n_outputs_f = jnp.asarray(max(n_outputs, 1), dtype=sqnorm_sum.dtype)
+        val = sqnorm_sum / n_outputs_f
+        return jnp.where(jnp.isfinite(val), val, 0.0)
+
     def _probe_trace(_carry, probe_key):
         if trace_estimator == "rhutch":
             trace_per_output = trace_per_output_from_vjp_probe(
@@ -295,12 +403,7 @@ def _reconstruct_and_estimate_full_ntk_trace_per_output(
                 output_chunk_size=output_chunk_size,
             )
         else:
-            trace_per_output = trace_per_output_from_jvp_probe(
-                fn=decode_only,
-                params=params,
-                n_outputs=n_outputs,
-                probe_key=probe_key,
-            )
+            trace_per_output = _trace_per_output_from_chunked_fhutch_probe(probe_key)
         return None, trace_per_output
 
     _, probe_traces = jax.lax.scan(_probe_trace, None, probe_keys)

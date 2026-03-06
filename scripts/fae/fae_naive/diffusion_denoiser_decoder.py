@@ -698,6 +698,7 @@ def get_denoiser_loss_fn(
     prior: Optional[LatentDiffusionPrior] = None,
     prior_weight: float = 1.0,
     decoder_loss_factor: float = 1.3,
+    prior_recon_weighting: str = "sigmoid",
 ) -> Callable:
     """Denoiser objective with optional latent diffusion prior (Unified Latents).
 
@@ -738,10 +739,12 @@ def get_denoiser_loss_fn(
         )
     if velocity_weight + x0_weight + ambient_weight <= 0:
         raise ValueError("At least one denoiser reconstruction weight must be > 0.")
+    if prior_recon_weighting not in {"sigmoid", "none"}:
+        raise ValueError("prior_recon_weighting must be one of {'sigmoid', 'none'}.")
     if prior is not None:
         if prior_weight <= 0:
             raise ValueError("prior_weight must be > 0 when prior is provided.")
-        if decoder_loss_factor <= 0:
+        if prior_recon_weighting == "sigmoid" and decoder_loss_factor <= 0:
             raise ValueError("decoder_loss_factor must be > 0.")
 
     use_prior = prior is not None
@@ -860,13 +863,15 @@ def get_denoiser_loss_fn(
                 + ambient_weight * amb_per_sample
             )
 
-            # Sigmoid weighting: w(t) = c_lf * sigmoid(log_snr(t))
-            # Rectified flow: log_snr(t) = 2 * log((1-t) / t)
-            t_clamped = jnp.clip(t, 1e-4, 1.0 - 1e-4)
-            log_snr = 2.0 * jnp.log((1.0 - t_clamped) / t_clamped)
-            w = decoder_loss_factor * jax.nn.sigmoid(log_snr)
-
-            recon_loss = jnp.mean(w * recon_per_sample)
+            if prior_recon_weighting == "sigmoid":
+                # Sigmoid weighting: w(t) = c_lf * sigmoid(log_snr(t))
+                # Rectified flow: log_snr(t) = 2 * log((1-t) / t)
+                t_clamped = jnp.clip(t, 1e-4, 1.0 - 1e-4)
+                log_snr = 2.0 * jnp.log((1.0 - t_clamped) / t_clamped)
+                w = decoder_loss_factor * jax.nn.sigmoid(log_snr)
+                recon_loss = jnp.mean(w * recon_per_sample)
+            else:
+                recon_loss = jnp.mean(recon_per_sample)
         else:
             velocity_loss = jnp.mean((v - v_pred) ** 2)
             x0_loss = jnp.mean((x_pred - u_dec) ** 2)
@@ -910,6 +915,7 @@ def get_ntk_scaled_denoiser_loss_fn(
     prior: Optional[LatentDiffusionPrior] = None,
     prior_weight: float = 1.0,
     decoder_loss_factor: float = 1.3,
+    prior_recon_weighting: str = "sigmoid",
     scale_norm: float = 10.0,
     epsilon: float = 1e-8,
     estimate_total_trace: bool = False,
@@ -967,11 +973,13 @@ def get_ntk_scaled_denoiser_loss_fn(
     if trace_estimator not in ("rhutch", "fhutch"):
         raise ValueError("trace_estimator must be one of ('rhutch', 'fhutch').")
 
+    if prior_recon_weighting not in {"sigmoid", "none"}:
+        raise ValueError("prior_recon_weighting must be one of {'sigmoid', 'none'}.")
     use_prior = prior is not None
     if use_prior:
         if prior_weight <= 0:
             raise ValueError("prior_weight must be > 0 when prior is provided.")
-        if decoder_loss_factor <= 0:
+        if prior_recon_weighting == "sigmoid" and decoder_loss_factor <= 0:
             raise ValueError("decoder_loss_factor must be > 0.")
 
     def _sample_t(t_key: jax.Array, batch_size: int) -> jax.Array:
@@ -1029,7 +1037,7 @@ def get_ntk_scaled_denoiser_loss_fn(
             parts.append(scale * comp)
 
         residual_vec = jnp.concatenate(parts, axis=-1)
-        if use_prior:
+        if use_prior and prior_recon_weighting == "sigmoid":
             t_clamped = jnp.clip(t, 1e-4, 1.0 - 1e-4)
             log_snr = 2.0 * jnp.log((1.0 - t_clamped) / t_clamped)
             w = decoder_loss_factor * jax.nn.sigmoid(log_snr)

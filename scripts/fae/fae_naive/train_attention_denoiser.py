@@ -130,6 +130,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--decoder-loss-factor", type=float, default=1.3,
                         help="Sigmoid-weighted decoder loss scale c_lf (Heek et al. §3.2). "
                              "Per-sample weighting: c_lf * sigmoid(log_snr(t)).")
+    parser.add_argument("--prior-recon-weighting", type=str, default="sigmoid",
+                        choices=["sigmoid", "none"],
+                        help=(
+                            "When --use-prior is enabled: "
+                            "'sigmoid' applies Heek-style c_lf*sigmoid(log_snr(t)) "
+                            "weighting to decoder reconstruction; "
+                            "'none' uses unweighted reconstruction."
+                        ))
 
     # -- Pooling -----------------------------------------------------------
     parser.add_argument("--pooling-type", type=str, default="attention",
@@ -166,9 +174,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--loss-type",
         type=str,
         default="denoiser",
-        choices=["denoiser", "ntk_scaled"],
+        choices=["denoiser", "l2", "ntk_scaled"],
         help=(
-            "Denoiser training objective. "
+            "Training objective selector. "
+            "'denoiser' and 'l2' use the base loss path; for --decoder-type=film "
+            "this is deterministic MSE reconstruction (+ prior/L2 latent term), "
+            "while denoiser decoders use the denoiser objective. "
             "'ntk_scaled' applies Wang et al.-style NTK trace balancing across "
             "physical-time marginals (requires time-grouped batches)."
         ),
@@ -211,7 +222,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--ntk-hutchinson-probes",
         type=int,
-        default=1,
+        default=4,
         help=(
             "Hutchinson probes per global NTK trace estimate "
             "(higher = lower variance, higher compute)."
@@ -230,7 +241,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--ntk-trace-estimator",
         type=str,
-        default="rhutch",
+        default="fhutch",
         choices=["rhutch", "fhutch"],
         help=(
             "Trace estimator backend for --loss-type=ntk_scaled. "
@@ -338,8 +349,13 @@ def validate_args(args: argparse.Namespace) -> None:
             raise ValueError("--prior-time-emb-dim must be >= 2.")
         if args.prior_loss_weight <= 0:
             raise ValueError("--prior-loss-weight must be > 0.")
-        if args.decoder_loss_factor <= 0:
+        if args.prior_recon_weighting == "sigmoid" and args.decoder_loss_factor <= 0:
             raise ValueError("--decoder-loss-factor must be > 0.")
+        if args.prior_recon_weighting == "none" and args.decoder_loss_factor != 1.3:
+            warnings.warn(
+                "--decoder-loss-factor is ignored when --prior-recon-weighting=none.",
+                UserWarning,
+            )
         if args.beta != 0.0:
             warnings.warn(
                 "--beta is ignored when --use-prior is set (prior replaces L2 reg).",
@@ -353,6 +369,12 @@ def validate_args(args: argparse.Namespace) -> None:
                 "--decoder-type=film in train_attention_denoiser.py is intended for the "
                 "prior ablation (--use-prior). For a deterministic FiLM baseline without "
                 "prior, use train_attention.py --decoder-type film instead.",
+                UserWarning,
+            )
+        if args.loss_type == "denoiser":
+            warnings.warn(
+                "For --decoder-type=film, --loss-type=denoiser maps to deterministic "
+                "single-step MSE + latent regularization. Prefer --loss-type=l2 for clarity.",
                 UserWarning,
             )
     if args.denoiser_time_sampling == "logsnr_uniform" and args.denoiser_logsnr_max <= 0:
@@ -428,11 +450,11 @@ def validate_args(args: argparse.Namespace) -> None:
             ntk_args_used.append("--ntk-total-trace-ema-decay")
         if args.ntk_trace_update_interval != 100:
             ntk_args_used.append("--ntk-trace-update-interval")
-        if args.ntk_hutchinson_probes != 1:
+        if args.ntk_hutchinson_probes != 4:
             ntk_args_used.append("--ntk-hutchinson-probes")
         if args.ntk_output_chunk_size != 0:
             ntk_args_used.append("--ntk-output-chunk-size")
-        if args.ntk_trace_estimator != "rhutch":
+        if args.ntk_trace_estimator != "fhutch":
             ntk_args_used.append("--ntk-trace-estimator")
         if ntk_args_used:
             warnings.warn(
@@ -588,6 +610,7 @@ def _denoiser_setup(autoencoder, args):
             prior=prior,
             prior_weight=getattr(args, "prior_loss_weight", 1.0),
             decoder_loss_factor=getattr(args, "decoder_loss_factor", 1.0),
+            prior_recon_weighting=getattr(args, "prior_recon_weighting", "sigmoid"),
             scale_norm=args.ntk_scale_norm,
             epsilon=args.ntk_epsilon,
             estimate_total_trace=bool(args.ntk_estimate_total_trace),
@@ -612,6 +635,7 @@ def _denoiser_setup(autoencoder, args):
             prior=prior,
             prior_weight=getattr(args, "prior_loss_weight", 1.0),
             decoder_loss_factor=getattr(args, "decoder_loss_factor", 1.0),
+            prior_recon_weighting=getattr(args, "prior_recon_weighting", "sigmoid"),
         )
 
     sample_steps = (

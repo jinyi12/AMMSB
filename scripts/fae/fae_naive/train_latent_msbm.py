@@ -6,7 +6,8 @@ Pipeline
 --------
 1) Load a pretrained *time-invariant* (naive) Functional Autoencoder (e.g. `train_attention.py`).
 2) Load the multiscale field dataset (`*.npz`) and partition it into time marginals.
-3) Encode each time marginal into latent codes z(t) (encoder has no time input).
+3) Encode each time marginal into latent codes z(t) (encoder has no time input),
+   with optional latent noising to match noisy-latent decoder training.
 4) Train MSBM policies on the latent marginals.
 5) Sample latent trajectories with the trained policies and decode them back to fields.
 """
@@ -21,9 +22,11 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 import argparse
+import shutil
 from typing import Optional
 
 import matplotlib
+from matplotlib import pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
@@ -83,6 +86,45 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="Optional cap on samples per time marginal (uses the first K samples).",
+    )
+    p.add_argument(
+        "--encoded_latent_noise_mode",
+        type=str,
+        default="none",
+        choices=["none", "prior_fixed", "gaussian"],
+        help=(
+            "Optional latent noising applied after encoding and before MSBM training. "
+            "'prior_fixed' uses z0=alpha*z+sigma*eps from prior log-SNR; "
+            "'gaussian' uses z+std*eps."
+        ),
+    )
+    p.add_argument(
+        "--encoded_latent_noise_split",
+        type=str,
+        default="train",
+        choices=["train", "both"],
+        help="Where to apply encoded-latent noising: train only (default) or both train/test.",
+    )
+    p.add_argument(
+        "--encoded_latent_noise_std",
+        type=float,
+        default=0.0,
+        help="Std for --encoded_latent_noise_mode=gaussian (must be >0 for gaussian mode).",
+    )
+    p.add_argument(
+        "--encoded_latent_prior_logsnr_max",
+        type=float,
+        default=None,
+        help=(
+            "Override log-SNR used by --encoded_latent_noise_mode=prior_fixed. "
+            "If unset, inferred from FAE checkpoint args/architecture and falls back to 5.0."
+        ),
+    )
+    p.add_argument(
+        "--encoded_latent_noise_seed_offset",
+        type=int,
+        default=1000003,
+        help="Seed offset used when sampling encoded-latent noise (deterministic w.r.t. --seed).",
     )
 
     # MSBM model
@@ -148,6 +190,17 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--auto_var_min", type=float, default=1e-4, help="Lower clamp for --auto_var selected sigma_0.")
     p.add_argument("--auto_var_max", type=float, default=1.0, help="Upper clamp for --auto_var selected sigma_0.")
     p.add_argument("--t_scale", type=float, default=1.0)
+    p.add_argument(
+        "--time_dist_mode",
+        type=str,
+        default="uniform",
+        choices=["zt", "uniform"],
+        help=(
+            "How to place marginal knot times for MSBM. "
+            "'zt' preserves non-uniform dataset time gaps; "
+            "'uniform' reproduces legacy equally-spaced knot times."
+        ),
+    )
     p.add_argument("--interval", type=int, default=100)
     p.add_argument("--use_t_idx", action="store_true", default=False)
     p.add_argument("--no_use_t_idx", action="store_false", dest="use_t_idx")
@@ -163,8 +216,34 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--lr_b", type=float, default=None)
     p.add_argument("--lr_gamma", type=float, default=0.999)
     p.add_argument("--lr_step", type=int, default=1000)
-    p.add_argument("--optimizer", type=str, default="AdamW", choices=["Adam", "AdamW"])
+    p.add_argument("--optimizer", type=str.lower, default="adamw", choices=["adam", "adamw", "muon"])
     p.add_argument("--weight_decay", type=float, default=0.0)
+    p.add_argument("--muon_beta", type=float, default=0.95, help="Momentum coefficient for --optimizer=muon.")
+    p.add_argument(
+        "--muon_ns_steps",
+        type=int,
+        default=5,
+        help="Newton-Schulz orthogonalization steps for --optimizer=muon.",
+    )
+    p.add_argument(
+        "--muon_nesterov",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use Nesterov momentum for --optimizer=muon.",
+    )
+    p.add_argument(
+        "--muon_eps",
+        type=float,
+        default=1e-7,
+        help="Numerical stability epsilon for --optimizer=muon.",
+    )
+    p.add_argument(
+        "--muon_adjust_lr_fn",
+        type=str,
+        default=None,
+        choices=["original", "match_rms_adamw"],
+        help="Optional learning-rate adjustment rule for torch.optim.Muon.",
+    )
     p.add_argument("--grad_clip", type=float, default=1.0)
     p.add_argument("--no_grad_clip", action="store_true")
     p.add_argument("--use_amp", action="store_true", default=True)
@@ -271,6 +350,18 @@ def _parse_args() -> argparse.Namespace:
             "and 'full' logs all per-time metrics (can create many wandb scalars)."
         ),
     )
+    p.add_argument(
+        "--latent_pca_visualize",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Create PCA-projected latent trajectory diagnostics during eval/final visualization.",
+    )
+    p.add_argument(
+        "--latent_pca_max_points",
+        type=int,
+        default=256,
+        help="Max number of trajectories per time used for latent PCA diagnostic plots.",
+    )
 
     # Output / logging
     p.add_argument("--seed", type=int, default=42, help="RNG seed for MSBM sampling/decoding.")
@@ -278,6 +369,16 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--log_interval", type=int, default=50)
     p.add_argument("--rolling_window", type=int, default=200)
     p.add_argument("--outdir", type=str, default=None, help="Results subdir name (under results/).")
+    p.add_argument(
+        "--clean_run_artifacts",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "If set, remove stale generated artifacts in the run directory at startup "
+            "(eval/final plots, decoded samples, policy checkpoints) to avoid mixing outputs "
+            "across reruns that reuse --outdir."
+        ),
+    )
 
     p.add_argument("--wandb_mode", type=str, default="disabled", choices=["online", "offline", "disabled"])
     p.add_argument("--entity", type=str, default=None)
@@ -304,6 +405,108 @@ def _parse_wandb_tags(tags_csv: str) -> list[str]:
         seen.add(tag)
         tags.append(tag)
     return tags
+
+
+def _prior_alpha_sigma_from_logsnr(logsnr_max: float) -> tuple[float, float]:
+    logsnr = float(logsnr_max)
+    alpha = float(np.sqrt(1.0 / (1.0 + np.exp(-logsnr))))
+    sigma = float(np.sqrt(1.0 / (1.0 + np.exp(logsnr))))
+    return alpha, sigma
+
+
+def _resolve_prior_logsnr_max(*, args: argparse.Namespace, fae_meta: dict) -> float:
+    if getattr(args, "encoded_latent_prior_logsnr_max", None) is not None:
+        return float(args.encoded_latent_prior_logsnr_max)
+
+    ckpt_args = fae_meta.get("args", {}) if isinstance(fae_meta, dict) else {}
+    ckpt_arch = fae_meta.get("architecture", {}) if isinstance(fae_meta, dict) else {}
+
+    for src in (ckpt_args, ckpt_arch):
+        if isinstance(src, dict) and src.get("prior_logsnr_max", None) is not None:
+            return float(src["prior_logsnr_max"])
+    return 5.0
+
+
+def _maybe_noise_encoded_latents(
+    *,
+    latent_train: np.ndarray,
+    latent_test: np.ndarray,
+    args: argparse.Namespace,
+    fae_meta: dict,
+) -> tuple[np.ndarray, np.ndarray, dict]:
+    mode = str(getattr(args, "encoded_latent_noise_mode", "none")).lower()
+    split = str(getattr(args, "encoded_latent_noise_split", "train")).lower()
+    seed_offset = int(getattr(args, "encoded_latent_noise_seed_offset", 0))
+    base_seed = int(getattr(args, "seed", 0))
+
+    if mode == "none":
+        info = {
+            "enabled": False,
+            "mode": "none",
+            "split": split,
+            "seed_offset": seed_offset,
+        }
+        return latent_train, latent_test, info
+
+    if split not in {"train", "both"}:
+        raise ValueError(f"--encoded_latent_noise_split must be one of ['train', 'both']; got '{split}'.")
+
+    train_out = np.asarray(latent_train, dtype=np.float32).copy()
+    test_out = np.asarray(latent_test, dtype=np.float32).copy()
+    rng_train = np.random.default_rng(base_seed + seed_offset)
+    rng_test = np.random.default_rng(base_seed + seed_offset + 1)
+
+    if mode == "prior_fixed":
+        logsnr = _resolve_prior_logsnr_max(args=args, fae_meta=fae_meta)
+        alpha, sigma = _prior_alpha_sigma_from_logsnr(logsnr)
+        noise_train = rng_train.standard_normal(size=train_out.shape, dtype=np.float32)
+        train_out = (alpha * train_out + sigma * noise_train).astype(np.float32, copy=False)
+        if split == "both":
+            noise_test = rng_test.standard_normal(size=test_out.shape, dtype=np.float32)
+            test_out = (alpha * test_out + sigma * noise_test).astype(np.float32, copy=False)
+
+        ckpt_args = fae_meta.get("args", {}) if isinstance(fae_meta, dict) else {}
+        ckpt_arch = fae_meta.get("architecture", {}) if isinstance(fae_meta, dict) else {}
+        uses_prior = bool(
+            (isinstance(ckpt_args, dict) and ckpt_args.get("use_prior", False))
+            or (isinstance(ckpt_arch, dict) and ckpt_arch.get("use_prior", False))
+        )
+        if not uses_prior and getattr(args, "encoded_latent_prior_logsnr_max", None) is None:
+            print(
+                "Warning: --encoded_latent_noise_mode=prior_fixed is enabled but checkpoint does not "
+                "explicitly indicate --use_prior. Using inferred prior_logsnr_max anyway."
+            )
+
+        info = {
+            "enabled": True,
+            "mode": "prior_fixed",
+            "split": split,
+            "seed_offset": seed_offset,
+            "prior_logsnr_max": float(logsnr),
+            "alpha_0": float(alpha),
+            "sigma_0": float(sigma),
+        }
+        return train_out, test_out, info
+
+    if mode == "gaussian":
+        std = float(getattr(args, "encoded_latent_noise_std", 0.0))
+        if std <= 0.0:
+            raise ValueError("--encoded_latent_noise_std must be > 0 when --encoded_latent_noise_mode=gaussian.")
+        noise_train = rng_train.standard_normal(size=train_out.shape, dtype=np.float32)
+        train_out = (train_out + std * noise_train).astype(np.float32, copy=False)
+        if split == "both":
+            noise_test = rng_test.standard_normal(size=test_out.shape, dtype=np.float32)
+            test_out = (test_out + std * noise_test).astype(np.float32, copy=False)
+        info = {
+            "enabled": True,
+            "mode": "gaussian",
+            "split": split,
+            "seed_offset": seed_offset,
+            "std": float(std),
+        }
+        return train_out, test_out, info
+
+    raise ValueError(f"Unknown --encoded_latent_noise_mode: {mode}")
 
 
 def _interval_deltas_rms(latent: np.ndarray) -> np.ndarray:
@@ -528,6 +731,37 @@ def _maybe_auto_var(
     return sigma0
 
 
+def _build_msbm_t_dists(
+    *,
+    zt: np.ndarray,
+    t_scale: float,
+    time_dist_mode: str,
+) -> np.ndarray:
+    """Build MSBM internal time grid from knot times."""
+    zt_np = np.asarray(zt, dtype=np.float64).reshape(-1)
+    t_scale_f = float(t_scale)
+    mode = str(time_dist_mode).lower()
+
+    if zt_np.size <= 1:
+        return np.zeros((int(zt_np.size),), dtype=np.float64)
+
+    if mode == "uniform":
+        return (np.linspace(0, zt_np.size - 1, zt_np.size, dtype=np.float64) * t_scale_f).astype(np.float64)
+
+    if mode == "zt":
+        dz = zt_np - float(zt_np[0])
+        span = float(dz[-1])
+        if not np.isfinite(span) or span <= 0.0:
+            print("Warning: invalid/degenerate zt span; falling back to uniform marginal spacing.")
+            return (np.linspace(0, zt_np.size - 1, zt_np.size, dtype=np.float64) * t_scale_f).astype(np.float64)
+        dz01 = dz / span
+        horizon = float((zt_np.size - 1) * t_scale_f)
+        return (dz01 * horizon).astype(np.float64)
+
+    print(f"Warning: unknown --time_dist_mode='{mode}'; falling back to uniform marginal spacing.")
+    return (np.linspace(0, zt_np.size - 1, zt_np.size, dtype=np.float64) * t_scale_f).astype(np.float64)
+
+
 def _warn_near_duplicate_marginals(
     *,
     latent_train: np.ndarray,
@@ -572,6 +806,167 @@ def _write_args_snapshot(outdir: Path, args: argparse.Namespace) -> None:
     payload = {"args": _to_jsonable(vars(args)), "meta": meta}
     with (outdir / "args.json").open("w") as f:
         json.dump(payload, f, indent=2, sort_keys=True)
+
+
+def _clean_stale_run_artifacts(outdir: Path) -> None:
+    """Remove generated artifacts that can become stale when reusing --outdir."""
+    stale_paths = [
+        outdir / "eval",
+        outdir / "final",
+        outdir / "field_viz",
+        outdir / "msbm_decoded_samples.npz",
+        outdir / "full_trajectories.npz",
+        outdir / "realizations_backward.npz",
+        outdir / "latent_msbm_policy_forward.pth",
+        outdir / "latent_msbm_policy_backward.pth",
+        outdir / "latent_msbm_policy_forward_ema.pth",
+        outdir / "latent_msbm_policy_backward_ema.pth",
+    ]
+
+    removed: list[str] = []
+    for path in stale_paths:
+        if not path.exists():
+            continue
+        try:
+            if path.is_dir():
+                shutil.rmtree(path)
+            else:
+                path.unlink()
+            removed.append(path.name)
+        except Exception as e:
+            print(f"Warning: failed to remove stale artifact '{path}': {e}")
+
+    if removed:
+        print("Cleaned stale run artifacts: " + ", ".join(removed))
+
+
+def _plot_latent_trajectory_pca(
+    *,
+    out_base: Path,
+    zt: np.ndarray,
+    latent_reference: np.ndarray,
+    latent_forward: Optional[np.ndarray],
+    latent_backward: Optional[np.ndarray],
+    run=None,
+    wandb_key: Optional[str] = None,
+    step: Optional[int] = None,
+    title_prefix: str = "",
+    max_points: int = 256,
+) -> None:
+    """Project latent trajectories to 2D PCA for quick transport diagnostics."""
+    ref = np.asarray(latent_reference, dtype=np.float32)
+    if ref.ndim != 3:
+        raise ValueError(f"latent_reference must have shape (T,N,K); got {ref.shape}")
+    if ref.shape[-1] < 2:
+        print("Warning: latent dim < 2; skipping latent PCA trajectory plot.")
+        return
+
+    bundles: list[tuple[str, np.ndarray]] = []
+    if latent_forward is not None:
+        bundles.append(("forward", np.asarray(latent_forward, dtype=np.float32)))
+    if latent_backward is not None:
+        bundles.append(("backward", np.asarray(latent_backward, dtype=np.float32)))
+    if not bundles:
+        return
+
+    t_count, n_count, _ = ref.shape
+    n_keep = int(min(max(1, int(max_points)), n_count))
+    keep_idx = np.linspace(0, n_count - 1, n_keep, dtype=np.int64) if n_keep < n_count else np.arange(n_count, dtype=np.int64)
+
+    def _take(arr: np.ndarray) -> np.ndarray:
+        a = np.asarray(arr, dtype=np.float32)
+        if a.shape[0] != t_count or a.shape[2] != ref.shape[2]:
+            raise ValueError(f"Latent array shape mismatch: expected (T,*,K)=({t_count},*,{ref.shape[2]}), got {a.shape}")
+        if a.shape[1] < n_keep:
+            return a
+        return a[:, keep_idx]
+
+    ref_sel = _take(ref)
+    fit_blocks = [ref_sel.reshape(-1, ref_sel.shape[-1])]
+    eval_bundles: list[tuple[str, np.ndarray]] = []
+    for name, arr in bundles:
+        cur = _take(arr)
+        eval_bundles.append((name, cur))
+        fit_blocks.append(cur.reshape(-1, cur.shape[-1]))
+
+    fit = np.concatenate(fit_blocks, axis=0).astype(np.float64)
+    mean = np.mean(fit, axis=0, keepdims=True)
+    centered = fit - mean
+    _, svals, vt = np.linalg.svd(centered, full_matrices=False)
+    comps = vt[:2].T  # (K,2)
+    explained = (svals[:2] ** 2) / (np.sum(svals * svals) + 1e-12)
+
+    def _proj(arr: np.ndarray) -> np.ndarray:
+        flat = arr.reshape(-1, arr.shape[-1]).astype(np.float64)
+        out = (flat - mean) @ comps
+        return out.reshape(arr.shape[0], arr.shape[1], 2).astype(np.float32)
+
+    ref_proj = _proj(ref_sel)
+    proj_payload: dict[str, np.ndarray] = {
+        "zt": np.asarray(zt, dtype=np.float32),
+        "explained_variance_ratio": explained.astype(np.float32),
+        "reference_proj": ref_proj,
+        "sample_idx": keep_idx.astype(np.int64),
+    }
+
+    ncols = int(len(eval_bundles))
+    fig, axes = plt.subplots(1, ncols, figsize=(6.0 * ncols, 5.5), squeeze=False)
+    axes_1d = axes.reshape(-1)
+    colors = plt.cm.viridis(np.linspace(0.0, 1.0, t_count))
+    ref_mean = np.mean(ref_proj, axis=1)
+
+    for ax_i, (name, arr) in enumerate(eval_bundles):
+        ax = axes_1d[ax_i]
+        arr_proj = _proj(arr)
+        proj_payload[f"{name}_proj"] = arr_proj
+        arr_mean = np.mean(arr_proj, axis=1)
+
+        for t_i in range(t_count):
+            ax.scatter(
+                arr_proj[t_i, :, 0],
+                arr_proj[t_i, :, 1],
+                s=9,
+                alpha=0.22,
+                c=[colors[t_i]],
+                linewidths=0.0,
+            )
+
+        ax.plot(ref_mean[:, 0], ref_mean[:, 1], color="black", linestyle="--", linewidth=1.8, label="reference mean")
+        line_color = "#C73E3A" if name == "forward" else "#2B5F75"
+        ax.plot(arr_mean[:, 0], arr_mean[:, 1], color=line_color, linewidth=2.0, marker="o", markersize=3, label=f"{name} mean")
+
+        if t_count <= 12:
+            for t_i in range(t_count):
+                ax.text(arr_mean[t_i, 0], arr_mean[t_i, 1], str(t_i), fontsize=7, alpha=0.8)
+
+        ax.set_title(f"{name.capitalize()} Latent Trajectory")
+        ax.set_xlabel(f"PC1 ({float(explained[0]):.1%})")
+        ax.set_ylabel(f"PC2 ({float(explained[1]):.1%})")
+        ax.grid(True, alpha=0.25)
+        ax.legend(loc="best", fontsize=8)
+
+    title = "Latent Trajectory PCA Diagnostic"
+    if title_prefix:
+        title = f"{title_prefix} - {title}"
+    fig.suptitle(title)
+    fig.tight_layout()
+
+    out_base.parent.mkdir(parents=True, exist_ok=True)
+    png_path = out_base.with_suffix(".png")
+    pdf_path = out_base.with_suffix(".pdf")
+    npz_path = out_base.with_suffix(".npz")
+    fig.savefig(png_path, dpi=150, bbox_inches="tight")
+    fig.savefig(pdf_path, bbox_inches="tight")
+    plt.close(fig)
+
+    np.savez_compressed(npz_path, **proj_payload)
+
+    if run is not None and wandb is not None and hasattr(run, "log") and hasattr(wandb, "Image"):
+        payload = {wandb_key or out_base.name: wandb.Image(str(png_path))}
+        if step is None:
+            run.log(payload)
+        else:
+            run.log(payload, step=int(step))
 
 
 def _latent_moment_metrics(x_gen: torch.Tensor, x_ref: torch.Tensor) -> dict:
@@ -738,12 +1133,21 @@ def _sample_knots(
 def main() -> None:
     args = _parse_args()
 
+    if args.muon_beta <= 0.0 or args.muon_beta >= 1.0:
+        raise ValueError("--muon_beta must be in (0, 1).")
+    if int(args.muon_ns_steps) < 1:
+        raise ValueError("--muon_ns_steps must be >= 1.")
+    if float(args.muon_eps) <= 0.0:
+        raise ValueError("--muon_eps must be > 0.")
+
     np.random.seed(int(args.seed))
     torch.manual_seed(int(args.seed))
 
     device = get_device(args.nogpu)
     outdir = Path(set_up_exp(args))
     print(f"Output dir: {outdir}")
+    if bool(getattr(args, "clean_run_artifacts", True)):
+        _clean_stale_run_artifacts(outdir)
     format_for_paper()
 
     # -----------------------------------------------------------------------
@@ -758,7 +1162,13 @@ def main() -> None:
             raise ValueError("--held_out_times requires times_normalized in the dataset.")
         held_out_indices = parse_held_out_times_arg(args.held_out_times, dataset_meta["times_normalized"])
 
-    time_data = load_training_time_data_naive(args.data_path, held_out_indices=held_out_indices)
+    # Load all available samples for each training-time marginal, then apply
+    # the train/test split once in _encode_time_marginals.
+    time_data = load_training_time_data_naive(
+        args.data_path,
+        held_out_indices=held_out_indices,
+        split="all",
+    )
     if not time_data:
         raise RuntimeError("No training-time marginals found to train MSBM on.")
 
@@ -797,6 +1207,32 @@ def main() -> None:
     print(f"  latent_test:  {tuple(latent_test.shape)} (T, N_test, K)")
     print(f"  zt: {np.round(zt, 4).tolist()}")
 
+    latent_train_clean = np.asarray(latent_train, dtype=np.float32).copy()
+    latent_test_clean = np.asarray(latent_test, dtype=np.float32).copy()
+    latent_train, latent_test, latent_noise_info = _maybe_noise_encoded_latents(
+        latent_train=latent_train_clean,
+        latent_test=latent_test_clean,
+        args=args,
+        fae_meta=fae_meta,
+    )
+    if bool(latent_noise_info.get("enabled", False)):
+        mode = str(latent_noise_info.get("mode", "unknown"))
+        split_name = str(latent_noise_info.get("split", "train"))
+        if mode == "prior_fixed":
+            print(
+                "Applied encoded-latent noise for MSBM "
+                f"(mode=prior_fixed, split={split_name}, "
+                f"logsnr_max={float(latent_noise_info['prior_logsnr_max']):.4g}, "
+                f"alpha_0={float(latent_noise_info['alpha_0']):.4g}, sigma_0={float(latent_noise_info['sigma_0']):.4g})."
+            )
+        elif mode == "gaussian":
+            print(
+                "Applied encoded-latent noise for MSBM "
+                f"(mode=gaussian, split={split_name}, std={float(latent_noise_info['std']):.4g})."
+            )
+    else:
+        print("Encoded-latent noising disabled (mode=none).")
+
     _warn_near_duplicate_marginals(latent_train=latent_train, time_indices=time_indices, zt=zt)
     try:
         delta_rms_train = _interval_deltas_rms(latent_train)
@@ -815,32 +1251,46 @@ def main() -> None:
     except Exception as e:
         print(f"Warning: failed to save latent interval diagnostics: {e}")
 
-    np.savez_compressed(
-        outdir / "fae_latents.npz",
-        latent_train=latent_train,
-        latent_test=latent_test,
+    T = int(latent_train.shape[0])
+    if T < 2:
+        raise ValueError("MSBM needs at least 2 time marginals.")
+    t_dists_np = _build_msbm_t_dists(
         zt=zt,
-        time_indices=time_indices,
-        grid_coords=grid_coords,
-        resolution=np.asarray([int(resolution)], dtype=np.int64),
-        split=np.asarray([split], dtype=object),
-        dataset_meta=np.asarray([dataset_meta], dtype=object),
-        fae_meta=np.asarray([fae_meta], dtype=object),
+        t_scale=float(args.t_scale),
+        time_dist_mode=str(getattr(args, "time_dist_mode", "uniform")),
     )
+    if int(t_dists_np.shape[0]) != T:
+        raise RuntimeError(f"Computed t_dists has shape {t_dists_np.shape}, expected ({T},)")
+
+    latents_payload = {
+        "latent_train": latent_train,
+        "latent_test": latent_test,
+        "zt": zt,
+        "t_dists": t_dists_np.astype(np.float32),
+        "time_indices": time_indices,
+        "grid_coords": grid_coords,
+        "resolution": np.asarray([int(resolution)], dtype=np.int64),
+        "split": np.asarray([split], dtype=object),
+        "dataset_meta": np.asarray([dataset_meta], dtype=object),
+        "fae_meta": np.asarray([fae_meta], dtype=object),
+        "latent_noise_info": np.asarray([latent_noise_info], dtype=object),
+    }
+    if bool(latent_noise_info.get("enabled", False)):
+        latents_payload["latent_train_clean"] = latent_train_clean
+        latents_payload["latent_test_clean"] = latent_test_clean
+    np.savez_compressed(outdir / "fae_latents.npz", **latents_payload)
 
     # -----------------------------------------------------------------------
     # MSBM agent (Torch)
     # -----------------------------------------------------------------------
-    T = int(latent_train.shape[0])
-    if T < 2:
-        raise ValueError("MSBM needs at least 2 time marginals.")
+    print("MSBM time grid:")
+    print(f"  mode={str(getattr(args, 'time_dist_mode', 'uniform')).lower()} t_scale={float(args.t_scale):.6g}")
+    print("  t_dists: " + ", ".join(f"{float(t):.6g}" for t in t_dists_np.tolist()))
 
-    t_ref_default = float(max(1.0, (T - 1) * float(args.t_scale)))
+    t_ref_default = float(max(1.0, float(t_dists_np[-1] - t_dists_np[0])))
     t_ref = float(args.var_time_ref) if args.var_time_ref is not None else t_ref_default
     if args.var_time_ref is None:
         args.var_time_ref = float(t_ref)
-
-    t_dists_np = (np.linspace(0, T - 1, T, dtype=np.float64) * float(args.t_scale)).astype(np.float64)
     args_mutated = False
     decay_fit_info: Optional[dict] = None
     if bool(getattr(args, "auto_var_decay", False)):
@@ -928,6 +1378,7 @@ def main() -> None:
         var=float(args.var),
         sigma_schedule=sigma_schedule,
         t_scale=float(args.t_scale),
+        t_dists=t_dists_np.astype(np.float32),
         interval=int(args.interval),
         use_t_idx=bool(args.use_t_idx),
         lr=float(args.lr),
@@ -937,6 +1388,11 @@ def main() -> None:
         lr_step=int(args.lr_step),
         optimizer=str(args.optimizer),
         weight_decay=float(args.weight_decay),
+        muon_beta=float(args.muon_beta),
+        muon_ns_steps=int(args.muon_ns_steps),
+        muon_nesterov=bool(args.muon_nesterov),
+        muon_eps=float(args.muon_eps),
+        muon_adjust_lr_fn=str(args.muon_adjust_lr_fn) if args.muon_adjust_lr_fn is not None else None,
         grad_clip=grad_clip,
         use_amp=bool(args.use_amp),
         use_ema=bool(args.use_ema),
@@ -971,6 +1427,8 @@ def main() -> None:
     eval_metrics_swd_proj = int(getattr(args, "eval_metrics_swd_proj", 0) or 0)
     eval_metrics_mmd = bool(getattr(args, "eval_metrics_mmd", False))
     eval_metrics_wandb_detail = str(getattr(args, "eval_metrics_wandb_detail", "summary"))
+    latent_pca_visualize = bool(getattr(args, "latent_pca_visualize", True))
+    latent_pca_max_points = int(getattr(args, "latent_pca_max_points", 256))
 
     did_reference = {"done": False}
     eval_rng = np.random.default_rng(int(args.seed) + 12345)
@@ -1048,6 +1506,26 @@ def main() -> None:
             except Exception as e:
                 print(f"[eval] Sampling failed at stage {stage}: {e}")
                 return
+
+            if latent_pca_visualize:
+                try:
+                    ref_lat_eval = lat_src[:, idx_t].detach().cpu().numpy().astype(np.float32)
+                    lat_f_eval = knots_f.detach().cpu().numpy().astype(np.float32)
+                    lat_b_eval = knots_b.detach().cpu().numpy().astype(np.float32)
+                    _plot_latent_trajectory_pca(
+                        out_base=eval_dir / f"stage{int(stage):04d}_latent_pca_trajectory",
+                        zt=zt,
+                        latent_reference=ref_lat_eval,
+                        latent_forward=lat_f_eval,
+                        latent_backward=lat_b_eval,
+                        run=run,
+                        wandb_key=f"eval_latent_pca/stage_{int(stage):04d}",
+                        step=int(_agent.step_counter),
+                        title_prefix=f"Stage {int(stage):04d} ({eval_split})",
+                        max_points=max(1, latent_pca_max_points),
+                    )
+                except Exception as e:
+                    print(f"[eval] Latent PCA diagnostic failed at stage {stage}: {e}")
 
             # -------------------------------------------------------------------
             # Latent distribution metrics (no decoding required).
@@ -1504,8 +1982,36 @@ def main() -> None:
                 except Exception as e:
                     print(f"[final] Backward plotting failed: {e}")
 
+                if bool(getattr(args, "latent_pca_visualize", True)):
+                    try:
+                        ref_lat_final = agent.latent_train[:, idx_t].detach().cpu().numpy().astype(np.float32)
+                        lat_f_final = (
+                            np.asarray(artifacts["latent_forward"], dtype=np.float32)
+                            if "latent_forward" in artifacts
+                            else None
+                        )
+                        lat_b_final = (
+                            np.asarray(artifacts["latent_backward"], dtype=np.float32)
+                            if "latent_backward" in artifacts
+                            else None
+                        )
+                        _plot_latent_trajectory_pca(
+                            out_base=final_dir / "FINAL_latent_pca_trajectory",
+                            zt=zt,
+                            latent_reference=ref_lat_final,
+                            latent_forward=lat_f_final,
+                            latent_backward=lat_b_final,
+                            run=run,
+                            wandb_key="final_latent_pca/trajectory",
+                            step=int(agent.step_counter),
+                            title_prefix="Final",
+                            max_points=max(1, int(getattr(args, "latent_pca_max_points", 256))),
+                        )
+                    except Exception as e:
+                        print(f"[final] Latent PCA diagnostic failed: {e}")
+
                 try:
-                    save_payload = {"idx": idx_plot, "zt": zt, "reference": ref_fields}
+                    save_payload = {"idx": idx_plot, "zt": zt, "t_dists": t_dists_np, "reference": ref_fields}
                     if "fields_forward" in artifacts:
                         save_payload["fields_forward"] = np.asarray(artifacts["fields_forward"])[:, :n_plot]
                     if "fields_backward" in artifacts:
