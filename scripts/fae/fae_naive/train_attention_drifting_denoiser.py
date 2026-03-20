@@ -56,13 +56,15 @@ from scripts.fae.fae_naive.train_attention_components import (
     parse_int_list_arg,
     parse_held_out_indices_arg,
     parse_held_out_times_arg,
-    save_model_artifact,
-    save_model_info,
-    setup_output_directory,
     visualize_physical_space_reconstructions,
     visualize_reconstructions_all_times,
     visualize_reconstructions_all_times_physical,
     visualize_sample_reconstructions,
+)
+from scripts.fae.fae_naive.run_artifacts import (
+    save_model_artifact,
+    save_model_info,
+    setup_output_directory,
 )
 
 

@@ -42,11 +42,13 @@ from scripts.fae.fae_naive.train_attention_components import (
     parse_held_out_indices_arg,
     parse_held_out_times_arg,
     parse_int_list_arg,
+    visualize_reconstructions_all_times,
+    visualize_sample_reconstructions,
+)
+from scripts.fae.fae_naive.run_artifacts import (
     save_model_artifact,
     save_model_info,
     setup_output_directory,
-    visualize_reconstructions_all_times,
-    visualize_sample_reconstructions,
 )
 from scripts.fae.multiscale_dataset_naive import (
     MultiscaleFieldDatasetNaive,

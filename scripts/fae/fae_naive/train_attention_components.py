@@ -3,11 +3,8 @@
 from __future__ import annotations
 
 import argparse
-import json
 import os
-import pickle
 import sys
-from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional, Sequence
 
@@ -17,13 +14,6 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
-
-try:
-    import wandb
-    HAS_WANDB = True
-except ImportError:
-    HAS_WANDB = False
-    wandb = None
 
 # ---------------------------------------------------------------------------
 # Project imports
@@ -68,140 +58,6 @@ from scripts.fae.dataset_metadata import (
     parse_held_out_indices_arg,
     parse_held_out_times_arg,
 )
-
-
-# ---------------------------------------------------------------------------
-# Output directory and artifact management
-# ---------------------------------------------------------------------------
-
-
-def generate_run_id() -> str:
-    """Generate a unique run ID based on timestamp."""
-    return datetime.now().strftime("%Y%m%d_%H%M%S")
-
-
-def setup_output_directory(
-    base_dir: str,
-    run_name: Optional[str] = None,
-    wandb_run_id: Optional[str] = None,
-) -> dict:
-    """Set up structured output directory for the run.
-
-    Directory structure:
-    base_dir/
-    ├── run_name/                    # or wandb_run_id if run_name not provided
-    │   ├── checkpoints/
-    │   │   ├── state.pkl            # Final model state
-    │   │   └── best_state.pkl       # Best model (if --save-best-model)
-    │   ├── figures/
-    │   │   └── *.png                # Reconstruction visualizations
-    │   ├── logs/
-    │   │   └── training_loss.npy    # Training loss history
-    │   ├── args.json                # Training arguments
-    │   ├── eval_results.json        # Evaluation metrics
-    │   └── model_info.json          # Model architecture info
-
-    Returns
-    -------
-    dict with paths: 'root', 'checkpoints', 'figures', 'logs'
-    """
-    if run_name:
-        run_dir = os.path.join(base_dir, run_name)
-    elif wandb_run_id:
-        run_dir = os.path.join(base_dir, f"run_{wandb_run_id}")
-    else:
-        run_dir = os.path.join(base_dir, f"run_{generate_run_id()}")
-
-    paths = {
-        "root": run_dir,
-        "checkpoints": os.path.join(run_dir, "checkpoints"),
-        "figures": os.path.join(run_dir, "figures"),
-        "logs": os.path.join(run_dir, "logs"),
-    }
-
-    for path in paths.values():
-        os.makedirs(path, exist_ok=True)
-
-    return paths
-
-
-def save_model_artifact(
-    state,
-    paths: dict,
-    architecture_info: dict,
-    args: argparse.Namespace,
-    is_best: bool = False,
-    wandb_run=None,
-) -> str:
-    """Save model checkpoint with full metadata.
-
-    Parameters
-    ----------
-    state : AutoencoderState
-        Model state to save.
-    paths : dict
-        Output directory paths.
-    architecture_info : dict
-        Model architecture details.
-    args : argparse.Namespace
-        Training arguments.
-    is_best : bool
-        Whether this is the best model checkpoint.
-    wandb_run : wandb.Run or None
-        Active wandb run for artifact logging.
-
-    Returns
-    -------
-    str : Path to saved checkpoint.
-    """
-    filename = "best_state.pkl" if is_best else "state.pkl"
-    ckpt_path = os.path.join(paths["checkpoints"], filename)
-
-    checkpoint = {
-        "params": jax.tree.map(np.array, state.params),
-        "batch_stats": (
-            jax.tree.map(np.array, state.batch_stats)
-            if state.batch_stats
-            else None
-        ),
-        "architecture": architecture_info,
-        "args": vars(args),
-        "timestamp": datetime.now().isoformat(),
-    }
-
-    with open(ckpt_path, "wb") as f:
-        pickle.dump(checkpoint, f)
-
-    # Log as wandb artifact if available
-    if wandb_run is not None and HAS_WANDB:
-        artifact_name = f"model-{'best' if is_best else 'final'}"
-        artifact = wandb.Artifact(
-            name=artifact_name,
-            type="model",
-            metadata={
-                "architecture": architecture_info,
-                "is_best": is_best,
-            },
-        )
-        artifact.add_file(ckpt_path)
-        wandb_run.log_artifact(artifact)
-
-    return ckpt_path
-
-
-def save_model_info(paths: dict, architecture_info: dict, args: argparse.Namespace):
-    """Save model architecture information as JSON."""
-    info = {
-        "architecture": architecture_info,
-        "training_args": vars(args),
-        "timestamp": datetime.now().isoformat(),
-    }
-    info_path = os.path.join(paths["root"], "model_info.json")
-    with open(info_path, "w") as f:
-        json.dump(info, f, indent=2, default=str)
-    return info_path
-
-
 # ---------------------------------------------------------------------------
 # Model construction
 # ---------------------------------------------------------------------------
