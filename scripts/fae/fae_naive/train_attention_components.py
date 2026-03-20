@@ -63,6 +63,11 @@ from scripts.fae.fae_naive.decoder_builders import (
     build_decoder,
     canonicalize_decoder_type,
 )
+from scripts.fae.dataset_metadata import (
+    load_dataset_metadata,
+    parse_held_out_indices_arg,
+    parse_held_out_times_arg,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -1229,66 +1234,6 @@ def visualize_reconstructions_all_times_physical(
 
     data.close()
     print(f"Saved physical-space visualizations to {phys_dir}")
-
-
-# ---------------------------------------------------------------------------
-# Dataset helpers
-# ---------------------------------------------------------------------------
-
-
-def load_dataset_metadata(npz_path: str) -> dict:
-    """Load dataset metadata without reading field arrays."""
-    with np.load(npz_path, allow_pickle=True) as data:
-        marginal_keys = sorted(
-            [k for k in data.files if k.startswith("raw_marginal_")],
-            key=lambda k: float(k.replace("raw_marginal_", "")),
-        )
-        n_samples = int(data[marginal_keys[0]].shape[0]) if marginal_keys else None
-        n_times = len(marginal_keys) if marginal_keys else None
-
-        return {
-            "data_generator": str(data.get("data_generator", "")),
-            "scale_mode": str(data.get("scale_mode", "")),
-            "resolution": int(data["resolution"]) if "resolution" in data else None,
-            "times_normalized": (
-                np.array(data["times_normalized"]).astype(np.float32)
-                if "times_normalized" in data
-                else None
-            ),
-            "held_out_indices": (
-                [int(i) for i in np.array(data["held_out_indices"]).tolist()]
-                if "held_out_indices" in data
-                else []
-            ),
-            "n_samples": n_samples,
-            "n_times": n_times,
-        }
-
-
-def parse_held_out_indices_arg(raw: str) -> list[int]:
-    if not raw or raw.strip().lower() in {"none", "null", "no", "false"}:
-        return []
-    indices = []
-    for token in raw.split(","):
-        token = token.strip()
-        if token:
-            indices.append(int(token))
-    return list(dict.fromkeys(indices))  # Remove duplicates, preserve order
-
-
-def parse_held_out_times_arg(raw: str, times_normalized: np.ndarray) -> list[int]:
-    if not raw or raw.strip().lower() in {"none", "null", "no", "false"}:
-        return []
-    targets = [float(t.strip()) for t in raw.split(",") if t.strip()]
-    indices = []
-    for t in targets:
-        diffs = np.abs(times_normalized - t)
-        idx = int(diffs.argmin())
-        if diffs[idx] > 1e-6:
-            raise ValueError(f"Could not match held-out time {t} to dataset times.")
-        if idx not in indices:
-            indices.append(idx)
-    return indices
 
 
 def parse_int_list_arg(raw: str) -> list[int]:

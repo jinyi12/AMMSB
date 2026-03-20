@@ -54,9 +54,18 @@ from functional_autoencoders.losses.fae import get_loss_fae_fn
 from functional_autoencoders.positional_encodings import RandomFourierEncoding
 from functional_autoencoders.train.metrics import Metric
 
+from scripts.fae.dataset_metadata import (
+    load_dataset_metadata,
+    parse_held_out_indices_arg,
+    parse_held_out_times_arg,
+)
 from scripts.fae.multiscale_dataset_time_invariant import (
     MultiscaleFieldDatasetTimeInvariant,
     load_held_out_data_time_invariant,
+)
+from scripts.fae.pointset_reconstruction import (
+    evaluate_pointset_reconstruction as evaluate_train_reconstruction,
+    visualize_pointset_reconstructions as visualize_sample_reconstructions,
 )
 from scripts.fae.wandb_trainer import WandbAutoencoderTrainer
 
@@ -194,38 +203,6 @@ def build_autoencoder(
     return Autoencoder(encoder=encoder, decoder=decoder)
 
 
-def load_checkpoint(checkpoint_path: str, autoencoder: Autoencoder) -> object:
-    """Load a saved checkpoint and restore model state.
-
-    Parameters
-    ----------
-    checkpoint_path : str
-        Path to the saved checkpoint (.pkl file).
-    autoencoder : Autoencoder
-        Autoencoder instance to load parameters into.
-
-    Returns
-    -------
-    state : object
-        Restored model state that can be used for inference.
-    """
-    import pickle
-    from functional_autoencoders.train.state import AutoencoderState
-
-    with open(checkpoint_path, "rb") as f:
-        checkpoint = pickle.load(f)
-
-    state = AutoencoderState(
-        params=checkpoint["params"],
-        batch_stats=checkpoint["batch_stats"],
-    )
-
-    if "best_metric_value" in checkpoint:
-        print(f"Loaded checkpoint with MSE={checkpoint['best_metric_value']:.6f}")
-
-    return state
-
-
 # ---------------------------------------------------------------------------
 # Custom metrics for time-invariant decoder
 # ---------------------------------------------------------------------------
@@ -269,22 +246,6 @@ class MSEMetricTimeInvariant(Metric):
 
         # Compute MSE on decoder outputs
         return float(jnp.mean((u_dec - u_hat) ** 2))
-
-
-# ---------------------------------------------------------------------------
-# Data transformation helpers
-# ---------------------------------------------------------------------------
-
-
-def inverse_log_standardize(
-    standardized_data: jnp.ndarray,
-    log_mean: float,
-    log_std: float,
-    log_epsilon: float,
-) -> jnp.ndarray:
-    """Invert log-standardization to recover original positive values."""
-    log_space = standardized_data * log_std + log_mean
-    return jnp.exp(log_space) - log_epsilon
 
 
 # ---------------------------------------------------------------------------
@@ -342,239 +303,6 @@ def evaluate_interpolation(
             f"MSE={mse:.6f}, Rel-MSE={rel_mse:.6f}"
         )
     return results
-
-
-def evaluate_train_reconstruction(
-    autoencoder: Autoencoder,
-    state,
-    test_dataloader,
-    n_batches: int = 10,
-) -> dict:
-    """Quick MSE and relative error estimate on the test split of training-time data.
-
-    Returns
-    -------
-    dict with keys "mse" and "rel_mse"
-    """
-    se_sum = 0.0
-    u_norm_sq_sum = 0.0
-    count = 0
-    for i, batch in enumerate(test_dataloader):
-        if i >= n_batches:
-            break
-        u_dec, x_dec, u_enc, x_enc = batch[:4]
-        u_enc = jnp.array(u_enc)
-        x_enc = jnp.array(x_enc)
-        x_dec = jnp.array(x_dec)
-        u_dec = jnp.array(u_dec)
-
-        z = autoencoder.encode(state, u_enc, x_enc, train=False)
-        u_hat = autoencoder.decode(state, z, x_dec, train=False)
-
-        se_sum += float(jnp.sum((u_dec - u_hat) ** 2))
-        u_norm_sq_sum += float(jnp.sum(u_dec ** 2))
-        count += u_dec.shape[0] * u_dec.shape[1]
-
-    mse = se_sum / max(count, 1)
-    rel_mse = se_sum / max(u_norm_sq_sum, 1e-10)
-    return {"mse": mse, "rel_mse": rel_mse}
-
-
-def _sorted_marginal_keys(npz: np.lib.npyio.NpzFile) -> list[str]:
-    return sorted(
-        [k for k in npz.files if k.startswith("raw_marginal_")],
-        key=lambda k: float(k.replace("raw_marginal_", "")),
-    )
-
-
-def visualize_sample_reconstructions(
-    autoencoder: Autoencoder,
-    state,
-    test_dataloader,
-    n_samples: int = 4,
-    n_batches: int = 1,
-) -> plt.Figure:
-    """Create a figure showing sample reconstructions from test set.
-
-    Returns a matplotlib figure with original and reconstructed fields side-by-side.
-
-    Notes
-    -----
-    The dataset returns a masked subset of decoder points (not a full regular
-    grid). We therefore visualise reconstructions on the decoder point set
-    using triangulation.
-    """
-    import matplotlib.tri as mtri
-
-    samples_collected = []
-    for i, batch in enumerate(test_dataloader):
-        if i >= n_batches:
-            break
-        u_dec, x_dec, u_enc, x_enc = batch[:4]
-        u_enc = jnp.array(u_enc)
-        x_enc = jnp.array(x_enc)
-        x_dec = jnp.array(x_dec)
-        u_dec = jnp.array(u_dec)
-
-        z = autoencoder.encode(state, u_enc, x_enc, train=False)
-        u_hat = autoencoder.decode(state, z, x_dec, train=False)
-
-        # Store samples
-        for j in range(min(n_samples - len(samples_collected), u_dec.shape[0])):
-            coords = np.array(x_dec[j])
-            if coords.ndim != 2 or coords.shape[-1] < 2:
-                continue
-            samples_collected.append({
-                "coords": coords[:, :2],
-                "original": np.array(u_dec[j, :, 0]),
-                "reconstructed": np.array(u_hat[j, :, 0]),
-            })
-            if len(samples_collected) >= n_samples:
-                break
-        if len(samples_collected) >= n_samples:
-            break
-
-    if not samples_collected:
-        return None
-
-    n_show = len(samples_collected)
-    fig, axes = plt.subplots(2, n_show, figsize=(3 * n_show, 6))
-    if n_show == 1:
-        axes = axes[:, None]
-
-    for j in range(n_show):
-        coords = samples_collected[j]["coords"]
-        orig = samples_collected[j]["original"]
-        recon = samples_collected[j]["reconstructed"]
-        vmin = float(min(orig.min(), recon.min()))
-        vmax = float(max(orig.max(), recon.max()))
-
-        x = coords[:, 0]
-        y = coords[:, 1]
-        try:
-            tri = mtri.Triangulation(x, y)
-        except Exception:
-            tri = None
-
-        # Original
-        if tri is not None:
-            axes[0, j].tripcolor(tri, orig, vmin=vmin, vmax=vmax, cmap="viridis", shading="gouraud")
-        else:
-            axes[0, j].scatter(x, y, c=orig, s=6, vmin=vmin, vmax=vmax, cmap="viridis")
-        axes[0, j].set_title(f"Original {j+1}")
-        axes[0, j].axis("off")
-        axes[0, j].set_aspect("equal")
-
-        # Reconstructed
-        if tri is not None:
-            axes[1, j].tripcolor(tri, recon, vmin=vmin, vmax=vmax, cmap="viridis", shading="gouraud")
-        else:
-            axes[1, j].scatter(x, y, c=recon, s=6, vmin=vmin, vmax=vmax, cmap="viridis")
-        axes[1, j].set_title(f"Reconstructed {j+1}")
-        axes[1, j].axis("off")
-        axes[1, j].set_aspect("equal")
-
-        # Compute relative error for this sample
-        rel_error = np.linalg.norm(orig - recon) / max(np.linalg.norm(orig), 1e-10)
-        axes[1, j].text(
-            0.5, -0.05, f"Rel-Err: {rel_error:.3f}",
-            transform=axes[1, j].transAxes,
-            ha="center", fontsize=8
-        )
-
-    fig.tight_layout()
-    return fig
-
-
-def load_dataset_metadata(npz_path: str) -> dict:
-    """Load lightweight metadata from the FAE npz without reading field arrays."""
-    with np.load(npz_path, allow_pickle=True) as data:
-        marginal_keys = _sorted_marginal_keys(data)
-        n_samples = None
-        n_times = None
-        if marginal_keys:
-            n_samples = int(data[marginal_keys[0]].shape[0])
-            n_times = int(len(marginal_keys))
-
-        meta = {
-            "data_generator": str(data.get("data_generator", "")),
-            "scale_mode": str(data.get("scale_mode", "")),
-            "resolution": int(data["resolution"]) if "resolution" in data else None,
-            "data_dim": int(data["data_dim"]) if "data_dim" in data else None,
-            "times": np.array(data["times"]).astype(np.float32) if "times" in data else None,
-            "times_normalized": (
-                np.array(data["times_normalized"]).astype(np.float32)
-                if "times_normalized" in data
-                else None
-            ),
-            "held_out_indices": (
-                [int(i) for i in np.array(data["held_out_indices"]).tolist()]
-                if "held_out_indices" in data
-                else []
-            ),
-            "held_out_times": (
-                [float(t) for t in np.array(data["held_out_times"]).tolist()]
-                if "held_out_times" in data
-                else []
-            ),
-            "n_samples": n_samples,
-            "n_times": n_times,
-            "has_log_stats": all(
-                k in data for k in ("log_epsilon", "log_mean", "log_std")
-            ),
-        }
-
-        if meta["has_log_stats"]:
-            meta["log_epsilon"] = float(data["log_epsilon"])
-            meta["log_mean"] = float(data["log_mean"])
-            meta["log_std"] = float(data["log_std"])
-
-        return meta
-
-
-def parse_held_out_indices_arg(raw: str) -> list[int]:
-    if not raw:
-        return []
-    if raw.strip().lower() in {"none", "null", "no", "false"}:
-        return []
-    indices: list[int] = []
-    seen = set()
-    for token in raw.split(","):
-        token = token.strip()
-        if not token:
-            continue
-        idx = int(token)
-        if idx in seen:
-            continue
-        seen.add(idx)
-        indices.append(idx)
-    return indices
-
-
-def parse_held_out_times_arg(raw: str, times_normalized: np.ndarray) -> list[int]:
-    if not raw:
-        return []
-    if raw.strip().lower() in {"none", "null", "no", "false"}:
-        return []
-    targets: list[float] = []
-    for token in raw.split(","):
-        token = token.strip()
-        if not token:
-            continue
-        targets.append(float(token))
-
-    indices: list[int] = []
-    for t in targets:
-        diffs = np.abs(times_normalized - t)
-        idx = int(diffs.argmin())
-        if diffs[idx] > 1e-6:
-            raise ValueError(
-                f"Could not match held-out time {t} to dataset times_normalized. "
-                f"Closest is {float(times_normalized[idx])} at index {idx}."
-            )
-        if idx not in indices:
-            indices.append(idx)
-    return indices
 
 
 def visualize_reconstructions(
