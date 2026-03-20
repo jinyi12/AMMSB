@@ -7,9 +7,13 @@ Use this runbook for the active evaluation family in `scripts/fae/tran_evaluatio
 Core entrypoints:
 
 - `evaluate.py`
+- `generate.py`
 - `evaluate_conditional.py`
 - `evaluate_conditional_diagnostic.py`
+- `evaluate_postfiltered_consistency.py`
 - `compare_latent_geometry_models.py`
+- `visualize_latent_msbm_manifold.py`
+- `visualize_conditional_latent_projections.py`
 - `encode_corpus.py`
 
 ## Safety Checks
@@ -17,6 +21,7 @@ Core entrypoints:
 Before a larger rerun:
 
 ```bash
+make install-local
 make test-tran-eval
 make smoke-tran-eval
 ```
@@ -46,6 +51,15 @@ Cross-model latent geometry comparison:
 
 ```bash
 python scripts/fae/tran_evaluation/compare_latent_geometry_models.py --help
+```
+
+Trajectory/post-filtered companion checks:
+
+```bash
+python scripts/fae/tran_evaluation/generate.py --help
+python scripts/fae/tran_evaluation/evaluate_postfiltered_consistency.py --help
+python scripts/fae/tran_evaluation/visualize_latent_msbm_manifold.py --help
+python scripts/fae/tran_evaluation/visualize_conditional_latent_projections.py --help
 ```
 
 ## Support Modules

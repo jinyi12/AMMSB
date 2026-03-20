@@ -15,7 +15,7 @@ from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
 from numpy.typing import NDArray
 
-from scripts.images.field_visualization import EASTERN_HUES, format_for_paper  # noqa: F401
+from scripts.images.field_visualization import EASTERN_HUES, format_for_paper
 
 
 # ============================================================================
@@ -81,6 +81,34 @@ def _band_label(band: int, H_schedule: Optional[List[float]] = None) -> str:
 def _set_tick_fontsize(ax, size: float = FONT_TICK) -> None:
     """Set tick label font size on both axes."""
     ax.tick_params(axis="both", labelsize=size)
+
+
+def add_column_cbar_horizontal(
+    fig: plt.Figure,
+    axes_col: List[plt.Axes],
+    mappable,
+    *,
+    pad: float = 0.008,
+    height: float = 0.012,
+    fontsize: float = FONT_TICK,
+):
+    """Add a horizontal colorbar below a column of axes."""
+    fig.canvas.draw()
+
+    bbs = [ax.get_position() for ax in axes_col]
+    x0 = min(bb.x0 for bb in bbs)
+    x1 = max(bb.x1 for bb in bbs)
+    y0 = min(bb.y0 for bb in bbs)
+
+    cax = fig.add_axes([
+        x0,
+        y0 - pad - height,
+        x1 - x0,
+        height,
+    ])
+    cbar = fig.colorbar(mappable, cax=cax, orientation="horizontal")
+    cbar.ax.tick_params(labelsize=fontsize)
+    return cbar
 
 
 def _sample_finite(
@@ -891,6 +919,9 @@ def plot_direct_field_pdfs(
     out_dir: Path,
     n_cols: int = N_COLS,
     min_spacing_pixels: int = 4,
+    *,
+    obs_label: str = "Obs",
+    basename: str = "fig10_direct_field_pdfs",
 ) -> None:
     """One-point PDFs of decorrelated direct filtered-field values.
 
@@ -934,7 +965,7 @@ def plot_direct_field_pdfs(
         markevery = max(1, int(len(x) // 10))
         ax.plot(
             x, y_obs,
-            color=C_OBS, lw=1.4, label="Obs",
+            color=C_OBS, lw=1.4, label=obs_label,
             marker="o", markersize=2.2, markevery=markevery,
         )
         ax.fill_between(x, y_obs, alpha=0.14, color=C_OBS)
@@ -956,7 +987,7 @@ def plot_direct_field_pdfs(
         axes[i // n_cols, i % n_cols].set_visible(False)
 
     plt.tight_layout()
-    _save_fig(fig, out_dir, "fig10_direct_field_pdfs")
+    _save_fig(fig, out_dir, basename)
     plt.close(fig)
 
 
@@ -977,6 +1008,8 @@ def plot_conditional_pdfs(
         Mapping ``pair_label -> {'ref_values': ndarray, 'gen_values': ndarray,
         'title': str (optional)}``.
     """
+    format_for_paper()
+
     pairs = list(conditional_pdf_values.keys())
     if len(pairs) == 0:
         return
@@ -1000,20 +1033,21 @@ def plot_conditional_pdfs(
 
         ax.plot(
             x, y_ref,
-            color=C_OBS, lw=1.4, label="Ref cond.",
+            color=C_OBS, lw=1.4, label="Reference",
             marker="o", markersize=2.2, markevery=markevery,
         )
         ax.fill_between(x, y_ref, alpha=0.14, color=C_OBS)
 
         ax.plot(
             x, y_gen,
-            color=C_GEN, lw=1.4, label="Gen cond.",
+            color=C_GEN, lw=1.4, label="Generated",
             marker="^", markersize=2.2, markevery=markevery,
         )
         ax.fill_between(x, y_gen, alpha=0.14, color=C_GEN)
 
         title = str(pair_data.get("title", pair_label))
         ax.set_title(title, fontsize=FONT_TITLE)
+        ax.set_xlabel("Volume fraction, $u$", fontsize=FONT_LABEL)
         ax.set_ylabel("Density", fontsize=FONT_LABEL)
         ax.legend(fontsize=FONT_LEGEND, framealpha=0.8)
         ax.grid(alpha=0.2)
@@ -1039,6 +1073,9 @@ def plot_direct_field_correlation(
     pixel_size: float,
     out_dir: Path,
     n_cols: int = N_COLS,
+    *,
+    obs_label: str = "Obs",
+    basename: str = "fig11_direct_field_correlation",
 ) -> None:
     """Directional normalised correlation R(tau) of the direct filtered fields.
 
@@ -1087,9 +1124,9 @@ def plot_direct_field_correlation(
 
         # Observed.
         ax.plot(lags, R_obs_e1[:max_lag_idx], "-",
-                color=C_OBS, lw=1.2, label="Obs $e_1$")
+                color=C_OBS, lw=1.2, label=f"{obs_label} $e_1$")
         ax.plot(lags, R_obs_e2[:max_lag_idx], "--",
-                color=C_OBS, lw=1.2, label="Obs $e_2$")
+                color=C_OBS, lw=1.2, label=f"{obs_label} $e_2$")
 
         # Generated mean +/- sigma.
         m1 = gen_corr["R_e1_mean"][:max_lag_idx]
@@ -1119,7 +1156,7 @@ def plot_direct_field_correlation(
         axes[i // n_cols, i % n_cols].set_visible(False)
 
     plt.tight_layout()
-    _save_fig(fig, out_dir, "fig11_direct_field_correlation")
+    _save_fig(fig, out_dir, basename)
     plt.close(fig)
 
 
@@ -1231,8 +1268,9 @@ def plot_trajectory_fields(
     out_dir: Path,
     *,
     n_gen_show: int = 4,
+    held_out_indices: Optional[List[int]] = None,
 ) -> None:
-    """Backward SDE trajectory fields at each knot time vs GT.
+    """Backward SDE trajectory fields at each displayed marginal vs GT.
 
     **What it shows.**  Top row: ground-truth fields at each MSBM scale
     (one per knot time).  Rows 1..n_gen_show: distinct generated
@@ -1254,16 +1292,23 @@ def plot_trajectory_fields(
     sample_idx = 0  # GT sample index.
 
     n_rows = 1 + n_show  # GT row + generated rows
+    fig_width = FIG_WIDTH * 1.5 if T_knots > 5 else FIG_WIDTH
     fig, axes = plt.subplots(
         n_rows, T_knots,
-        figsize=(FIG_WIDTH, FIELD_ROW_HEIGHT * n_rows),
+        figsize=(fig_width, FIELD_ROW_HEIGHT * n_rows),
         squeeze=False,
     )
 
-    im = None  # for colorbar reference
+    ho_set = {int(idx) for idx in (held_out_indices or [])}
+    im_handles = [None] * T_knots
     for k in range(T_knots):
         ds_idx = int(time_indices[k])
         H_val = full_H_schedule[ds_idx] if ds_idx < len(full_H_schedule) else ds_idx
+        if float(H_val).is_integer():
+            h_label = f"$H = {H_val:g}$"
+        else:
+            h_label = f"$H = {H_val:.2f}$"
+        ho_tag = " (HO)" if ds_idx in ho_set else ""
 
         gt_field = gt_fields_by_index[ds_idx][sample_idx]
         gen_fields_k = trajectory_fields[k, :n_show]
@@ -1274,15 +1319,16 @@ def plot_trajectory_fields(
         )
         vmin, vmax = float(all_vals.min()), float(all_vals.max())
 
-        axes[0, k].imshow(
+        im_col = axes[0, k].imshow(
             gt_field.reshape(resolution, resolution),
             origin="lower", cmap=CMAP_FIELD, vmin=vmin, vmax=vmax,
         )
-        axes[0, k].set_title(f"$H={H_val:.3g}$", fontsize=FONT_TITLE)
+        im_handles[k] = im_col
+        axes[0, k].set_title(h_label + ho_tag, fontsize=FONT_TITLE)
         axes[0, k].axis("off")
 
         for r in range(n_show):
-            im = axes[r + 1, k].imshow(
+            axes[r + 1, k].imshow(
                 gen_fields_k[r].reshape(resolution, resolution),
                 origin="lower", cmap=CMAP_FIELD, vmin=vmin, vmax=vmax,
             )
@@ -1298,11 +1344,10 @@ def plot_trajectory_fields(
             ha="right", va="center", labelpad=14,
         )
 
-    fig.tight_layout(rect=[0.0, 0.0, 0.88, 1.0])
-    if im is not None:
-        cax = fig.add_axes([0.90, 0.18, 0.02, 0.64])
-        cbar = fig.colorbar(im, cax=cax)
-        cbar.ax.tick_params(labelsize=FONT_TICK)
+    fig.subplots_adjust(left=0.08, right=0.98, top=0.95, bottom=0.12,
+                        hspace=0.06, wspace=0.04)
+    for col in range(T_knots):
+        add_column_cbar_horizontal(fig, list(axes[:, col]), im_handles[col])
 
     _save_fig(fig, out_dir, "fig12_trajectory_fields")
     plt.close(fig)

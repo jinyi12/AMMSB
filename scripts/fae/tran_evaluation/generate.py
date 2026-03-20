@@ -7,8 +7,9 @@ realisations in a single CLI invocation, without a separate generation step.
 The main entry point is :func:`generate_backward_realizations`, which:
 
 1. Loads the trained MSBM agent from ``run_dir``.
-2. Generates *n_realizations* backward SDE trajectories from the same
-   macroscale initial condition (each with independent Brownian noise).
+2. Generates *n_realizations* backward SDE trajectories from either a
+   fixed macroscale initial condition or from macroscale samples drawn
+   from the training marginal (each with independent Brownian noise).
 3. Decodes trajectories to field space via the FAE decoder.
 4. Inverts log-standardisation to physical scale.
 5. Returns a dict compatible with the evaluation pipeline.
@@ -16,7 +17,6 @@ The main entry point is :func:`generate_backward_realizations`, which:
 
 from __future__ import annotations
 
-import ast
 import sys
 from contextlib import nullcontext
 from pathlib import Path
@@ -24,7 +24,6 @@ from typing import Any, Optional
 
 import numpy as np
 import torch
-import torch.nn as nn
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 if str(REPO_ROOT) not in sys.path:
@@ -32,7 +31,6 @@ if str(REPO_ROOT) not in sys.path:
 
 from data.transform_utils import apply_inverse_transform, load_transform_info  # noqa: E402
 from scripts.fae.fae_naive.fae_latent_utils import (  # noqa: E402
-    NoopTimeModule,
     build_attention_fae_from_checkpoint,
     compute_exponential_step_schedule,
     decode_latent_knots_to_fields,
@@ -42,152 +40,128 @@ from scripts.fae.fae_naive.fae_latent_utils import (  # noqa: E402
     parse_step_schedule,
 )
 from scripts.fae.generate_full_trajectories import _sample_full_trajectory  # noqa: E402
+from scripts.fae.tran_evaluation.latent_msbm_runtime import (  # noqa: E402
+    build_latent_msbm_agent,
+    load_policy_checkpoints,
+)
+from scripts.fae.tran_evaluation.run_support import (  # noqa: E402
+    build_internal_time_dists,
+    parse_key_value_args_file as parse_args_file,
+    resolve_existing_path,
+)
 from scripts.utils import get_device  # noqa: E402
 
-
-def parse_args_file(args_path: Path) -> dict[str, Any]:
-    """Parse args.txt file with key=value format."""
-    if not args_path.exists():
-        raise FileNotFoundError(f"Args file not found at {args_path}")
-    parsed: dict[str, Any] = {}
-    for line in args_path.read_text().splitlines():
-        if "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        key = key.strip()
-        value = value.strip()
-        try:
-            parsed[key] = ast.literal_eval(value)
-        except Exception:
-            parsed[key] = value
-    return parsed
-
-from mmsfm.latent_msbm import LatentMSBMAgent  # noqa: E402
-from mmsfm.latent_msbm.noise_schedule import (  # noqa: E402
-    ConstantSigmaSchedule,
-    ExponentialContractingSigmaSchedule,
-)
 from mmsfm.latent_msbm.utils import ema_scope  # noqa: E402
 
 
-# ============================================================================
-# Agent construction (mirrors generate_full_trajectories.py)
-# ============================================================================
+def _select_initial_sample_indices(
+    n_train: int,
+    n_realizations: int,
+    sample_idx: int,
+    seed: int,
+    sample_mode: str,
+) -> np.ndarray:
+    """Choose coarse-sample indices for backward trajectory generation."""
+    if sample_mode == "fixed":
+        if sample_idx < 0 or sample_idx >= n_train:
+            raise ValueError(f"sample_idx={sample_idx} outside [0, {n_train})")
+        return np.full(n_realizations, sample_idx, dtype=np.int64)
 
-def _build_t_dists_from_cfg(zt: np.ndarray, train_cfg: dict[str, Any]) -> np.ndarray:
-    """Reconstruct MSBM internal times from saved training config."""
-    zt_np = np.asarray(zt, dtype=np.float64).reshape(-1)
-    t_scale = float(train_cfg.get("t_scale", 1.0))
-    mode = str(train_cfg.get("time_dist_mode", "uniform")).lower()
+    if sample_mode != "marginal":
+        raise ValueError(f"Unknown sample_mode={sample_mode!r}")
 
-    if zt_np.size <= 1:
-        return np.zeros((int(zt_np.size),), dtype=np.float32)
-
-    if mode == "zt":
-        dz = zt_np - float(zt_np[0])
-        span = float(dz[-1])
-        if np.isfinite(span) and span > 0.0:
-            horizon = float((zt_np.size - 1) * t_scale)
-            return ((dz / span) * horizon).astype(np.float32)
-        print("Warning: invalid/degenerate zt span; falling back to uniform t_dists.")
-    elif mode != "uniform":
-        print(f"Warning: unknown time_dist_mode='{mode}', falling back to uniform t_dists.")
-
-    return (np.linspace(0, zt_np.size - 1, zt_np.size, dtype=np.float64) * t_scale).astype(np.float32)
+    rng = np.random.default_rng(seed)
+    replace = n_realizations > n_train
+    return rng.choice(n_train, size=n_realizations, replace=replace).astype(np.int64)
 
 
-def _build_agent(
-    train_cfg: dict,
-    latent_dim: int,
-    zt: np.ndarray,
-    device: torch.device,
-) -> LatentMSBMAgent:
-    """Reconstruct the MSBM agent from the training configuration."""
-    t_dists_np = _build_t_dists_from_cfg(zt, train_cfg)
-    t_ref_default = float(max(1.0, float(t_dists_np[-1] - t_dists_np[0])))
-    var_time_ref_val = train_cfg.get("var_time_ref", None)
-    t_ref = float(var_time_ref_val) if var_time_ref_val is not None else t_ref_default
-
-    var_schedule = str(train_cfg.get("var_schedule", "constant"))
-    if var_schedule == "constant":
-        sigma_schedule = ConstantSigmaSchedule(float(train_cfg.get("var", 0.5)))
-    else:
-        sigma_schedule = ExponentialContractingSigmaSchedule(
-            sigma_0=float(train_cfg.get("var", 0.5)),
-            decay_rate=float(train_cfg.get("var_decay_rate", 2.0)),
-            t_ref=t_ref,
+def _infer_steps_per_interval(n_steps_full: int, n_knots: int) -> int:
+    """Infer the number of saved samples per knot interval."""
+    n_intervals = int(n_knots) - 1
+    if n_intervals <= 0:
+        raise ValueError("Need at least two knots to infer full-trajectory spacing.")
+    s_float = 1.0 + (float(n_steps_full) - 1.0) / float(n_intervals)
+    s = int(np.round(s_float))
+    if abs(s_float - float(s)) > 1e-6 or s < 2:
+        raise ValueError(
+            f"Could not infer integer steps-per-interval for n_steps_full={n_steps_full}, n_knots={n_knots}."
         )
+    return s
 
-    return LatentMSBMAgent(
-        encoder=NoopTimeModule(),
-        decoder=NoopTimeModule(),
-        latent_dim=latent_dim,
-        zt=list(map(float, zt.tolist())),
-        initial_coupling=str(train_cfg.get("initial_coupling", "paired")),
-        hidden_dims=list(train_cfg.get("hidden", [256, 128, 64])),
-        time_dim=int(train_cfg.get("time_dim", 32)),
-        policy_arch=str(train_cfg.get("policy_arch", "film")),
-        var=float(train_cfg.get("var", 0.5)),
-        sigma_schedule=sigma_schedule,
-        t_scale=float(train_cfg.get("t_scale", 1.0)),
-        t_dists=t_dists_np,
-        interval=int(train_cfg.get("interval", 100)),
-        use_t_idx=bool(train_cfg.get("use_t_idx", False)),
-        lr=float(train_cfg.get("lr", 1e-4)),
-        lr_f=None,
-        lr_b=None,
-        lr_gamma=float(train_cfg.get("lr_gamma", 0.999)),
-        lr_step=int(train_cfg.get("lr_step", 1000)),
-        optimizer=str(train_cfg.get("optimizer", "AdamW")),
-        weight_decay=float(train_cfg.get("weight_decay", 0.0)),
-        grad_clip=None,
-        use_amp=False,
-        use_ema=bool(train_cfg.get("use_ema", True)),
-        ema_decay=float(train_cfg.get("ema_decay", 0.999)),
-        coupling_drift_clip_norm=None,
-        drift_reg=0.0,
-        device=device,
+
+def _build_full_internal_times(knot_times: np.ndarray, n_steps_full: int) -> np.ndarray:
+    """Expand knot times to the saved full-trajectory time grid."""
+    knot_times = np.asarray(knot_times, dtype=np.float64).reshape(-1)
+    if knot_times.size == 0:
+        raise ValueError("knot_times must be non-empty.")
+    if knot_times.size == 1:
+        return knot_times.astype(np.float32)
+
+    steps_per_interval = _infer_steps_per_interval(int(n_steps_full), int(knot_times.size))
+    parts = []
+    for idx in range(int(knot_times.size) - 1):
+        seg = np.linspace(
+            float(knot_times[idx]),
+            float(knot_times[idx + 1]),
+            int(steps_per_interval),
+            dtype=np.float64,
+        )
+        if idx > 0:
+            seg = seg[1:]
+        parts.append(seg)
+    return np.concatenate(parts, axis=0).astype(np.float32)
+
+
+def _nearest_time_indices(full_times: np.ndarray, target_times: np.ndarray) -> np.ndarray:
+    """Return nearest indices in ``full_times`` for each monotone target time."""
+    full_times = np.asarray(full_times, dtype=np.float64).reshape(-1)
+    target_times = np.asarray(target_times, dtype=np.float64).reshape(-1)
+    if full_times.size == 0:
+        raise ValueError("full_times must be non-empty.")
+    if target_times.size == 0:
+        return np.asarray([], dtype=np.int64)
+
+    right = np.searchsorted(full_times, target_times, side="left")
+    right = np.clip(right, 0, full_times.size - 1)
+    left = np.clip(right - 1, 0, full_times.size - 1)
+    choose_left = np.abs(target_times - full_times[left]) <= np.abs(full_times[right] - target_times)
+    return np.where(choose_left, left, right).astype(np.int64)
+
+
+def _extract_all_marginal_frames(
+    full_fields: np.ndarray,
+    *,
+    knot_t_dists: np.ndarray,
+    modeled_time_indices: np.ndarray | None,
+    dataset_times_norm: np.ndarray,
+) -> tuple[np.ndarray | None, np.ndarray | None]:
+    """Sample the decoded full trajectory at every dataset marginal in range."""
+    if modeled_time_indices is None:
+        return None, None
+
+    modeled_idx = np.asarray(modeled_time_indices, dtype=np.int64).reshape(-1)
+    if modeled_idx.size == 0:
+        return None, None
+
+    dataset_times_norm = np.asarray(dataset_times_norm, dtype=np.float64).reshape(-1)
+    if dataset_times_norm.size == 0:
+        return None, None
+
+    start_idx = max(1, int(np.min(modeled_idx)))
+    end_idx = int(np.max(modeled_idx))
+    target_idx = np.arange(start_idx, end_idx + 1, dtype=np.int64)
+    modeled_times_norm = dataset_times_norm[modeled_idx]
+    target_times_norm = dataset_times_norm[target_idx]
+
+    target_t_dists = np.interp(
+        target_times_norm,
+        modeled_times_norm,
+        np.asarray(knot_t_dists, dtype=np.float64).reshape(-1),
     )
+    full_t_dists = _build_full_internal_times(knot_t_dists, int(full_fields.shape[0]))
+    frame_idx = _nearest_time_indices(full_t_dists, target_t_dists)
 
-
-def _load_policy_checkpoints(
-    agent: LatentMSBMAgent,
-    run_dir: Path,
-    device: torch.device,
-    use_ema: bool = True,
-) -> None:
-    """Load forward/backward policy weights (+ EMA if available)."""
-    # Regular checkpoints.
-    z_f_path = run_dir / "latent_msbm_policy_forward.pth"
-    z_b_path = run_dir / "latent_msbm_policy_backward.pth"
-    if not z_f_path.exists():
-        ckpt_dir = run_dir / "checkpoints"
-        z_f_path = ckpt_dir / "z_f.pt"
-        z_b_path = ckpt_dir / "z_b.pt"
-    if not z_f_path.exists():
-        raise FileNotFoundError(
-            f"Forward policy checkpoint not found in {run_dir}"
-        )
-
-    agent.z_f.load_state_dict(torch.load(z_f_path, map_location=device))
-    agent.z_b.load_state_dict(torch.load(z_b_path, map_location=device))
-
-    # EMA checkpoints.
-    ema_f_path = run_dir / "latent_msbm_policy_forward_ema.pth"
-    ema_b_path = run_dir / "latent_msbm_policy_backward_ema.pth"
-    if not ema_f_path.exists():
-        ckpt_dir = run_dir / "checkpoints"
-        ema_f_path = ckpt_dir / "ema_z_f.pt"
-        ema_b_path = ckpt_dir / "ema_z_b.pt"
-
-    if use_ema and ema_f_path.exists() and ema_b_path.exists():
-        agent.z_f.load_state_dict(torch.load(ema_f_path, map_location=device))
-        agent.z_b.load_state_dict(torch.load(ema_b_path, map_location=device))
-        agent.ema_f = None
-        agent.ema_b = None
-        print("  Loaded EMA-averaged policy weights")
-    elif use_ema:
-        print("  Warning: EMA requested but checkpoints not found, using non-EMA weights")
+    return np.asarray(full_fields[frame_idx]), target_idx
 
 
 # ============================================================================
@@ -200,6 +174,7 @@ def generate_backward_realizations(
     dataset_npz_path: str | Path,
     n_realizations: int = 200,
     sample_idx: int = 0,
+    sample_mode: str = "fixed",
     seed: int = 42,
     use_ema: bool = True,
     drift_clip_norm: Optional[float] = None,
@@ -220,10 +195,14 @@ def generate_backward_realizations(
         Original dataset npz (needed for inverse-transform parameters).
     n_realizations : int
         Number of independent backward SDE trajectories to generate, each
-        with different Brownian noise but the same initial condition.
+        with different Brownian noise.
     sample_idx : int
         Which training sample's macroscale latent to use as the initial
-        condition for the backward SDE.
+        condition for the backward SDE when ``sample_mode="fixed"``.
+    sample_mode : {"fixed", "marginal"}
+        How to choose macroscale initial conditions. ``"fixed"`` reuses
+        ``sample_idx`` for every realisation; ``"marginal"`` draws
+        macroscale samples from the training marginal.
     seed : int
         Base random seed (each realisation gets ``seed + 1000 + i``).
     use_ema : bool
@@ -289,31 +268,54 @@ def generate_backward_realizations(
 
     T, n_train, latent_dim = latent_train.shape
     print(f"  Latent marginals: T={T}, n_train={n_train}, latent_dim={latent_dim}")
+    t_dists_np = build_internal_time_dists(zt, train_cfg)
 
-    if sample_idx >= n_train:
-        raise ValueError(f"sample_idx={sample_idx} >= n_train={n_train}")
+    sample_indices = _select_initial_sample_indices(
+        n_train=n_train,
+        n_realizations=n_realizations,
+        sample_idx=sample_idx,
+        seed=seed,
+        sample_mode=sample_mode,
+    )
 
     # ------------------------------------------------------------------
     # Build agent & load checkpoints
     # ------------------------------------------------------------------
-    agent = _build_agent(train_cfg, latent_dim, zt, device)
-    agent.latent_train = torch.from_numpy(latent_train).float().to(device)
-
-    _load_policy_checkpoints(agent, run_dir, device, use_ema=use_ema)
+    agent = build_latent_msbm_agent(
+        train_cfg,
+        zt,
+        latent_dim,
+        device,
+        latent_train=latent_train,
+    )
+    load_policy_checkpoints(
+        agent,
+        run_dir,
+        device,
+        use_ema=use_ema,
+        load_forward=True,
+        load_backward=True,
+    )
 
     # ------------------------------------------------------------------
     # Generate backward realisations
     # ------------------------------------------------------------------
-    print(f"  Generating {n_realizations} backward realisations "
-          f"from sample {sample_idx}...")
-
-    y0_single = agent.latent_train[-1, sample_idx].unsqueeze(0)  # (1, K)
+    if sample_mode == "fixed":
+        print(f"  Generating {n_realizations} backward realisations "
+              f"from sample {sample_idx}...")
+    else:
+        unique_count = int(np.unique(sample_indices).size)
+        print(
+            f"  Generating {n_realizations} backward realisations from "
+            f"{unique_count} coarse samples drawn from the training marginal..."
+        )
 
     knots_list = []
     traj_list = []
 
-    for i in range(n_realizations):
+    for i, init_idx in enumerate(sample_indices):
         torch.manual_seed(seed + 1000 + i)
+        y0_single = agent.latent_train[-1, int(init_idx)].unsqueeze(0)  # (1, K)
         knots_i, traj_i = _sample_full_trajectory(
             agent=agent,
             policy=agent.z_b,
@@ -333,18 +335,26 @@ def generate_backward_realizations(
     full_traj_b_np = full_traj_b.detach().cpu().numpy().astype(np.float32)
     knots_b_np = knots_b.detach().cpu().numpy().astype(np.float32)
 
-    # Verify all start from the same condition.
+    # Verify the realised initial conditions.
     init_latents = full_traj_b_np[-1, :, :]  # (N, K) at t=1.00 (flipped)
-    max_diff = np.abs(init_latents - init_latents[0:1, :]).max()
-    print(f"  Max init-condition diff: {max_diff:.2e} (should be ~0)")
+    if sample_mode == "fixed":
+        max_diff = np.abs(init_latents - init_latents[0:1, :]).max()
+        print(f"  Max init-condition diff: {max_diff:.2e} (should be ~0)")
+    else:
+        unique_init = np.unique(sample_indices).size
+        print(f"  Unique coarse initial samples used: {unique_init}")
 
     # ------------------------------------------------------------------
     # Decode to field space
     # ------------------------------------------------------------------
     print("  Decoding to field space...")
-    fae_checkpoint_path = Path(train_cfg.get("fae_checkpoint"))
-    if not fae_checkpoint_path.exists():
-        raise FileNotFoundError(f"FAE checkpoint not found: {fae_checkpoint_path}")
+    fae_checkpoint_path = resolve_existing_path(
+        train_cfg.get("fae_checkpoint"),
+        repo_root=REPO_ROOT,
+        roots=[run_dir, Path.cwd()],
+    )
+    if fae_checkpoint_path is None:
+        raise FileNotFoundError("FAE checkpoint not found from args.txt")
 
     ckpt = load_fae_checkpoint(fae_checkpoint_path)
     autoencoder, fae_params, fae_batch_stats, _ = build_attention_fae_from_checkpoint(ckpt)
@@ -431,7 +441,20 @@ def generate_backward_realizations(
     # ------------------------------------------------------------------
     ds = np.load(dataset_npz_path, allow_pickle=True)
     transform_info = load_transform_info(ds)
+    dataset_times_norm = np.asarray(ds["times_normalized"], dtype=np.float32)
     ds.close()
+
+    all_marginal_fields_log, all_marginal_time_indices = _extract_all_marginal_frames(
+        fields_b,
+        knot_t_dists=t_dists_np,
+        modeled_time_indices=time_indices,
+        dataset_times_norm=dataset_times_norm,
+    )
+    if all_marginal_fields_log is not None and all_marginal_time_indices is not None:
+        print(
+            "  All-marginal trajectory fields: "
+            f"{all_marginal_fields_log.shape} at dataset indices {all_marginal_time_indices.tolist()}"
+        )
 
     realizations_phys = apply_inverse_transform(
         realizations_log.astype(np.float32), transform_info
@@ -445,6 +468,15 @@ def generate_backward_realizations(
             knot_fields_log[t].astype(np.float32), transform_info
         )
 
+    all_marginal_fields_phys = None
+    if all_marginal_fields_log is not None:
+        n_all = int(all_marginal_fields_log.shape[0])
+        all_marginal_fields_phys = np.empty_like(all_marginal_fields_log, dtype=np.float32)
+        for t in range(n_all):
+            all_marginal_fields_phys[t] = apply_inverse_transform(
+                all_marginal_fields_log[t].astype(np.float32), transform_info
+            )
+
     print(f"  Generated {n_realizations} realisations, "
           f"shape={realizations_phys.shape}")
     print(f"  Trajectory knot fields: {T_knots} scales, "
@@ -455,10 +487,19 @@ def generate_backward_realizations(
         "realizations_log": realizations_log.astype(np.float32),
         "trajectory_fields_phys": knot_fields_phys,
         "trajectory_fields_log": knot_fields_log.astype(np.float32),
+        "trajectory_fields_phys_all": (
+            all_marginal_fields_phys.astype(np.float32)
+            if all_marginal_fields_phys is not None else None
+        ),
+        "trajectory_fields_log_all": (
+            all_marginal_fields_log.astype(np.float32)
+            if all_marginal_fields_log is not None else None
+        ),
         "zt": zt,
         "time_indices": time_indices,
+        "trajectory_all_time_indices": all_marginal_time_indices,
         "resolution": resolution,
-        "sample_indices": np.array([sample_idx], dtype=np.int64),
+        "sample_indices": sample_indices.astype(np.int64),
         "is_realizations": True,
         "transform_info": transform_info,
         "decode_mode": effective_decode_mode,

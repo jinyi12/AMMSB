@@ -16,7 +16,6 @@ jnp = pytest.importorskip("jax.numpy")
 from scripts.fae.tran_evaluation.latent_geometry import (
     LatentGeometryConfig,
     estimate_hessian_norm,
-    estimate_logdet_metric,
     estimate_pullback_spectrum,
 )
 
@@ -28,6 +27,7 @@ def _base_config(seed: int = 0) -> LatentGeometryConfig:
         n_hvp_probes=4,
         eps=1e-6,
         near_null_tau=1e-3,
+        trace_estimator="fhutch",
         seed=seed,
     )
 
@@ -47,16 +47,21 @@ def test_linear_decoder_has_finite_metrics_and_near_zero_hessian():
     cfg = _base_config(seed=11)
     spec = estimate_pullback_spectrum(decode_fn, z, x, config=cfg)
     hess = estimate_hessian_norm(decode_fn, z, x, config=cfg)
-    volume = estimate_logdet_metric(decode_fn, z, x, config=cfg)
 
     assert np.isfinite(spec["trace_g"])
+    assert np.isfinite(spec["trace_g_sq"])
+    assert np.isfinite(spec["fro_norm_g"])
     assert np.isfinite(spec["effective_rank"])
-    assert np.isfinite(spec["condition_proxy"])
-    assert np.isfinite(volume["logdet_mean"])
+    assert np.isfinite(spec["rho_vol"])
+    assert np.isfinite(spec["rho_vol_q10"])
     assert hess["p99"] < 1e-4
+    assert "effective_rank_definition" in spec
+    assert "rho_vol_definition" in spec
+    assert "definitions" in spec
+    assert "Tr(g^2)" in spec["effective_rank_definition"]["formula"]
 
 
-def test_isotropic_mapping_has_high_rank_and_low_condition_proxy():
+def test_isotropic_mapping_has_high_rank_and_high_rho_vol():
     n, k = 32, 6
     z = np.linspace(-1.0, 1.0, n * k, dtype=np.float32).reshape(n, k)
     a = 2.0 * jnp.eye(k, dtype=jnp.float32)
@@ -67,11 +72,11 @@ def test_isotropic_mapping_has_high_rank_and_low_condition_proxy():
 
     spec = estimate_pullback_spectrum(decode_fn, z, np.zeros((1, 2), dtype=np.float32), config=_base_config(seed=7))
     assert spec["effective_rank"] > (k - 1.0)
-    assert spec["condition_proxy"] < 2.5
+    assert spec["rho_vol"] > 0.95
     assert spec["near_null_mass"] < 0.25
 
 
-def test_collapsed_decoder_triggers_near_null_mass():
+def test_collapsed_decoder_triggers_near_null_mass_and_low_rho_vol():
     key = jax.random.PRNGKey(5)
     n, k, m = 32, 8, 10
     z = np.asarray(jax.random.normal(key, (n, k), dtype=jnp.float32))
@@ -84,6 +89,7 @@ def test_collapsed_decoder_triggers_near_null_mass():
     spec = estimate_pullback_spectrum(decode_fn, z, np.zeros((1, 2), dtype=np.float32), config=_base_config(seed=19))
     assert spec["near_null_mass"] > 0.5
     assert spec["effective_rank"] < 2.0
+    assert spec["rho_vol"] < 0.35
 
 
 def test_seed_reproducibility_for_estimators():
@@ -113,4 +119,29 @@ def test_seed_reproducibility_for_estimators():
 
     assert np.allclose(spec_a["trace_g_samples"], spec_b["trace_g_samples"])
     assert np.allclose(spec_a["effective_rank_samples"], spec_b["effective_rank_samples"])
+    assert np.allclose(spec_a["rho_vol_samples"], spec_b["rho_vol_samples"])
     assert np.allclose(hess_a["hessian_frob_samples"], hess_b["hessian_frob_samples"])
+
+
+def test_hutchpp_trace_mode_produces_finite_metrics():
+    key = jax.random.PRNGKey(13)
+    n, k = 24, 5
+    z = np.asarray(jax.random.normal(key, (n, k), dtype=jnp.float32))
+    a = 1.5 * jnp.eye(k, dtype=jnp.float32)
+
+    def decode_fn(z_single, x_coords):
+        del x_coords
+        return a @ z_single
+
+    cfg = _base_config(seed=17).with_overrides(trace_estimator="hutchpp")
+    spec = estimate_pullback_spectrum(
+        decode_fn,
+        z,
+        np.zeros((1, 2), dtype=np.float32),
+        config=cfg,
+    )
+    assert np.isfinite(spec["trace_g"])
+    assert np.isfinite(spec["trace_g_sq"])
+    assert np.isfinite(spec["fro_norm_g"])
+    assert np.isfinite(spec["effective_rank"])
+    assert np.isfinite(spec["rho_vol"])

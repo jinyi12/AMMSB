@@ -33,7 +33,6 @@ R²_{W,f} = 1 - E[W₂²(f♯μ̂, f♯μ_ref)] / E[W₂²(f♯μ₀, f♯μ_ref
 from __future__ import annotations
 
 import argparse
-import ast
 import json
 import sys
 from pathlib import Path
@@ -41,7 +40,6 @@ from typing import Any
 
 import numpy as np
 import torch
-import torch.nn as nn
 from scipy.spatial.distance import cdist
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
@@ -50,54 +48,27 @@ if str(REPO_ROOT) not in sys.path:
 
 from data.multimarginal_generation import tran_filter_periodic
 from data.transform_utils import apply_inverse_transform, load_transform_info
+from scripts.fae.tran_evaluation.conditional_support import (
+    build_full_H_schedule,
+    knn_gaussian_weights,
+    make_pair_label,
+    normalise_weights,
+)
 from scripts.fae.fae_naive.fae_latent_utils import (
-    NoopTimeModule,
     build_attention_fae_from_checkpoint,
     load_fae_checkpoint,
     make_fae_apply_fns,
 )
+from scripts.fae.tran_evaluation.latent_msbm_runtime import (
+    build_latent_msbm_agent,
+    load_policy_checkpoints,
+    sample_backward_one_interval,
+)
+from scripts.fae.tran_evaluation.run_support import (
+    parse_key_value_args_file as parse_args_file,
+    resolve_existing_path,
+)
 from scripts.utils import get_device
-
-
-# ============================================================================
-# Shared helpers (from evaluate_conditional.py)
-# ============================================================================
-
-def parse_args_file(args_path: Path) -> dict[str, Any]:
-    if not args_path.exists():
-        raise FileNotFoundError(f"Args file not found at {args_path}")
-    parsed: dict[str, Any] = {}
-    for line in args_path.read_text().splitlines():
-        if "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        key, value = key.strip(), value.strip()
-        try:
-            parsed[key] = ast.literal_eval(value)
-        except Exception:
-            parsed[key] = value
-    return parsed
-
-
-def _normalise_weights(weights: np.ndarray | None, n: int) -> np.ndarray:
-    if weights is None:
-        return np.ones(n, dtype=np.float64) / float(n)
-    out = np.maximum(np.asarray(weights, dtype=np.float64).ravel(), 0.0)
-    s = float(out.sum())
-    return out / s if s > 0 else np.ones(n, dtype=np.float64) / float(n)
-
-
-def _knn_gaussian_weights(
-    query: np.ndarray, corpus: np.ndarray, k: int,
-) -> tuple[np.ndarray, np.ndarray]:
-    dists = np.linalg.norm(corpus - query[None, :], axis=1)
-    k_eff = max(1, min(k, len(dists)))
-    knn_idx = np.argpartition(dists, k_eff - 1)[:k_eff]
-    knn_dists = dists[knn_idx]
-    h = max(float(np.median(knn_dists)), 1e-12)
-    weights = np.exp(-knn_dists ** 2 / (2.0 * h ** 2))
-    weights /= weights.sum()
-    return knn_idx, weights
 
 
 # ============================================================================
@@ -113,8 +84,8 @@ def _w2_squared(
     """Compute W₂² between two empirical measures via exact OT (POT)."""
     import ot
 
-    wa = _normalise_weights(weights_a, len(samples_a))
-    wb = _normalise_weights(weights_b, len(samples_b))
+    wa = normalise_weights(weights_a, len(samples_a))
+    wb = normalise_weights(weights_b, len(samples_b))
     M2 = cdist(samples_a, samples_b, metric="sqeuclidean").astype(np.float64)
     return float(max(ot.emd2(wa, wb, M2), 0.0))
 
@@ -271,62 +242,6 @@ def _ae_diagnostic(
 
 
 # ============================================================================
-# MSBM agent reconstruction (from evaluate_conditional.py)
-# ============================================================================
-
-from mmsfm.latent_msbm import LatentMSBMAgent
-from mmsfm.latent_msbm.noise_schedule import (
-    ConstantSigmaSchedule,
-    ExponentialContractingSigmaSchedule,
-)
-
-
-def _build_t_dists_from_cfg(zt: np.ndarray, train_cfg: dict[str, Any]) -> np.ndarray:
-    zt_np = np.asarray(zt, dtype=np.float64).reshape(-1)
-    t_scale = float(train_cfg.get("t_scale", 1.0))
-    mode = str(train_cfg.get("time_dist_mode", "uniform")).lower()
-    if zt_np.size <= 1:
-        return np.zeros((int(zt_np.size),), dtype=np.float32)
-    if mode == "zt":
-        dz = zt_np - float(zt_np[0])
-        span = float(dz[-1])
-        if np.isfinite(span) and span > 0.0:
-            horizon = float((zt_np.size - 1) * t_scale)
-            return ((dz / span) * horizon).astype(np.float32)
-    return (np.linspace(0, zt_np.size - 1, zt_np.size, dtype=np.float64) * t_scale).astype(np.float32)
-
-
-@torch.no_grad()
-def _sample_backward_one_interval(
-    agent: LatentMSBMAgent,
-    policy: nn.Module,
-    z_start: torch.Tensor,
-    interval_idx: int,
-    n_realizations: int,
-    seed: int,
-    drift_clip_norm: float | None = None,
-) -> torch.Tensor:
-    ts_rel = agent.ts
-    num_intervals = int(agent.t_dists.numel() - 1)
-    if z_start.shape[0] == 1:
-        z_start = z_start.expand(n_realizations, -1)
-    results = []
-    for i in range(n_realizations):
-        torch.manual_seed(seed + i)
-        y = z_start[i:i + 1]
-        rev_i = (num_intervals - 1) - interval_idx
-        t0_rev = agent.t_dists[rev_i]
-        t1_rev = agent.t_dists[rev_i + 1]
-        _, y_end = agent.sde.sample_traj(
-            ts_rel, policy, y, t0_rev, t_final=t1_rev,
-            save_traj=False, drift_clip_norm=drift_clip_norm,
-            direction=getattr(policy, "direction", "backward"),
-        )
-        results.append(y_end)
-    return torch.cat(results, dim=0)
-
-
-# ============================================================================
 # CLI
 # ============================================================================
 
@@ -377,17 +292,19 @@ def main() -> None:
     train_cfg = parse_args_file(run_dir / "args.txt")
 
     # Build full H_schedule for coarsening
-    H_meso = [float(x) for x in args.H_meso_list.split(",")]
-    full_H_schedule = [0.0] + H_meso + [args.H_macro]
+    full_H_schedule = build_full_H_schedule(args.H_meso_list, args.H_macro)
     print(f"Full H_schedule: {full_H_schedule}")
 
     # ------------------------------------------------------------------
     # Load dataset
     # ------------------------------------------------------------------
-    dataset_path = args.dataset_path or train_cfg.get("data_path")
+    dataset_path = resolve_existing_path(
+        args.dataset_path or train_cfg.get("data_path"),
+        repo_root=REPO_ROOT,
+        roots=[run_dir, Path.cwd()],
+    )
     if dataset_path is None:
-        raise ValueError("Could not determine dataset path. Use --dataset_path.")
-    dataset_path = Path(dataset_path)
+        raise FileNotFoundError("Could not determine dataset path. Use --dataset_path.")
     print(f"Dataset: {dataset_path}")
 
     ds = np.load(dataset_path, allow_pickle=True)
@@ -452,7 +369,13 @@ def main() -> None:
     # ------------------------------------------------------------------
     # Load FAE encoder/decoder
     # ------------------------------------------------------------------
-    fae_checkpoint_path = Path(train_cfg["fae_checkpoint"])
+    fae_checkpoint_path = resolve_existing_path(
+        train_cfg.get("fae_checkpoint"),
+        repo_root=REPO_ROOT,
+        roots=[run_dir, Path.cwd()],
+    )
+    if fae_checkpoint_path is None:
+        raise FileNotFoundError("Could not resolve FAE checkpoint from args.txt")
     ckpt = load_fae_checkpoint(fae_checkpoint_path)
     autoencoder, fae_params, fae_batch_stats, _ = build_attention_fae_from_checkpoint(ckpt)
     encode_fn, decode_fn = make_fae_apply_fns(
@@ -462,73 +385,23 @@ def main() -> None:
         denoiser_noise_scale=float(args.denoiser_noise_scale),
     )
 
-    # ------------------------------------------------------------------
-    # Rebuild MSBM agent
-    # ------------------------------------------------------------------
-    t_dists_np = _build_t_dists_from_cfg(zt, train_cfg)
-    t_ref_default = float(max(1.0, float(t_dists_np[-1] - t_dists_np[0])))
-    var_time_ref_val = train_cfg.get("var_time_ref")
-    t_ref = float(var_time_ref_val) if var_time_ref_val is not None else t_ref_default
-
-    var_schedule = str(train_cfg.get("var_schedule", "constant"))
-    if var_schedule == "constant":
-        sigma_schedule = ConstantSigmaSchedule(float(train_cfg.get("var", 0.5)))
-    else:
-        sigma_schedule = ExponentialContractingSigmaSchedule(
-            sigma_0=float(train_cfg.get("var", 0.5)),
-            decay_rate=float(train_cfg.get("var_decay_rate", 2.0)),
-            t_ref=t_ref,
-        )
-
-    agent = LatentMSBMAgent(
-        encoder=NoopTimeModule(), decoder=NoopTimeModule(),
-        latent_dim=latent_dim,
-        zt=list(map(float, zt.tolist())),
-        initial_coupling=str(train_cfg.get("initial_coupling", "paired")),
-        hidden_dims=list(train_cfg.get("hidden", [256, 128, 64])),
-        time_dim=int(train_cfg.get("time_dim", 32)),
-        policy_arch=str(train_cfg.get("policy_arch", "film")),
-        var=float(train_cfg.get("var", 0.5)),
-        sigma_schedule=sigma_schedule,
-        t_scale=float(train_cfg.get("t_scale", 1.0)),
-        t_dists=t_dists_np,
-        interval=int(train_cfg.get("interval", 100)),
-        use_t_idx=bool(train_cfg.get("use_t_idx", False)),
-        lr=float(train_cfg.get("lr", 1e-4)),
-        lr_f=None, lr_b=None,
-        lr_gamma=float(train_cfg.get("lr_gamma", 0.999)),
-        lr_step=int(train_cfg.get("lr_step", 1000)),
-        optimizer=str(train_cfg.get("optimizer", "AdamW")),
-        weight_decay=float(train_cfg.get("weight_decay", 0.0)),
-        grad_clip=None, use_amp=False,
-        use_ema=bool(train_cfg.get("use_ema", True)),
-        ema_decay=float(train_cfg.get("ema_decay", 0.999)),
-        coupling_drift_clip_norm=None, drift_reg=0.0,
-        device=device,
+    agent = build_latent_msbm_agent(
+        train_cfg,
+        zt,
+        latent_dim,
+        device,
+        latent_train=latent_train,
+        latent_test=latent_test,
     )
-    agent.latent_train = torch.from_numpy(latent_train).float().to(device)
-    agent.latent_test = torch.from_numpy(latent_test).float().to(device)
-
-    # Load policy checkpoints
-    z_f_path = run_dir / "latent_msbm_policy_forward.pth"
-    z_b_path = run_dir / "latent_msbm_policy_backward.pth"
-    if not z_f_path.exists():
-        z_f_path = run_dir / "checkpoints" / "z_f.pt"
-        z_b_path = run_dir / "checkpoints" / "z_b.pt"
-    agent.z_f.load_state_dict(torch.load(z_f_path, map_location=device, weights_only=True))
-    agent.z_b.load_state_dict(torch.load(z_b_path, map_location=device, weights_only=True))
-
-    ema_f_path = run_dir / "latent_msbm_policy_forward_ema.pth"
-    ema_b_path = run_dir / "latent_msbm_policy_backward_ema.pth"
-    if not ema_f_path.exists():
-        ema_f_path = run_dir / "checkpoints" / "ema_z_f.pt"
-        ema_b_path = run_dir / "checkpoints" / "ema_z_b.pt"
-    if args.use_ema and ema_f_path.exists() and ema_b_path.exists():
-        agent.z_f.load_state_dict(torch.load(ema_f_path, map_location=device, weights_only=True))
-        agent.z_b.load_state_dict(torch.load(ema_b_path, map_location=device, weights_only=True))
-        agent.ema_f = None
-        agent.ema_b = None
-        print("Loaded EMA policy weights")
+    load_policy_checkpoints(
+        agent,
+        run_dir,
+        device,
+        use_ema=args.use_ema,
+        load_forward=True,
+        load_backward=True,
+        weights_only=True,
+    )
 
     # ------------------------------------------------------------------
     # Decode helper
@@ -601,12 +474,18 @@ def main() -> None:
     for pair_idx in range(T - 1):
         tidx_fine = int(time_indices[pair_idx])
         tidx_coarse = int(time_indices[pair_idx + 1])
-        pair_label = f"pair_{tidx_coarse}_to_{tidx_fine}"
-        H_coarse = full_H_schedule[tidx_coarse]
+        pair_label, H_coarse, H_fine, display_label = make_pair_label(
+            tidx_coarse=tidx_coarse,
+            tidx_fine=tidx_fine,
+            full_H_schedule=full_H_schedule,
+        )
 
         print(f"\n{'=' * 70}")
-        print(f"Scale pair: idx {tidx_coarse} -> {tidx_fine}  "
-              f"(H={H_coarse:.2f} -> H={full_H_schedule[tidx_fine]:.2f})")
+        print(
+            f"Scale pair: {display_label}  "
+            f"(modeled marginal {pair_idx + 2}/{T} -> {pair_idx + 1}/{T}, "
+            f"dataset idx {tidx_coarse} -> {tidx_fine})"
+        )
         print(f"{'=' * 70}")
 
         corpus_z_coarse = corpus_latents_by_tidx[tidx_coarse]
@@ -630,7 +509,7 @@ def main() -> None:
             z_test_coarse = latent_test[pair_idx + 1, test_idx]
 
             # --- k-NN reference ---
-            knn_idx, knn_weights = _knn_gaussian_weights(
+            knn_idx, knn_weights = knn_gaussian_weights(
                 z_test_coarse, corpus_z_coarse, args.k_neighbors,
             )
 
@@ -644,7 +523,7 @@ def main() -> None:
                 z_test_coarse[None, :],
             ).float().to(device)
 
-            z_gen = _sample_backward_one_interval(
+            z_gen = sample_backward_one_interval(
                 agent=agent, policy=agent.z_b,
                 z_start=z_start, interval_idx=pair_idx,
                 n_realizations=args.n_realizations,
@@ -728,7 +607,11 @@ def main() -> None:
             "tidx_coarse": tidx_coarse,
             "tidx_fine": tidx_fine,
             "H_coarse": H_coarse,
-            "H_fine": full_H_schedule[tidx_fine],
+            "H_fine": H_fine,
+            "display_label": display_label,
+            "modeled_marginal_coarse_order": int(pair_idx + 2),
+            "modeled_marginal_fine_order": int(pair_idx + 1),
+            "modeled_n_marginals": int(T),
             "R2_Wz": R2_Wz,
             "E_w2sq_z_gen": mean_w2sq_z_gen,
             "E_w2sq_z_null": mean_w2sq_z_null,
@@ -823,13 +706,20 @@ def main() -> None:
         "  R²_{W,z} : latent conditional skill (SDE kernel, no decoder)",
         "  Ẽ_coarse : normalized conditioning consistency (<1 = correct)",
         "  R²_{W,f} : perceptual/texture skill (PSD feature OT)",
+        "  pair_labels use physical H values; modeled marginal 1 is H=1 and the last modeled marginal is H=6",
+        "  for the default Tran ladder.",
         "",
         f"{'Pair':>14} | {'R²_Wz':>8} | {'Ẽ_coarse':>10} | {'R²_Wf':>8}",
         "-" * 50,
     ]
     for label, r in pair_results.items():
         summary_lines.append(
-            f"{label:>14} | {r['R2_Wz']:+8.4f} | {r['E_tilde_coarse']:10.4f} | "
+            f"{label}: {r['display_label']} "
+            f"(m{r['modeled_marginal_coarse_order']} -> m{r['modeled_marginal_fine_order']}, "
+            f"idx {r['tidx_coarse']} -> {r['tidx_fine']})"
+        )
+        summary_lines.append(
+            f"{'':>14} | {r['R2_Wz']:+8.4f} | {r['E_tilde_coarse']:10.4f} | "
             f"{r['R2_Wf']:+8.4f}"
         )
     summary_lines.extend([

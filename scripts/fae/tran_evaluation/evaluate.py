@@ -20,6 +20,14 @@ python scripts/fae/tran_evaluation/evaluate.py \\
     --n_realizations 200 \\
     --sample_idx 0
 
+Usage (trajectory-only unconditional knot evaluation)
+----------------------------------------------------
+python scripts/fae/tran_evaluation/evaluate.py \\
+    --run_dir results/2026-02-01T23-00-12-38 \\
+    --n_realizations 200 \\
+    --trajectory_only \\
+    --trajectory_seed_mode marginal
+
 Usage (legacy -- pre-generated trajectories)
 --------------------------------------------
 python scripts/fae/tran_evaluation/evaluate.py \\
@@ -55,7 +63,6 @@ trained to reconstruct it.
 from __future__ import annotations
 
 import argparse
-import ast
 import json
 import sys
 from pathlib import Path
@@ -90,6 +97,13 @@ from scripts.fae.tran_evaluation.first_order import (  # noqa: E402
 from scripts.fae.tran_evaluation.second_order import evaluate_second_order  # noqa: E402
 from scripts.fae.tran_evaluation.spectral import evaluate_spectral  # noqa: E402
 from scripts.fae.tran_evaluation.diversity import evaluate_diversity  # noqa: E402
+from scripts.fae.tran_evaluation.run_support import (  # noqa: E402
+    load_json_dict,
+    normalise_raw_list,
+    parse_key_value_args_file as parse_args_file,
+    resolve_existing_path,
+    resolve_held_out_indices,
+)
 from scripts.fae.tran_evaluation.report import (  # noqa: E402
     plot_conditioning,
     plot_conditioning_errors,
@@ -114,25 +128,6 @@ from scripts.fae.tran_evaluation.report import (  # noqa: E402
 )
 from scripts.images.field_visualization import format_for_paper  # noqa: E402
 
-
-def parse_args_file(args_path: Path) -> dict[str, Any]:
-    """Parse args.txt file with key=value format."""
-    if not args_path.exists():
-        raise FileNotFoundError(f"Args file not found at {args_path}")
-    parsed: dict[str, Any] = {}
-    for line in args_path.read_text().splitlines():
-        if "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        key = key.strip()
-        value = value.strip()
-        try:
-            parsed[key] = ast.literal_eval(value)
-        except Exception:
-            parsed[key] = value
-    return parsed
-
-
 def _save_generated_data_cache(path: Path, gen: dict[str, Any]) -> None:
     """Persist generated evaluation data for later plot-only reruns."""
     payload: dict[str, np.ndarray] = {}
@@ -141,8 +136,11 @@ def _save_generated_data_cache(path: Path, gen: dict[str, Any]) -> None:
         "realizations_log",
         "trajectory_fields_phys",
         "trajectory_fields_log",
+        "trajectory_fields_phys_all",
+        "trajectory_fields_log_all",
         "zt",
         "time_indices",
+        "trajectory_all_time_indices",
         "sample_indices",
     ):
         value = gen.get(key)
@@ -175,8 +173,11 @@ def _load_generated_data_cache(path: Path) -> dict[str, Any]:
             "realizations_log",
             "trajectory_fields_phys",
             "trajectory_fields_log",
+            "trajectory_fields_phys_all",
+            "trajectory_fields_log_all",
             "zt",
             "time_indices",
+            "trajectory_all_time_indices",
             "sample_indices",
         ):
             if key in data:
@@ -256,6 +257,13 @@ def _parse_args() -> argparse.Namespace:
         "--sample_idx", type=int, default=0,
         help="Ground-truth sample index for realisations.",
     )
+    p.add_argument(
+        "--trajectory_seed_mode", type=str, default="fixed",
+        choices=["fixed", "marginal"],
+        help="How to choose coarse latent states for backward trajectory generation. "
+             "'fixed' reuses --sample_idx; 'marginal' draws coarse samples from "
+             "the training marginal.",
+    )
 
     # --- Generation (run_dir mode) ---
     p.add_argument(
@@ -315,6 +323,12 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--no_plot", action="store_true")
     p.add_argument(
+        "--trajectory_only",
+        action="store_true",
+        help="Only compute/save native knot-time trajectory statistics and figures. "
+             "Skips Phases 1-6 and latent-geometry diagnostics.",
+    )
+    p.add_argument(
         "--no_latent_geometry",
         action="store_true",
         help="Disable Phase 7b latent-geometry robustness diagnostics.",
@@ -328,6 +342,8 @@ def _parse_args() -> argparse.Namespace:
     )
     p.add_argument("--latent_geom_n_samples", type=int, default=None)
     p.add_argument("--latent_geom_n_probes", type=int, default=None)
+    p.add_argument("--latent_geom_n_slq_probes", type=int, default=None)
+    p.add_argument("--latent_geom_n_lanczos_steps", type=int, default=None)
     p.add_argument("--latent_geom_n_hvp_probes", type=int, default=None)
     p.add_argument("--latent_geom_eps", type=float, default=1e-6)
     p.add_argument("--latent_geom_near_null_tau", type=float, default=1e-4)
@@ -412,60 +428,24 @@ def _discover_dataset_path(run_dir: Path) -> Path:
     )
 
 
-def _load_json_args(path: Path) -> dict[str, Any]:
-    if not path.exists():
-        return {}
-    with path.open("r") as f:
-        payload = json.load(f)
-    if not isinstance(payload, dict):
-        return {}
-    return payload
-
-
-def _resolve_existing_path(
-    raw_path: str | Path | None,
-    *,
-    roots: Optional[list[Path]] = None,
-) -> Optional[Path]:
-    if raw_path is None:
-        return None
-    raw = Path(str(raw_path))
-    candidates: list[Path] = [raw]
-    for root in roots or []:
-        candidates.append(root / raw)
-    candidates.append(REPO_ROOT / raw)
-
-    seen: set[Path] = set()
-    for candidate in candidates:
-        if candidate in seen:
-            continue
-        seen.add(candidate)
-        if candidate.exists():
-            return candidate.resolve()
-    return None
-
-
-def _normalise_raw_list(value: Any) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, (list, tuple, np.ndarray)):
-        return ",".join(str(v) for v in value)
-    return str(value)
-
-
 def _resolve_latent_geometry_inputs(
     args: argparse.Namespace,
     run_dir: Optional[Path],
 ) -> dict[str, Any]:
     train_cfg = parse_args_file(run_dir / "args.txt") if run_dir is not None else {}
-    fae_run_dir = _resolve_existing_path(args.latent_geom_fae_run_dir, roots=[Path.cwd()])
+    fae_run_dir = resolve_existing_path(
+        args.latent_geom_fae_run_dir,
+        repo_root=REPO_ROOT,
+        roots=[Path.cwd()],
+    )
     if fae_run_dir is not None and not fae_run_dir.is_dir():
         raise NotADirectoryError(f"--latent_geom_fae_run_dir is not a directory: {fae_run_dir}")
 
-    fae_cfg = _load_json_args(fae_run_dir / "args.json") if fae_run_dir is not None else {}
+    fae_cfg = load_json_dict(fae_run_dir / "args.json") if fae_run_dir is not None else {}
 
-    ckpt_path = _resolve_existing_path(
+    ckpt_path = resolve_existing_path(
         args.latent_geom_checkpoint,
+        repo_root=REPO_ROOT,
         roots=[p for p in [fae_run_dir, run_dir, Path.cwd()] if p is not None],
     )
     if ckpt_path is None and fae_run_dir is not None:
@@ -475,8 +455,9 @@ def _resolve_latent_geometry_inputs(
                 ckpt_path = candidate.resolve()
                 break
     if ckpt_path is None and "fae_checkpoint" in train_cfg:
-        ckpt_path = _resolve_existing_path(
+        ckpt_path = resolve_existing_path(
             str(train_cfg["fae_checkpoint"]),
+            repo_root=REPO_ROOT,
             roots=[p for p in [run_dir, Path.cwd()] if p is not None],
         )
     if ckpt_path is None:
@@ -488,23 +469,26 @@ def _resolve_latent_geometry_inputs(
         ckpt_parent = ckpt_path.parent
         if ckpt_parent.name == "checkpoints":
             inferred_run_dir = ckpt_parent.parent
-            inferred_cfg = _load_json_args(inferred_run_dir / "args.json")
+            inferred_cfg = load_json_dict(inferred_run_dir / "args.json")
             if inferred_cfg:
                 fae_run_dir = inferred_run_dir
                 fae_cfg = inferred_cfg
 
-    data_path = _resolve_existing_path(
+    data_path = resolve_existing_path(
         args.latent_geom_data_path,
+        repo_root=REPO_ROOT,
         roots=[p for p in [fae_run_dir, run_dir, Path.cwd()] if p is not None],
     )
     if data_path is None and "data_path" in fae_cfg:
-        data_path = _resolve_existing_path(
+        data_path = resolve_existing_path(
             str(fae_cfg["data_path"]),
+            repo_root=REPO_ROOT,
             roots=[p for p in [fae_run_dir, Path.cwd()] if p is not None],
         )
     if data_path is None and "data_path" in train_cfg:
-        data_path = _resolve_existing_path(
+        data_path = resolve_existing_path(
             str(train_cfg["data_path"]),
+            repo_root=REPO_ROOT,
             roots=[p for p in [run_dir, Path.cwd()] if p is not None],
         )
     if data_path is None:
@@ -540,11 +524,6 @@ def _compute_latent_geometry_results(
         build_attention_fae_from_checkpoint,
         load_fae_checkpoint,
     )
-    from scripts.fae.fae_naive.train_attention_components import (  # noqa: E402
-        load_dataset_metadata,
-        parse_held_out_indices_arg,
-        parse_held_out_times_arg,
-    )
     from scripts.fae.multiscale_dataset_naive import load_training_time_data_naive  # noqa: E402
     from scripts.fae.tran_evaluation.latent_geometry import (  # noqa: E402
         LatentGeometryConfig,
@@ -552,18 +531,11 @@ def _compute_latent_geometry_results(
     )
 
     resolved = _resolve_latent_geometry_inputs(args, run_dir)
-    raw_indices = _normalise_raw_list(resolved["held_out_indices_raw"]).strip()
-    raw_times = _normalise_raw_list(resolved["held_out_times_raw"]).strip()
-
-    held_out_indices: Optional[list[int]] = None
-    if raw_indices and raw_indices.lower() not in {"none", "null", "false", "no"}:
-        held_out_indices = parse_held_out_indices_arg(raw_indices)
-    elif raw_times and raw_times.lower() not in {"none", "null", "false", "no"}:
-        meta = load_dataset_metadata(str(resolved["data_path"]))
-        times_norm = meta.get("times_normalized")
-        if times_norm is None:
-            raise ValueError("Dataset missing times_normalized; cannot parse held_out_times.")
-        held_out_indices = parse_held_out_times_arg(raw_times, np.asarray(times_norm, dtype=np.float32))
+    held_out_indices = resolve_held_out_indices(
+        data_path=Path(resolved["data_path"]),
+        raw_indices=normalise_raw_list(resolved["held_out_indices_raw"]),
+        raw_times=normalise_raw_list(resolved["held_out_times_raw"]),
+    )
 
     time_data = load_training_time_data_naive(
         str(resolved["data_path"]),
@@ -594,6 +566,8 @@ def _compute_latent_geometry_results(
     ).with_overrides(
         n_samples=args.latent_geom_n_samples,
         n_probes=args.latent_geom_n_probes,
+        n_slq_probes=args.latent_geom_n_slq_probes,
+        n_lanczos_steps=args.latent_geom_n_lanczos_steps,
         n_hvp_probes=args.latent_geom_n_hvp_probes,
         eps=args.latent_geom_eps,
         near_null_tau=args.latent_geom_near_null_tau,
@@ -752,6 +726,7 @@ def main() -> None:
                 dataset_npz_path=ds_path,
                 n_realizations=args.n_realizations,
                 sample_idx=args.sample_idx,
+                sample_mode=args.trajectory_seed_mode,
                 seed=args.seed,
                 use_ema=args.use_ema,
                 drift_clip_norm=args.drift_clip_norm,
@@ -783,6 +758,9 @@ def main() -> None:
 
     K = gen["realizations_phys"].shape[0]
     print(f"\nLoaded/generated {K} realisations")
+    if args.trajectory_only:
+        args.no_latent_geometry = True
+        print("Trajectory-only mode enabled: skipping Phases 1-6 and latent geometry.")
 
     if time_indices is None:
         print("WARNING: time_indices not available; "
@@ -863,122 +841,134 @@ def main() -> None:
     print(f"Eval H_schedule: {eval_H_schedule}  ({n_eval_bands} detail bands)")
     print("  Excluded from evaluation: raw microscale index 0 and any held-out dataset indices")
 
-    # ---------------------------------------------------------------
-    # Phase 1: Conditioning consistency
-    # ---------------------------------------------------------------
-    print("\n--- Phase 1: Conditioning consistency ---")
+    cond = None
+    passed = None
+    first_order = {}
+    second_order = {}
+    spectral = {}
+    diversity = {}
+    micro_d = None
+    obs_single_details = {}
+    obs_ensemble_details = {}
+    gen_details = {}
 
-    cond = compute_conditioning_error(
-        gen["realizations_phys"],
-        gt_macro_sample,
-        eval_ladder,
-        macro_scale_idx=eval_macro_scale_idx,
-    )
-    passed = conditioning_pass(cond["mean"])
-    print(f"  Mean E^coarse = {cond['mean']:.6f}  "
-          f"({'PASS' if passed else 'FAIL'})")
+    if not args.trajectory_only:
+        # ---------------------------------------------------------------
+        # Phase 1: Conditioning consistency
+        # ---------------------------------------------------------------
+        print("\n--- Phase 1: Conditioning consistency ---")
 
-    # ---------------------------------------------------------------
-    # Phase 2: Detail field decomposition
-    # ---------------------------------------------------------------
-    print("\n--- Phase 2: Detail field decomposition ---")
+        cond = compute_conditioning_error(
+            gen["realizations_phys"],
+            gt_macro_sample,
+            eval_ladder,
+            macro_scale_idx=eval_macro_scale_idx,
+        )
+        passed = conditioning_pass(cond["mean"])
+        print(f"  Mean E^coarse = {cond['mean']:.6f}  "
+              f"({'PASS' if passed else 'FAIL'})")
 
-    # Observed detail: uses eval_gt_fields (remapped, excludes raw micro).
-    obs_single_details = build_observed_detail_fields(
-        eval_gt_fields, args.sample_idx, eval_ladder,
-    )
-    # Generated detail: filters gen field through eval_ladder
-    # (H=0 identity, then scales coarser than gen's native H=1.0D).
-    gen_details = build_generated_detail_fields(
-        gen["realizations_phys"], eval_ladder,
-    )
-    print(f"  {len(gen_details)} detail bands computed "
-          f"(scales {full_H_schedule[gt_micro_dataset_idx]:.2f} -> "
-          f"{full_H_schedule[gt_macro_dataset_idx]:.2f})")
+        # ---------------------------------------------------------------
+        # Phase 2: Detail field decomposition
+        # ---------------------------------------------------------------
+        print("\n--- Phase 2: Detail field decomposition ---")
 
-    # Ensemble of GT detail fields for distribution comparison.
-    obs_ensemble_details = build_observed_ensemble_detail_fields(
-        eval_gt_ensemble_fields,
-        max_samples=args.n_gt_neighbors,
-    )
+        # Observed detail: uses eval_gt_fields (remapped, excludes raw micro).
+        obs_single_details = build_observed_detail_fields(
+            eval_gt_fields, args.sample_idx, eval_ladder,
+        )
+        # Generated detail: filters gen field through eval_ladder
+        # (H=0 identity, then scales coarser than gen's native H=1.0D).
+        gen_details = build_generated_detail_fields(
+            gen["realizations_phys"], eval_ladder,
+        )
+        print(f"  {len(gen_details)} detail bands computed "
+              f"(scales {full_H_schedule[gt_micro_dataset_idx]:.2f} -> "
+              f"{full_H_schedule[gt_macro_dataset_idx]:.2f})")
 
-    # ---------------------------------------------------------------
-    # Phase 3: First-order statistics
-    # ---------------------------------------------------------------
-    print("\n--- Phase 3: First-order statistics (PDFs, W1) ---")
-
-    first_order = evaluate_first_order(
-        obs_ensemble_details,
-        gen_details,
-        resolution,
-        args.min_spacing_pixels,
-    )
-    for b in sorted(first_order.keys()):
-        w = first_order[b]["wasserstein1"]
-        samp = first_order[b]["sampling"]
-        print(f"  Band {b}: W1={w['w1']:.6f}  W1_norm={w['w1_normalised']:.6f}")
-        print(
-            "           "
-            f"spacing={int(samp['spacing_pixels'])} px  "
-            f"xi_obs=({samp['xi_e1_pixels']:.2f}, {samp['xi_e2_pixels']:.2f}) px"
+        # Ensemble of GT detail fields for distribution comparison.
+        obs_ensemble_details = build_observed_ensemble_detail_fields(
+            eval_gt_ensemble_fields,
+            max_samples=args.n_gt_neighbors,
         )
 
-    # ---------------------------------------------------------------
-    # Phase 4: Second-order statistics
-    # ---------------------------------------------------------------
-    print("\n--- Phase 4: Second-order statistics (R(tau), J) ---")
+        # ---------------------------------------------------------------
+        # Phase 3: First-order statistics
+        # ---------------------------------------------------------------
+        print("\n--- Phase 3: First-order statistics (PDFs, W1) ---")
 
-    second_order = evaluate_second_order(
-        obs_ensemble_details,
-        gen_details,
-        resolution,
-        pixel_size,
-    )
-    for b in sorted(second_order.keys()):
-        J = second_order[b]["J"]
-        print(f"  Band {b}: J_norm={J['J_normalised']:.6f}  "
-              f"(J_e1={J['J_e1']:.4f}, J_e2={J['J_e2']:.4f})")
+        first_order = evaluate_first_order(
+            obs_ensemble_details,
+            gen_details,
+            resolution,
+            args.min_spacing_pixels,
+        )
+        for b in sorted(first_order.keys()):
+            w = first_order[b]["wasserstein1"]
+            samp = first_order[b]["sampling"]
+            print(f"  Band {b}: W1={w['w1']:.6f}  W1_norm={w['w1_normalised']:.6f}")
+            print(
+                "           "
+                f"spacing={int(samp['spacing_pixels'])} px  "
+                f"xi_obs=({samp['xi_e1_pixels']:.2f}, {samp['xi_e2_pixels']:.2f}) px"
+            )
 
-    # ---------------------------------------------------------------
-    # Phase 5: PSD diagnostics
-    # ---------------------------------------------------------------
-    print("\n--- Phase 5: PSD diagnostics ---")
+        # ---------------------------------------------------------------
+        # Phase 4: Second-order statistics
+        # ---------------------------------------------------------------
+        print("\n--- Phase 4: Second-order statistics (R(tau), J) ---")
 
-    spectral = evaluate_spectral(
-        obs_ensemble_details,
-        gen_details,
-        resolution,
-        pixel_size,
-    )
-    for b in sorted(spectral.keys()):
-        s = spectral[b]
-        print(f"  Band {b}: dPSD={s['psd_mismatch']:.4f}  "
-              f"lam_obs={s['wavelength_obs']:.4f}  lam_gen={s['wavelength_gen']:.4f}")
+        second_order = evaluate_second_order(
+            obs_ensemble_details,
+            gen_details,
+            resolution,
+            pixel_size,
+        )
+        for b in sorted(second_order.keys()):
+            J = second_order[b]["J"]
+            print(f"  Band {b}: J_norm={J['J_normalised']:.6f}  "
+                  f"(J_e1={J['J_e1']:.4f}, J_e2={J['J_e2']:.4f})")
 
-    # ---------------------------------------------------------------
-    # Phase 6: Diversity
-    # ---------------------------------------------------------------
-    print("\n--- Phase 6: Diversity / collapse checks ---")
+        # ---------------------------------------------------------------
+        # Phase 5: PSD diagnostics
+        # ---------------------------------------------------------------
+        print("\n--- Phase 5: PSD diagnostics ---")
 
-    J_per_band = {
-        b: second_order[b]["J"]["J_normalised"]
-        for b in second_order.keys()
-    }
+        spectral = evaluate_spectral(
+            obs_ensemble_details,
+            gen_details,
+            resolution,
+            pixel_size,
+        )
+        for b in sorted(spectral.keys()):
+            s = spectral[b]
+            print(f"  Band {b}: dPSD={s['psd_mismatch']:.4f}  "
+                  f"lam_obs={s['wavelength_obs']:.4f}  lam_gen={s['wavelength_gen']:.4f}")
 
-    # GT ensemble at the correct scale (gen's native, NOT raw micro).
-    gt_micro_ens = eval_gt_ensemble_fields[0]
+        # ---------------------------------------------------------------
+        # Phase 6: Diversity
+        # ---------------------------------------------------------------
+        print("\n--- Phase 6: Diversity / collapse checks ---")
 
-    diversity = evaluate_diversity(
-        gen["realizations_phys"],
-        gen_details,
-        gt_fields_phys=gt_micro_ens,
-        gt_details=obs_ensemble_details,
-        J_per_band=J_per_band,
-    )
-    micro_d = diversity["microscale"]
-    print(f"  Microscale: mean_dist={micro_d['mean']:.6f}  CV={micro_d['cv']:.4f}")
-    if "diversity_ratio" in micro_d:
-        print(f"  Microscale diversity ratio: {micro_d['diversity_ratio']:.4f}")
+        J_per_band = {
+            b: second_order[b]["J"]["J_normalised"]
+            for b in second_order.keys()
+        }
+
+        # GT ensemble at the correct scale (gen's native, NOT raw micro).
+        gt_micro_ens = eval_gt_ensemble_fields[0]
+
+        diversity = evaluate_diversity(
+            gen["realizations_phys"],
+            gen_details,
+            gt_fields_phys=gt_micro_ens,
+            gt_details=obs_ensemble_details,
+            J_per_band=J_per_band,
+        )
+        micro_d = diversity["microscale"]
+        print(f"  Microscale: mean_dist={micro_d['mean']:.6f}  CV={micro_d['cv']:.4f}")
+        if "diversity_ratio" in micro_d:
+            print(f"  Microscale diversity ratio: {micro_d['diversity_ratio']:.4f}")
 
     # ---------------------------------------------------------------
     # Phase 7: Backward SDE trajectory evaluation
@@ -1098,7 +1088,7 @@ def main() -> None:
     # ---------------------------------------------------------------
     latent_geometry_results = None
     latent_geom_time_indices = None
-    if not args.no_latent_geometry:
+    if not args.no_latent_geometry and not args.trajectory_only:
         print("\n--- Phase 7b: Latent geometry robustness ---")
         try:
             latent_geometry_results, latent_geom_time_indices = _compute_latent_geometry_results(
@@ -1110,14 +1100,17 @@ def main() -> None:
         except Exception as exc:
             print(f"  WARNING: latent geometry phase skipped: {exc}")
 
-    print("\n--- Phase 8: Reporting ---")
+    if args.trajectory_only:
+        print("\n--- Phase 8: Trajectory-only reporting ---")
+    else:
+        print("\n--- Phase 8: Reporting ---")
 
-    summary = print_summary_table(
-        cond, first_order, second_order, spectral, diversity,
-    )
-    print(summary)
+        summary = print_summary_table(
+            cond, first_order, second_order, spectral, diversity,
+        )
+        print(summary)
 
-    (out_dir / "summary.txt").write_text(summary)
+        (out_dir / "summary.txt").write_text(summary)
 
     # JSON summary (scalars only).
     json_out = {
@@ -1125,6 +1118,8 @@ def main() -> None:
             "run_dir": str(run_dir) if run_dir else None,
             "sample_idx": args.sample_idx,
             "n_realizations": K,
+            "trajectory_only": args.trajectory_only,
+            "trajectory_seed_mode": args.trajectory_seed_mode,
             "gt_micro_dataset_idx": gt_micro_dataset_idx,
             "gt_macro_dataset_idx": gt_macro_dataset_idx,
             "time_indices": time_indices.tolist() if time_indices is not None else None,
@@ -1132,21 +1127,31 @@ def main() -> None:
             "eval_H_schedule": eval_H_schedule,
             "decode_mode": gen.get("decode_mode"),
             "denoiser_steps_schedule": gen.get("denoiser_steps_schedule"),
+            "sample_indices": (
+                gen.get("sample_indices").tolist()
+                if gen.get("sample_indices") is not None else None
+            ),
+            "latent_geom_time_indices": latent_geom_time_indices,
         },
-        "conditioning": {
-            "mean": cond["mean"], "median": cond["median"],
-            "std": cond["std"], "pass": passed,
-        },
+        "conditioning": None,
         "first_order": {},
         "second_order": {},
         "spectral": {},
-        "diversity": {
+        "diversity": None,
+        "latent_geometry": latent_geometry_results,
+        "trajectory": {},
+    }
+    if cond is not None:
+        json_out["conditioning"] = {
+            "mean": cond["mean"], "median": cond["median"],
+            "std": cond["std"], "pass": passed,
+        }
+    if micro_d is not None:
+        json_out["diversity"] = {
             "microscale_mean": micro_d["mean"],
             "microscale_cv": micro_d["cv"],
             "microscale_diversity_ratio": micro_d.get("diversity_ratio"),
-        },
-        "latent_geometry": latent_geometry_results,
-    }
+        }
     for b in sorted(first_order.keys()):
         w = first_order[b]["wasserstein1"]
         m = first_order[b]["moments"]
@@ -1176,8 +1181,6 @@ def main() -> None:
             "wavelength_gen": s["wavelength_gen"],
         }
 
-    # Trajectory metrics.
-    json_out["trajectory"] = {}
     for k in sorted(trajectory_results.keys()):
         tr = trajectory_results[k]
         ds_idx = int(time_indices[k])
@@ -1216,7 +1219,8 @@ def main() -> None:
 
     # Save full numpy arrays.
     npz_data = {}
-    npz_data["cond_errors"] = cond["per_realization"]
+    if cond is not None:
+        npz_data["cond_errors"] = cond["per_realization"]
     for b in sorted(second_order.keys()):
         npz_data[f"R_obs_e1_band{b}"] = second_order[b]["R_obs_e1"]
         npz_data[f"R_obs_e2_band{b}"] = second_order[b]["R_obs_e2"]
@@ -1253,70 +1257,93 @@ def main() -> None:
 
         format_for_paper()
 
-        # Filter generated fields at each eval scale for direct comparison.
-        gen_filtered = eval_ladder.filter_all_scales(gen["realizations_phys"])
-
         print("\nGenerating figures...")
 
-        # Fig 1: Conditioning (uses macro field — not affected by micro).
-        plot_conditioning(
-            gt_macro_sample, cond["filtered_macro"],
-            resolution, out_dir,
-        )
-        # Fig 1b: Conditioning error histogram (separate figure).
-        plot_conditioning_errors(cond["per_realization"], out_dir)
-        # Fig 2: Sample realisations vs GT at gen's native scale (NOT raw micro).
-        plot_sample_realizations(
-            gen["realizations_phys"], gt_micro_sample, resolution, out_dir,
-        )
-        # Figs 3-9: All use eval-scoped detail bands (raw micro excluded).
-        plot_detail_bands(obs_single_details, gen_details, resolution, out_dir,
-                          H_schedule=label_H_schedule)
-        plot_pdfs(first_order, out_dir,
-                  H_schedule=label_H_schedule)
-        plot_qq(first_order, out_dir, H_schedule=label_H_schedule)
-        plot_directional_correlation(second_order, pixel_size, out_dir,
-                                     H_schedule=label_H_schedule)
-        plot_J_bars(second_order, out_dir, H_schedule=label_H_schedule)
-        plot_psd(spectral, out_dir, H_schedule=label_H_schedule)
-        plot_diversity(diversity, out_dir)
+        if args.trajectory_only:
+            n_figs = 0
+            if trajectory_results:
+                plot_trajectory_pdfs(
+                    trajectory_results, time_indices, full_H_schedule, out_dir,
+                )
+                plot_trajectory_correlation(
+                    trajectory_results, time_indices, full_H_schedule,
+                    pixel_size, out_dir,
+                )
+                plot_trajectory_correlation_superposed(
+                    trajectory_results, time_indices, full_H_schedule,
+                    pixel_size, out_dir,
+                )
+                n_figs = 3
+        else:
+            # Filter generated fields at each eval scale for direct comparison.
+            gen_filtered = eval_ladder.filter_all_scales(gen["realizations_phys"])
 
-        # Figs 10-11: Direct-field (non-detail-band) comparisons.
-        plot_direct_field_pdfs(
-            eval_gt_ensemble_fields, gen_filtered, label_H_schedule, out_dir,
-            min_spacing_pixels=args.min_spacing_pixels,
-        )
-        plot_direct_field_correlation(
-            eval_gt_ensemble_fields, gen_filtered, label_H_schedule,
-            resolution, pixel_size, out_dir,
-        )
+            # Fig 1: Conditioning (uses macro field — not affected by micro).
+            plot_conditioning(
+                gt_macro_sample, cond["filtered_macro"],
+                resolution, out_dir,
+            )
+            # Fig 1b: Conditioning error histogram (separate figure).
+            plot_conditioning_errors(cond["per_realization"], out_dir)
+            # Fig 2: Sample realisations vs GT at gen's native scale (NOT raw micro).
+            plot_sample_realizations(
+                gen["realizations_phys"], gt_micro_sample, resolution, out_dir,
+            )
+            # Figs 3-9: All use eval-scoped detail bands (raw micro excluded).
+            plot_detail_bands(obs_single_details, gen_details, resolution, out_dir,
+                              H_schedule=label_H_schedule)
+            plot_pdfs(first_order, out_dir,
+                      H_schedule=label_H_schedule)
+            plot_qq(first_order, out_dir, H_schedule=label_H_schedule)
+            plot_directional_correlation(second_order, pixel_size, out_dir,
+                                         H_schedule=label_H_schedule)
+            plot_J_bars(second_order, out_dir, H_schedule=label_H_schedule)
+            plot_psd(spectral, out_dir, H_schedule=label_H_schedule)
+            plot_diversity(diversity, out_dir)
 
-        n_figs = 12
+            # Figs 10-11: Direct-field (non-detail-band) comparisons.
+            plot_direct_field_pdfs(
+                eval_gt_ensemble_fields, gen_filtered, label_H_schedule, out_dir,
+                min_spacing_pixels=args.min_spacing_pixels,
+            )
+            plot_direct_field_correlation(
+                eval_gt_ensemble_fields, gen_filtered, label_H_schedule,
+                resolution, pixel_size, out_dir,
+            )
 
-        # Figs 12-17: Backward SDE trajectory field evaluations.
-        if trajectory_results:
-            plot_trajectory_fields(
-                trajectory_fields, gt["fields_by_index"],
-                time_indices, full_H_schedule, resolution, out_dir,
-            )
-            plot_trajectory_pdfs(
-                trajectory_results, time_indices, full_H_schedule, out_dir,
-            )
-            plot_trajectory_correlation(
-                trajectory_results, time_indices, full_H_schedule,
-                pixel_size, out_dir,
-            )
-            plot_trajectory_correlation_superposed(
-                trajectory_results, time_indices, full_H_schedule,
-                pixel_size, out_dir,
-            )
-            plot_trajectory_psd(
-                trajectory_results, time_indices, full_H_schedule, out_dir,
-            )
-            plot_trajectory_qq(
-                trajectory_results, time_indices, full_H_schedule, out_dir,
-            )
-            n_figs += 6
+            n_figs = 12
+
+            # Figs 12-17: Backward SDE trajectory field evaluations.
+            if trajectory_results:
+                trajectory_fields_vis = gen.get("trajectory_fields_phys_all")
+                if trajectory_fields_vis is None:
+                    trajectory_fields_vis = trajectory_fields
+                trajectory_time_indices_vis = gen.get("trajectory_all_time_indices")
+                if trajectory_time_indices_vis is None:
+                    trajectory_time_indices_vis = time_indices
+                plot_trajectory_fields(
+                    trajectory_fields_vis, gt["fields_by_index"],
+                    trajectory_time_indices_vis, full_H_schedule, resolution, out_dir,
+                    held_out_indices=gt.get("held_out_indices"),
+                )
+                plot_trajectory_pdfs(
+                    trajectory_results, time_indices, full_H_schedule, out_dir,
+                )
+                plot_trajectory_correlation(
+                    trajectory_results, time_indices, full_H_schedule,
+                    pixel_size, out_dir,
+                )
+                plot_trajectory_correlation_superposed(
+                    trajectory_results, time_indices, full_H_schedule,
+                    pixel_size, out_dir,
+                )
+                plot_trajectory_psd(
+                    trajectory_results, time_indices, full_H_schedule, out_dir,
+                )
+                plot_trajectory_qq(
+                    trajectory_results, time_indices, full_H_schedule, out_dir,
+                )
+                n_figs += 6
 
         print(f"Saved {n_figs} figures to {out_dir}")
 
