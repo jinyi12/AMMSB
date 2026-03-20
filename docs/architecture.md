@@ -16,6 +16,7 @@ MMSFM/
 │   ├── noise_schedules.py          # Exponential/mini-flow schedules for latent flow
 │   ├── wandb_compat.py             # Optional W&B wrapper
 │   ├── latent_msbm/                # Latent-space Multi-marginal Schrödinger Bridge Matching
+│   │                               # Legacy PyTorch path kept for existing runs/evaluation
 │   │   ├── agent.py                # Main MSBM training agent
 │   │   ├── coupling.py             # Hybrid coupling sampler
 │   │   ├── policy.py               # MSBM policies (AugmentedMLP, FiLM)
@@ -24,6 +25,14 @@ MMSFM/
 │   │   └── utils.py                # Freeze/activate policy, EMA scope
 │   └── training/
 │       └── ema.py                  # Exponential Moving Average wrapper
+│
+├── csp/                            # Active conditional continuous-scale bridge package (JAX/Diffrax)
+│   ├── sde.py                      # Drift nets, embeddings, sigma schedules, interval integration
+│   ├── bridge_matching.py          # Conditional bridge-matching losses and training
+│   ├── conditional_training.py     # ECMMD-based conditional refinement training
+│   ├── sample.py                   # Unconditional and conditional rollout samplers
+│   ├── benchmark.py                # Hierarchical Gaussian benchmark and evaluation harness
+│   └── [other support modules]     # Bridge conditioning, models, layout, and metrics
 │
 ├── functional_autoencoders/        # [SUBMODULE — do not modify]
 │   └── src/functional_autoencoders/
@@ -63,6 +72,14 @@ MMSFM/
 │   ├── diversity.py                # Mode-collapse detection
 │   └── report.py                   # Visualization & reporting
 │
+├── scripts/csp/                    # CSP training, evaluation, caching, plotting, and launchers
+│   ├── train_csp.py                # Main conditional continuous-scale bridge training entrypoint
+│   ├── evaluate_csp.py             # Decoded mismatch evaluation and artifact generation
+│   ├── evaluate_csp_conditional.py # Latent conditional evaluation for CSP runs
+│   ├── build_eval_cache.py         # Shared decoded-cache builder used by evaluation
+│   ├── plot_csp_training.py        # Training-curve figure generation
+│   └── experiments/                # Curated shell launchers and output conventions
+│
 ├── notebooks/                      # Active analysis notebooks
 │   ├── fae_latent_msbm_latent_viz.py
 │   ├── visualize_field_trajectories.py
@@ -100,5 +117,8 @@ Dataset (multiscale_dataset_naive.py)
 
 - `scripts/fae/` depends on `functional_autoencoders` (submodule)
 - `scripts/fae/fae_naive/` depends on `scripts/fae/` (dataset, trainer)
-- `mmsfm/` is independent of FAE code (separate PyTorch stack)
+- `scripts/csp/` depends on `csp/` and curated latent archives or FAE run outputs
+- `csp/` is the primary home for new conditional multi-marginal bridge work
+- `mmsfm/latent_msbm/` remains for existing PyTorch runs and Tran-evaluation compatibility
+- `mmsfm/` is otherwise independent of FAE code (separate PyTorch stack)
 - `functional_autoencoders/` is read-only — never modify in this repo

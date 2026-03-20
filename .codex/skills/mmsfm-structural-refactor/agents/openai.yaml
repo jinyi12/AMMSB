@@ -1,0 +1,4 @@
+interface:
+  display_name: "MMSFM Structural Refactor"
+  short_description: "Refactor MMSFM safely and structurally"
+  default_prompt: "Use $mmsfm-structural-refactor to simplify this repository, reduce duplication, and add structure without touching protected areas."

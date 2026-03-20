@@ -1,0 +1,4 @@
+interface:
+  display_name: "MMSFM Experiment Registry"
+  short_description: "Keep experiment docs and pipelines aligned"
+  default_prompt: "Use $mmsfm-experiment-registry to update MMSFM experiment catalogs, registries, and pipeline docs consistently."
