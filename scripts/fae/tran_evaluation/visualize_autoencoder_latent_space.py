@@ -33,10 +33,11 @@ from scripts.fae.fae_naive.fae_latent_utils import (  # noqa: E402
     build_attention_fae_from_checkpoint,
     load_fae_checkpoint,
 )
-from scripts.fae.fae_naive.train_attention_components import (  # noqa: E402
-    load_dataset_metadata,
-    parse_held_out_indices_arg,
-    parse_held_out_times_arg,
+from scripts.fae.tran_evaluation.run_support import (  # noqa: E402
+    load_json_dict,
+    resolve_data_path_from_args_json,
+    resolve_held_out_indices,
+    resolve_run_checkpoint,
 )
 from scripts.fae.multiscale_dataset_naive import load_training_time_data_naive  # noqa: E402
 from scripts.images.field_visualization import format_for_paper  # noqa: E402
@@ -82,50 +83,6 @@ def _parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def _load_json(path: Path) -> dict[str, Any]:
-    if not path.exists():
-        return {}
-    payload = json.loads(path.read_text())
-    return payload if isinstance(payload, dict) else {}
-
-
-def _resolve_existing_path(raw_path: str | Path | None, roots: list[Path]) -> Optional[Path]:
-    if raw_path is None:
-        return None
-    raw = Path(str(raw_path))
-    candidates = [raw, REPO_ROOT / raw]
-    for root in roots:
-        candidates.append(root / raw)
-    for cand in candidates:
-        if cand.exists():
-            return cand.resolve()
-    return None
-
-
-def _resolve_checkpoint(run_dir: Path) -> Path:
-    args_json = _load_json(run_dir / "args.json")
-    if "fae_checkpoint" in args_json:
-        external = _resolve_existing_path(args_json["fae_checkpoint"], [run_dir, Path.cwd()])
-        if external is not None and external.exists():
-            return external
-    candidates = [
-        run_dir / "checkpoints" / "best_state.pkl",
-        run_dir / "checkpoints" / "state.pkl",
-    ]
-    for c in candidates:
-        if c.exists():
-            return c.resolve()
-    raise FileNotFoundError(f"No FAE checkpoint found in {run_dir}")
-
-
-def _normalise_raw_list(value: Any) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, (list, tuple, np.ndarray)):
-        return ",".join(str(v) for v in value)
-    return str(value)
-
-
 def _load_time_data(
     run_dir: Path,
     *,
@@ -133,27 +90,22 @@ def _load_time_data(
     max_samples_per_time: int,
     seed: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    args_json = _load_json(run_dir / "args.json")
-
-    data_path = _resolve_existing_path(args_json.get("data_path"), [run_dir, Path.cwd()])
-    if data_path is None:
-        raise FileNotFoundError(f"Could not resolve data_path from {run_dir / 'args.json'}")
+    args_json = load_json_dict(run_dir / "args.json")
+    data_path = resolve_data_path_from_args_json(
+        args_json,
+        run_dir=run_dir,
+        repo_root=REPO_ROOT,
+        roots=[Path.cwd()],
+    )
 
     train_ratio_raw = args_json.get("train_ratio", 0.8)
     train_ratio = 0.8 if train_ratio_raw is None else float(train_ratio_raw)
 
-    raw_indices = _normalise_raw_list(args_json.get("held_out_indices", "")).strip()
-    raw_times = _normalise_raw_list(args_json.get("held_out_times", "")).strip()
-
-    held_out_indices: Optional[list[int]] = None
-    if raw_indices and raw_indices.lower() not in {"none", "null", "false", "no"}:
-        held_out_indices = parse_held_out_indices_arg(raw_indices)
-    elif raw_times and raw_times.lower() not in {"none", "null", "false", "no"}:
-        meta = load_dataset_metadata(str(data_path))
-        times_norm = meta.get("times_normalized")
-        if times_norm is None:
-            raise ValueError(f"Dataset missing times_normalized for held_out_times in {run_dir}")
-        held_out_indices = parse_held_out_times_arg(raw_times, np.asarray(times_norm, dtype=np.float32))
+    held_out_indices = resolve_held_out_indices(
+        data_path=data_path,
+        raw_indices=args_json.get("held_out_indices", ""),
+        raw_times=args_json.get("held_out_times", ""),
+    )
 
     time_data = load_training_time_data_naive(
         str(data_path),
@@ -351,7 +303,7 @@ def main() -> None:
         if not run_dir.exists():
             raise FileNotFoundError(f"Run dir does not exist: {run_dir}")
 
-        args_json = _load_json(run_dir / "args.json")
+        args_json = load_json_dict(run_dir / "args.json")
         label = _model_label(args_json)
         run_tag = _safe_name(f"{label}_{run_dir.name}")
         run_out = out_dir / run_tag
@@ -360,7 +312,7 @@ def main() -> None:
         print(f"[{i}/{len(args.run_dirs)}] {run_dir}")
         print(f"  model: {label}")
 
-        ckpt_path = _resolve_checkpoint(run_dir)
+        ckpt_path = resolve_run_checkpoint(run_dir, repo_root=REPO_ROOT, roots=[Path.cwd()])
         print(f"  checkpoint: {ckpt_path}")
 
         fields_per_time, coords, time_indices, times_norm = _load_time_data(

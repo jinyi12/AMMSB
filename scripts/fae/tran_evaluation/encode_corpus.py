@@ -16,7 +16,6 @@ python scripts/fae/tran_evaluation/encode_corpus.py \
 from __future__ import annotations
 
 import argparse
-import ast
 import sys
 from pathlib import Path
 from typing import Any
@@ -33,24 +32,7 @@ from scripts.fae.fae_naive.fae_latent_utils import (
     make_fae_apply_fns,
 )
 from scripts.fae.multiscale_dataset_naive import load_training_time_data_naive
-
-
-def parse_args_file(args_path: Path) -> dict[str, Any]:
-    """Parse args.txt file with key=value format."""
-    if not args_path.exists():
-        raise FileNotFoundError(f"Args file not found at {args_path}")
-    parsed: dict[str, Any] = {}
-    for line in args_path.read_text().splitlines():
-        if "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        key = key.strip()
-        value = value.strip()
-        try:
-            parsed[key] = ast.literal_eval(value)
-        except Exception:
-            parsed[key] = value
-    return parsed
+from scripts.fae.tran_evaluation.run_support import parse_key_value_args_file as parse_args_file
 
 
 def main() -> None:

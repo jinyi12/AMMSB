@@ -15,7 +15,6 @@ python scripts/fae/generate_full_trajectories.py \\
 from __future__ import annotations
 
 import argparse
-import ast
 import pickle
 import sys
 from pathlib import Path
@@ -39,25 +38,11 @@ from scripts.fae.fae_naive.fae_latent_utils import (
     make_fae_decode_fn,
     parse_step_schedule,
 )
+from scripts.fae.tran_evaluation.run_support import (
+    build_internal_time_dists as _build_t_dists_from_cfg,
+    parse_key_value_args_file as parse_args_file,
+)
 from scripts.utils import get_device
-
-
-def parse_args_file(args_path: Path) -> dict[str, Any]:
-    """Parse args.txt file with key=value format."""
-    if not args_path.exists():
-        raise FileNotFoundError(f"Args file not found at {args_path}")
-    parsed: dict[str, Any] = {}
-    for line in args_path.read_text().splitlines():
-        if "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        key = key.strip()
-        value = value.strip()
-        try:
-            parsed[key] = ast.literal_eval(value)
-        except Exception:
-            parsed[key] = value
-    return parsed
 
 from mmsfm.latent_msbm import LatentMSBMAgent
 from mmsfm.latent_msbm.coupling import MSBMCouplingSampler
@@ -66,28 +51,6 @@ from mmsfm.latent_msbm.noise_schedule import (
     ExponentialContractingSigmaSchedule,
 )
 from mmsfm.latent_msbm.utils import ema_scope
-
-
-def _build_t_dists_from_cfg(zt: np.ndarray, train_cfg: dict[str, Any]) -> np.ndarray:
-    """Reconstruct MSBM internal times from saved training config."""
-    zt_np = np.asarray(zt, dtype=np.float64).reshape(-1)
-    t_scale = float(train_cfg.get("t_scale", 1.0))
-    mode = str(train_cfg.get("time_dist_mode", "uniform")).lower()
-
-    if zt_np.size <= 1:
-        return np.zeros((int(zt_np.size),), dtype=np.float32)
-
-    if mode == "zt":
-        dz = zt_np - float(zt_np[0])
-        span = float(dz[-1])
-        if np.isfinite(span) and span > 0.0:
-            horizon = float((zt_np.size - 1) * t_scale)
-            return ((dz / span) * horizon).astype(np.float32)
-        print("Warning: invalid/degenerate zt span; falling back to uniform t_dists.")
-    elif mode != "uniform":
-        print(f"Warning: unknown time_dist_mode='{mode}', falling back to uniform t_dists.")
-
-    return (np.linspace(0, zt_np.size - 1, zt_np.size, dtype=np.float64) * t_scale).astype(np.float32)
 
 
 def _parse_args() -> argparse.Namespace:

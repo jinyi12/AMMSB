@@ -17,7 +17,6 @@ composable. We still use this as an informative consistency check.
 from __future__ import annotations
 
 import argparse
-import ast
 import sys
 from pathlib import Path
 from typing import Any
@@ -41,24 +40,8 @@ from scripts.fae.fae_naive.fae_latent_utils import (
     load_fae_checkpoint,
     make_fae_apply_fns,
 )
+from scripts.fae.tran_evaluation.run_support import parse_key_value_args_file as _parse_args_file
 from scripts.utils import get_device
-
-
-def _parse_args_file(args_path: Path) -> dict[str, Any]:
-    if not args_path.exists():
-        raise FileNotFoundError(f"Args file not found at {args_path}")
-    parsed: dict[str, Any] = {}
-    for line in args_path.read_text().splitlines():
-        if "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        key = key.strip()
-        value = value.strip()
-        try:
-            parsed[key] = ast.literal_eval(value)
-        except Exception:
-            parsed[key] = value
-    return parsed
 
 
 def _infer_H_by_tidx(
