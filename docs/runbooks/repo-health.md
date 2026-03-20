@@ -22,9 +22,10 @@ python scripts/refactor_hotspots.py
 ## What `repo_health.py` Checks
 
 - required harness files such as `AGENTS.md`, `docs/index.md`, runbooks, Makefile, workflow, and repo-local skills
+- primary active docs for architecture, conventions, experiments, Tran evaluation, latent geometry, and publication workflows
 - repo-local skill installation surface via `scripts/install_repo_skills.py` and `make install-skills`
 - required Makefile targets
-- broken relative markdown links in the harness docs
+- broken relative markdown links in the harness docs and primary active workflow docs
 - large active Python files
 - repeated top-level helper names
 
@@ -46,8 +47,8 @@ Use it before structural cleanup in active areas, especially:
 
 The repository workflow lives at [../../.github/workflows/harness.yml](../../.github/workflows/harness.yml).
 
-It is intentionally lightweight:
+It is intentionally split by responsibility:
 
-- repo-health in strict mode
-- Ruff
-- focused harness and Tran-evaluation support tests
+- `harness`: repo-health in strict mode, Ruff, and harness-only tests
+- `tran-eval`: local install, Tran-evaluation smoke checks, and focused Tran-evaluation tests
+- `csp`: CSP-capable install, CSP smoke checks, and CSP tests

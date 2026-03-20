@@ -9,7 +9,9 @@ dependencies = [
     "scipy==1.13.0",
     "tqdm==4.66.4",
     "matplotlib==3.8.4",
+    "colormaps==0.5.0",
     "scikit-learn==1.4.2",
+    "umap-learn==0.5.9.post2",
     "pillow==10.3.0",
     "scanpy==1.10.1",
     "pot==0.9.3",
@@ -20,6 +22,13 @@ dependencies = [
     "torchdiffeq==0.2.3",
     "torchsde==0.2.6",
     "wandb==0.19.3",
+]
+
+[project.optional-dependencies]
+csp = [
+    "diffrax==0.7.2",
+    "equinox==0.13.6",
+    "optax==0.2.6",
 ]
 
 [tool.setuptools.packages.find]
@@ -40,5 +49,4 @@ select = ["E", "W", "F", "I"]
 ignore = ["F722", "E501"]
 
 [tool.ruff.lint.isort]
-known-first-party = ["mmsfm"]
-
+known-first-party = ["csp", "mmsfm", "scripts"]

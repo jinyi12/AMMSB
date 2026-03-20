@@ -14,7 +14,7 @@ Preferred setup:
 make install-csp
 ```
 
-This installs the project together with the optional JAX, Equinox, Diffrax, and Optax stack required by the CSP package and entrypoints.
+This installs the base repo environment together with the optional JAX, Equinox, Diffrax, and Optax stack required by the CSP package and entrypoints.
 
 ## Validation
 

@@ -21,20 +21,34 @@ jobs:
           python -m pip install pytest numpy scipy ruff
 
       - name: Repo health
-        run: python scripts/repo_health.py --strict
+        run: make repo-health && python scripts/repo_health.py --strict
 
       - name: Ruff
         run: ruff check mmsfm/ csp/ scripts/ tests/
 
-      - name: Focused harness tests
+      - name: Harness tests
+        run: make test-harness
+
+  tran-eval:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Tran-evaluation dependencies
         run: |
-          pytest -q \
-            tests/test_install_repo_skills.py \
-            tests/test_harness_inventory.py \
-            tests/test_repo_health.py \
-            tests/test_tran_evaluation_run_support.py \
-            tests/test_tran_evaluation_conditional_support.py \
-            tests/test_tran_evaluation_conditional_metrics.py
+          python -m pip install --upgrade pip
+          make install-local
+
+      - name: Tran-evaluation smoke checks
+        run: make smoke-tran-eval
+
+      - name: Tran-evaluation tests
+        run: make test-tran-eval
 
   csp:
     runs-on: ubuntu-latest
@@ -49,7 +63,7 @@ jobs:
       - name: Install CSP validation dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -e ".[csp]"
+          make install-csp
 
       - name: CSP smoke checks
         run: make smoke-csp

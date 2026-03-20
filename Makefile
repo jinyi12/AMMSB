@@ -8,7 +8,7 @@ help:
 	@printf "Available targets:\n"
 	@printf "  setup              - provision the full repo environment via make_venv.sh\n"
 	@printf "  install-local      - install local Python dependencies into the current environment\n"
-	@printf "  install-csp        - install optional CSP Python dependencies into the current environment\n"
+	@printf "  install-csp        - install the base repo environment plus optional CSP Python dependencies\n"
 	@printf "  install-skills     - install repo-local Codex skills into the global discovery directory\n"
 	@printf "  lint               - run Ruff on active code surfaces\n"
 	@printf "  check              - run the legacy validation script\n"
@@ -28,7 +28,7 @@ install-local:
 	$(PYTHON) -m pip install -r requirements.txt
 	$(PYTHON) -m pip install -e .
 
-install-csp:
+install-csp: install-local
 	$(PYTHON) -m pip install -e ".[csp]"
 
 install-skills:
@@ -57,16 +57,24 @@ test-tran-eval:
 		tests/test_tran_evaluation_run_support.py \
 		tests/test_tran_evaluation_conditional_support.py \
 		tests/test_tran_evaluation_conditional_metrics.py \
-		tests/test_tran_evaluation_latent_msbm_runtime.py
+		tests/test_tran_evaluation_latent_msbm_runtime.py \
+		tests/test_tran_evaluation_statistics.py \
+		tests/test_latent_geometry_model_comparison.py \
+		tests/test_latent_geometry.py
 
 test-csp:
 	$(PYTEST) -q tests/test_csp.py
 
 smoke-tran-eval:
 	$(PYTHON) scripts/fae/tran_evaluation/evaluate.py --help >/dev/null
+	$(PYTHON) scripts/fae/tran_evaluation/generate.py --help >/dev/null
 	$(PYTHON) scripts/fae/tran_evaluation/evaluate_conditional.py --help >/dev/null
 	$(PYTHON) scripts/fae/tran_evaluation/evaluate_conditional_diagnostic.py --help >/dev/null
+	$(PYTHON) scripts/fae/tran_evaluation/evaluate_postfiltered_consistency.py --help >/dev/null
 	$(PYTHON) scripts/fae/tran_evaluation/compare_latent_geometry_models.py --help >/dev/null
+	$(PYTHON) scripts/fae/tran_evaluation/encode_corpus.py --help >/dev/null
+	$(PYTHON) scripts/fae/tran_evaluation/visualize_latent_msbm_manifold.py --help >/dev/null
+	$(PYTHON) scripts/fae/tran_evaluation/visualize_conditional_latent_projections.py --help >/dev/null
 
 smoke-csp:
 	$(PYTHON) scripts/csp/train_csp.py --help >/dev/null

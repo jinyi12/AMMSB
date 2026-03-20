@@ -18,20 +18,62 @@ The result is a single, continuous model of the system's dynamics that can gener
 
 > *Example trajectories for a 32x32 pixel image progression through the Imagenette classes (gas pump $\\to$ golf ball $\\to$ parachute). [cite\_start]Results are generated using our Triplet ($k=2$) model with an equidistant time scheme[cite: 262, 268].*
 
+## Active Repo Workflow
+
+This repository now contains active MMSFM, latent-MSBM, FAE, CSP, and evaluation code alongside historical paper-era paths. Start with the repository harness rather than jumping directly into the archived workflows later in this README.
+
+- Agent and repo map: [AGENTS.md](AGENTS.md)
+- Docs index: [docs/index.md](docs/index.md)
+- Bootstrap runbook: [docs/runbooks/bootstrap.md](docs/runbooks/bootstrap.md)
+- CSP runbook: [docs/runbooks/csp.md](docs/runbooks/csp.md)
+- Tran evaluation runbook: [docs/runbooks/tran-evaluation.md](docs/runbooks/tran-evaluation.md)
+
+Canonical commands:
+
+```bash
+make repo-health
+make lint
+make test-tran-eval
+make smoke-tran-eval
+make test-csp
+make smoke-csp
+```
+
+Skill discovery sync:
+
+```bash
+make install-skills
+```
+
+Environment setup:
+
+```bash
+make setup
+# or, when the environment is already provisioned:
+make install-local
+# or, for CSP work in a fresh environment:
+make install-csp
+```
+
+The archive-oriented MMSFM training flows are still documented below, but they are no longer the only active control surface in the repository.
+
 ## Repository Structure
 
 ```
 .
 ├── data/
 │   └── datagen.py                    # Script to download and preprocess datasets
+├── csp/                              # Conditional Schrodinger bridge package
 ├── mmsfm/
 │   ├── models/
 │   │   └── models.py                 # Network architectures
 │   ├── multimarginal_cfm.py          # Core implementation of multi-marginal flow matcher w/ splines
 │   └── multimarginal_otsampler.py    # Implementation of (ordered) multi-marginal optimal transport
-├── scripts/                          # Active scripts (FAE + shared helpers)
+├── scripts/                          # Active scripts (FAE, CSP, and shared helpers)
 │   ├── utils.py
 │   ├── fae/                          # Functional autoencoder (FAE) experiments
+│   │   └── tran_evaluation/          # Tran-aligned evaluation package and CLIs
+│   ├── csp/                          # CSP training and evaluation entrypoints
 │   └── images/
 │       └── field_visualization.py    # Shared visualization utilities (used by FAE eval)
 ├── archive/2026-02-16_non_fae_scripts/ # Legacy (non-FAE) training scripts

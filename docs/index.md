@@ -13,6 +13,7 @@ This directory is the repository system of record. Start with the short map in [
 - [evaluation_pipeline.md](evaluation_pipeline.md) for the latent-MSBM and Tran evaluation scripts
 - [runbooks/csp.md](runbooks/csp.md) for the active CSP package, bridge-training entrypoints, and validation commands
 - [experiments/index.md](experiments/index.md) for experiment catalog and registries
+- [publication_fae_figures_execution.md](publication_fae_figures_execution.md) for the FAE publication figure wrapper
 - [publication_figures.md](publication_figures.md) for figure inventory and style conventions
 - [publication_latent128_msbm_execution.md](publication_latent128_msbm_execution.md) for the publication pipeline that combines latent geometry and latent MSBM
 
@@ -37,4 +38,3 @@ This directory is the repository system of record. Start with the short map in [
 - [references/](references/)
 - [latent_geometry_formulation.md](latent_geometry_formulation.md)
 - [latent_geometry_plotting.md](latent_geometry_plotting.md)
-- [page-2026-03-20-18-05-19.md](page-2026-03-20-18-05-19.md)

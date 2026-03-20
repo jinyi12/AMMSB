@@ -5,9 +5,13 @@ set -e
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 
+echo "=== Repository health ==="
+python scripts/repo_health.py || echo "Repository harness reported issues"
+
+echo ""
 echo "=== Ruff lint check ==="
 if command -v ruff &>/dev/null; then
-    ruff check mmsfm/ scripts/fae/ tests/ --exit-zero
+    ruff check mmsfm/ csp/ scripts/ tests/ --exit-zero
 else
     echo "ruff not installed, skipping lint"
 fi

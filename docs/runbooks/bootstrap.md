@@ -16,7 +16,7 @@ Preferred commands:
 
 `make install-local` installs the repo into the current environment without downloading archived external repos. Use it when the environment is already provisioned.
 
-`make install-csp` installs the optional CSP Python dependencies from `pyproject.toml`. Use it when working in `csp/` or `scripts/csp/`.
+`make install-csp` installs the base repo environment plus the optional CSP Python dependencies from `pyproject.toml`. Use it when working in `csp/` or `scripts/csp/`, or when you want a fresh environment that can immediately run `make smoke-csp` and `make test-csp`.
 
 ## First Checks
 
