@@ -54,7 +54,7 @@ from functional_autoencoders.losses.fae import get_loss_fae_fn
 from functional_autoencoders.positional_encodings import RandomFourierEncoding
 from functional_autoencoders.train.metrics import Metric
 
-from scripts.fae.dataset_metadata import (
+from mmsfm.fae.dataset_metadata import (
     load_dataset_metadata,
     parse_held_out_indices_arg,
     parse_held_out_times_arg,
@@ -67,7 +67,7 @@ from scripts.fae.pointset_reconstruction import (
     evaluate_pointset_reconstruction as evaluate_train_reconstruction,
     visualize_pointset_reconstructions as visualize_sample_reconstructions,
 )
-from scripts.fae.wandb_trainer import WandbAutoencoderTrainer
+from mmsfm.fae.wandb_trainer import WandbAutoencoderTrainer
 
 
 # ---------------------------------------------------------------------------

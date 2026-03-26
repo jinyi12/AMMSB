@@ -14,7 +14,7 @@ if str(_REPO_ROOT) not in sys.path:
 jax = pytest.importorskip("jax")
 jnp = pytest.importorskip("jax.numpy")
 
-from scripts.fae.fae_naive.spacetime_geometry_jax import (
+from mmsfm.fae.spacetime_geometry_jax import (
     GaussianCorruptionSchedule,
     VPScheduleLogSNR,
     expectation_parameters_from_denoiser,

@@ -15,11 +15,18 @@ if str(_REPO_ROOT) not in sys.path:
 jax = pytest.importorskip("jax")
 jnp = pytest.importorskip("jax.numpy")
 
-from scripts.fae.fae_naive.diffusion_denoiser_decoder import (
-    get_ntk_scaled_denoiser_loss_fn,
+from mmsfm.fae.fae_training_components import build_autoencoder
+from mmsfm.fae.latent_diffusion_prior import (
+    LatentDiffusionPrior,
+    get_film_prior_loss_fn,
+    get_ntk_scaled_film_prior_loss_fn,
 )
-from scripts.fae.fae_naive.ntk_losses import get_ntk_scaled_loss_fn
-from scripts.fae.fae_naive.train_attention_components import build_autoencoder
+from mmsfm.fae.ntk_losses import get_ntk_scaled_loss_fn
+from mmsfm.fae.transformer_dit_prior import (
+    TransformerDiTPrior,
+    get_ntk_scaled_transformer_prior_loss_fn,
+    get_transformer_prior_loss_fn,
+)
 
 
 def _make_tiny_batch(key, *, batch_size=2, n_enc=6, n_dec=7):
@@ -117,9 +124,9 @@ def test_ntk_scaled_loss_multi_probe_path_runs_and_is_finite():
     assert np.isfinite(float(ntk["weight"]))
 
 
-def test_ntk_scaled_denoiser_loss_updates_on_interval_and_reuses_between_updates():
-    key = jax.random.PRNGKey(1)
-    key, k_model, k_batch, k_init, k_step1, k_step2 = jax.random.split(key, 6)
+def test_ntk_scaled_loss_fhutch_path_runs_and_is_finite():
+    key = jax.random.PRNGKey(12)
+    key, k_model, k_batch, k_init, k_step = jax.random.split(key, 5)
 
     autoencoder, _ = build_autoencoder(
         k_model,
@@ -130,24 +137,141 @@ def test_ntk_scaled_denoiser_loss_updates_on_interval_and_reuses_between_updates
         pooling_type="deepset",
         encoder_mlp_dim=16,
         encoder_mlp_layers=1,
-        decoder_type="denoiser_standard",
-        denoiser_time_emb_dim=8,
-        denoiser_scaling=1.0,
-        denoiser_diffusion_steps=8,
-        denoiser_beta_schedule="cosine",
-        denoiser_norm="none",
+        decoder_type="standard",
+    )
+    u_enc, x_enc, u_dec, x_dec = _make_tiny_batch(k_batch)
+
+    variables = autoencoder.init(k_init, u_enc, x_enc, x_dec, train=True)
+    params = variables["params"]
+    batch_stats = variables.get("batch_stats", {})
+
+    loss_fn = get_ntk_scaled_loss_fn(
+        autoencoder=autoencoder,
+        beta=1e-4,
+        trace_update_interval=1,
+        hutchinson_probes=2,
+        trace_estimator="fhutch",
+        output_chunk_size=8,  # ignored for fhutch; should still run.
+    )
+
+    _loss, bs = loss_fn(params, k_step, batch_stats, u_enc, x_enc, u_dec, x_dec)
+    ntk = bs["ntk"]
+    assert int(ntk["is_trace_update"]) == 1
+    assert np.isfinite(float(ntk["trace"]))
+    assert np.isfinite(float(ntk["weight"]))
+
+
+def test_film_prior_velocity_from_x0_prediction_matches_linear_flow_formula():
+    prior = LatentDiffusionPrior(
+        hidden_dim=16,
+        n_layers=1,
+        time_emb_dim=8,
+        prior_logsnr_max=5.0,
+    )
+    z_clean = jnp.arange(8, dtype=jnp.float32).reshape(2, 4) / 10.0
+    noise = jnp.flip(z_clean, axis=-1) + 0.5
+    t = jnp.array([0.25, 0.6], dtype=jnp.float32)
+
+    z_t = prior.mix_latent(z_clean, t, noise)
+    pred_velocity = prior.velocity_from_x0_prediction(z_t, z_clean, t)
+    target_velocity = prior.closed_form_velocity_target(z_clean, noise)
+
+    t_b = t.reshape(2, 1)
+    x1_pred = (z_t - (1.0 - t_b) * z_clean) / t_b
+    endpoint_velocity = (x1_pred - z_t) / (1.0 - t_b)
+
+    np.testing.assert_allclose(pred_velocity, target_velocity, rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(pred_velocity, endpoint_velocity, rtol=1e-6, atol=1e-6)
+
+
+def test_film_prior_l2_loss_runs_and_is_finite():
+    key = jax.random.PRNGKey(13)
+    key, k_model, k_batch, k_init, k_prior, k_step = jax.random.split(key, 6)
+
+    autoencoder, _ = build_autoencoder(
+        k_model,
+        latent_dim=4,
+        n_freqs=8,
+        fourier_sigma=1.0,
+        decoder_features=(16, 16),
+        pooling_type="deepset",
+        encoder_mlp_dim=16,
+        encoder_mlp_layers=1,
+        decoder_type="film",
+        film_norm_type="none",
     )
     u_enc, x_enc, u_dec, x_dec = _make_tiny_batch(k_batch)
     variables = autoencoder.init(k_init, u_enc, x_enc, x_dec, train=True)
     params = variables["params"]
     batch_stats = variables.get("batch_stats", {})
 
-    loss_fn = get_ntk_scaled_denoiser_loss_fn(
+    prior = LatentDiffusionPrior(
+        hidden_dim=16,
+        n_layers=1,
+        time_emb_dim=8,
+        prior_logsnr_max=5.0,
+    )
+    prior_variables = prior.init(k_prior, jnp.zeros((1, 4)), jnp.zeros((1,)))
+    params = dict(params)
+    params["prior"] = prior_variables["params"]
+
+    loss_fn = get_film_prior_loss_fn(
         autoencoder=autoencoder,
         beta=0.0,
-        velocity_weight=1.0,
-        x0_weight=0.0,
-        ambient_weight=0.0,
+        prior=prior,
+        prior_weight=1.0,
+    )
+
+    loss, updated_batch_stats = loss_fn(
+        params,
+        key=k_step,
+        batch_stats=batch_stats,
+        u_enc=u_enc,
+        x_enc=x_enc,
+        u_dec=u_dec,
+        x_dec=x_dec,
+    )
+
+    assert np.isfinite(float(loss))
+    assert set(updated_batch_stats.keys()) == {"encoder", "decoder"}
+
+
+def test_ntk_scaled_film_prior_loss_updates_on_interval_and_reuses_between_updates():
+    key = jax.random.PRNGKey(1)
+    key, k_model, k_batch, k_init, k_prior, k_step1, k_step2 = jax.random.split(key, 7)
+
+    autoencoder, _ = build_autoencoder(
+        k_model,
+        latent_dim=4,
+        n_freqs=8,
+        fourier_sigma=1.0,
+        decoder_features=(16, 16),
+        pooling_type="deepset",
+        encoder_mlp_dim=16,
+        encoder_mlp_layers=1,
+        decoder_type="film",
+        film_norm_type="none",
+    )
+    u_enc, x_enc, u_dec, x_dec = _make_tiny_batch(k_batch)
+    variables = autoencoder.init(k_init, u_enc, x_enc, x_dec, train=True)
+    params = variables["params"]
+    batch_stats = variables.get("batch_stats", {})
+
+    prior = LatentDiffusionPrior(
+        hidden_dim=16,
+        n_layers=1,
+        time_emb_dim=8,
+        prior_logsnr_max=5.0,
+    )
+    prior_variables = prior.init(k_prior, jnp.zeros((1, 4)), jnp.zeros((1,)))
+    params = dict(params)
+    params["prior"] = prior_variables["params"]
+
+    loss_fn = get_ntk_scaled_film_prior_loss_fn(
+        autoencoder=autoencoder,
+        beta=0.0,
+        prior=prior,
+        prior_weight=1.0,
         trace_update_interval=2,
         hutchinson_probes=2,
     )
@@ -183,3 +307,139 @@ def test_ntk_scaled_denoiser_loss_updates_on_interval_and_reuses_between_updates
 
     expected_keys = {"step", "trace", "trace_ema", "total_trace_est", "weight", "is_trace_update"}
     assert set(ntk2.keys()) == expected_keys
+
+
+def test_transformer_dit_prior_l2_loss_runs_and_is_finite():
+    key = jax.random.PRNGKey(20)
+    key, k_model, k_batch, k_init, k_prior, k_step = jax.random.split(key, 6)
+
+    autoencoder, _ = build_autoencoder(
+        k_model,
+        latent_dim=32,
+        n_freqs=8,
+        fourier_sigma=1.0,
+        decoder_features=(16, 16),
+        encoder_type="transformer",
+        decoder_type="transformer",
+        transformer_emb_dim=8,
+        transformer_num_latents=4,
+        transformer_encoder_depth=1,
+        transformer_cross_attn_depth=1,
+        transformer_decoder_depth=1,
+        transformer_mlp_ratio=2,
+        transformer_tokenization="points",
+        n_heads=2,
+    )
+    u_enc, x_enc, u_dec, x_dec = _make_tiny_batch(k_batch)
+    variables = autoencoder.init(k_init, u_enc, x_enc, x_dec, train=True)
+    params = variables["params"]
+    batch_stats = variables.get("batch_stats", {})
+
+    prior = TransformerDiTPrior(
+        hidden_dim=16,
+        n_layers=1,
+        num_heads=4,
+        mlp_ratio=2.0,
+        time_emb_dim=8,
+        prior_logsnr_max=5.0,
+    )
+    prior_variables = prior.init(k_prior, jnp.zeros((1, 4, 8)), jnp.zeros((1,)))
+    params = dict(params)
+    params["prior"] = prior_variables["params"]
+
+    loss_fn = get_transformer_prior_loss_fn(
+        autoencoder=autoencoder,
+        beta=0.0,
+        prior=prior,
+        prior_weight=1.0,
+    )
+
+    loss, updated_batch_stats = loss_fn(
+        params,
+        key=k_step,
+        batch_stats=batch_stats,
+        u_enc=u_enc,
+        x_enc=x_enc,
+        u_dec=u_dec,
+        x_dec=x_dec,
+    )
+
+    assert np.isfinite(float(loss))
+    assert set(updated_batch_stats.keys()) == {"encoder", "decoder"}
+
+
+def test_ntk_scaled_transformer_dit_prior_loss_updates_and_records_ntk_state():
+    key = jax.random.PRNGKey(21)
+    key, k_model, k_batch, k_init, k_prior, k_step1, k_step2 = jax.random.split(key, 7)
+
+    autoencoder, _ = build_autoencoder(
+        k_model,
+        latent_dim=32,
+        n_freqs=8,
+        fourier_sigma=1.0,
+        decoder_features=(16, 16),
+        encoder_type="transformer",
+        decoder_type="transformer",
+        transformer_emb_dim=8,
+        transformer_num_latents=4,
+        transformer_encoder_depth=1,
+        transformer_cross_attn_depth=1,
+        transformer_decoder_depth=1,
+        transformer_mlp_ratio=2,
+        transformer_tokenization="points",
+        n_heads=2,
+    )
+    u_enc, x_enc, u_dec, x_dec = _make_tiny_batch(k_batch)
+    variables = autoencoder.init(k_init, u_enc, x_enc, x_dec, train=True)
+    params = variables["params"]
+    batch_stats = variables.get("batch_stats", {})
+
+    prior = TransformerDiTPrior(
+        hidden_dim=16,
+        n_layers=1,
+        num_heads=4,
+        mlp_ratio=2.0,
+        time_emb_dim=8,
+        prior_logsnr_max=5.0,
+    )
+    prior_variables = prior.init(k_prior, jnp.zeros((1, 4, 8)), jnp.zeros((1,)))
+    params = dict(params)
+    params["prior"] = prior_variables["params"]
+
+    loss_fn = get_ntk_scaled_transformer_prior_loss_fn(
+        autoencoder=autoencoder,
+        beta=0.0,
+        prior=prior,
+        prior_weight=1.0,
+        trace_update_interval=2,
+        hutchinson_probes=2,
+    )
+
+    _loss1, bs1 = loss_fn(
+        params,
+        key=k_step1,
+        batch_stats=batch_stats,
+        u_enc=u_enc,
+        x_enc=x_enc,
+        u_dec=u_dec,
+        x_dec=x_dec,
+    )
+    _loss2, bs2 = loss_fn(
+        params,
+        key=k_step2,
+        batch_stats=bs1,
+        u_enc=u_enc,
+        x_enc=x_enc,
+        u_dec=u_dec,
+        x_dec=x_dec,
+    )
+
+    ntk1 = bs1["ntk"]
+    ntk2 = bs2["ntk"]
+    assert int(ntk1["step"]) == 1
+    assert int(ntk2["step"]) == 2
+    assert int(ntk1["is_trace_update"]) == 1
+    assert int(ntk2["is_trace_update"]) == 0
+    assert np.isclose(float(ntk2["trace"]), float(ntk1["trace"]), rtol=1e-6, atol=1e-8)
+    assert np.isfinite(float(ntk1["trace"]))
+    assert np.isfinite(float(ntk1["weight"]))

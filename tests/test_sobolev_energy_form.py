@@ -4,7 +4,7 @@ import numpy as np
 
 
 def _mean_sum_sq(x: jax.Array) -> jax.Array:
-    # Match the convention used in scripts/fae/fae_naive/sobolev_losses.py:
+    # Match the convention used in mmsfm/fae/sobolev_losses.py:
     # sum over channels, mean over batch+points.
     return jnp.mean(jnp.sum(x**2, axis=-1))
 
@@ -60,4 +60,3 @@ def test_sobolev_energy_and_residual_have_same_grad_wrt_prediction():
     grad_eng = jax.grad(energy_loss)(v0)
 
     np.testing.assert_allclose(np.array(grad_res), np.array(grad_eng), rtol=1e-6, atol=1e-6)
-

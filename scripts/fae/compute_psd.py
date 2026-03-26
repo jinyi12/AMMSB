@@ -51,8 +51,8 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from scripts.fae.fae_naive.fae_latent_utils import (
-    build_attention_fae_from_checkpoint,
+from mmsfm.fae.fae_latent_utils import (
+    build_fae_from_checkpoint,
     load_fae_checkpoint,
     make_fae_apply_fns,
 )
@@ -248,17 +248,12 @@ def main() -> None:
     parser.add_argument("--n-samples", type=int, default=128)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument(
-        "--denoiser-decode-mode",
+        "--decode-mode",
         type=str,
-        default="multistep",
-        choices=["auto", "one_step", "multistep", "standard"],
-        help=(
-            "Decode mode for denoiser checkpoints. Use 'multistep' for faithful "
-            "evaluation sweeps over --denoiser-num-steps."
-        ),
+        default="standard",
+        choices=["standard"],
+        help="Decode mode for active deterministic checkpoints.",
     )
-    parser.add_argument("--denoiser-num-steps", type=int, default=32)
-    parser.add_argument("--denoiser-noise-scale", type=float, default=1.0)
     parser.add_argument("--include-t0", action="store_true", default=False)
     parser.add_argument("--out", type=str, required=True, help="Output npz path (psd_data.npz)")
     parser.add_argument("--metrics-out", type=str, required=True, help="Output json path")
@@ -283,14 +278,12 @@ def main() -> None:
         print(f"\n[{label}] {run_dir}")
         ckpt_path = _resolve_ckpt(run_dir)
         ckpt = load_fae_checkpoint(ckpt_path)
-        autoencoder, params, batch_stats, meta = build_attention_fae_from_checkpoint(ckpt)
+        autoencoder, params, batch_stats, meta = build_fae_from_checkpoint(ckpt)
         encode_fn, decode_fn = make_fae_apply_fns(
             autoencoder,
             params,
             batch_stats,
-            decode_mode=str(args.denoiser_decode_mode),
-            denoiser_num_steps=int(args.denoiser_num_steps),
-            denoiser_noise_scale=float(args.denoiser_noise_scale),
+            decode_mode=str(args.decode_mode),
         )
 
         npz_data, run_args = _load_run_data(run_dir)
@@ -427,9 +420,7 @@ def main() -> None:
             "loss_type": run_args.get("loss_type"),
             "optimizer": run_args.get("optimizer"),
             "decoder_multiscale_sigmas": run_args.get("decoder_multiscale_sigmas"),
-            "eval_denoiser_num_steps": int(args.denoiser_num_steps),
-            "eval_denoiser_noise_scale": float(args.denoiser_noise_scale),
-            "eval_denoiser_decode_mode": str(args.denoiser_decode_mode),
+            "eval_decode_mode": str(args.decode_mode),
             "psd_log_l2_global": _log_psd_distance(run_psd_gt, run_psd_recon),
             "psd_log_l2_mid": _log_psd_distance_band(run_psd_gt, run_psd_recon, 3, 24),
             "psd_log_l2_high": _log_psd_distance_band(run_psd_gt, run_psd_recon, 24, min(64, len(run_psd_gt))),

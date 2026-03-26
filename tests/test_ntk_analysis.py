@@ -20,18 +20,18 @@ jax = pytest.importorskip("jax")
 jnp = pytest.importorskip("jax.numpy")
 
 # Both analysis modules must be importable
-from scripts.fae.fae_naive.analyze_ntk_spectrum import (
+from scripts.fae.analyze_ntk_spectrum import (
     compute_ntk_matrix,
     estimate_ntk_trace_exact_diag,
     make_synthetic_scale_batch,
     run_spectrum_analysis,
 )
-from scripts.fae.fae_naive.analyze_ntk_constancy import (
+from scripts.fae.analyze_ntk_constancy import (
     frobenius_norm,
     relative_frobenius_drift,
     run_constancy_analysis,
 )
-from scripts.fae.fae_naive.train_attention_components import build_autoencoder
+from mmsfm.fae.fae_training_components import build_autoencoder
 
 
 # ---------------------------------------------------------------------------

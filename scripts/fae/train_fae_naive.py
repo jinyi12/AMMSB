@@ -51,12 +51,12 @@ from functional_autoencoders.positional_encodings import RandomFourierEncoding
 from functional_autoencoders.train.metrics import Metric
 from functional_autoencoders.util.networks.pooling import DeepSetPooling
 
-from scripts.fae.dataset_metadata import (
+from mmsfm.fae.dataset_metadata import (
     load_dataset_metadata,
     parse_held_out_indices_arg,
     parse_held_out_times_arg,
 )
-from scripts.fae.multiscale_dataset_naive import (
+from mmsfm.fae.multiscale_dataset_naive import (
     MultiscaleFieldDatasetNaive,
     load_held_out_data_naive,
     load_training_time_data_naive,
@@ -65,7 +65,7 @@ from scripts.fae.pointset_reconstruction import (
     evaluate_pointset_reconstruction as evaluate_train_reconstruction,
     visualize_pointset_reconstructions as visualize_sample_reconstructions,
 )
-from scripts.fae.wandb_trainer import WandbAutoencoderTrainer
+from mmsfm.fae.wandb_trainer import WandbAutoencoderTrainer
 
 
 # ---------------------------------------------------------------------------

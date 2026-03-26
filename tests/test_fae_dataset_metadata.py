@@ -10,7 +10,7 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from scripts.fae.dataset_metadata import (
+from mmsfm.fae.dataset_metadata import (
     load_dataset_metadata,
     parse_held_out_indices_arg,
     parse_held_out_times_arg,

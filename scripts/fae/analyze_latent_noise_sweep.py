@@ -130,7 +130,7 @@ def compute_reconstruction_mse(
     """Encode test set and decode; return per-time and overall MSE."""
     import jax
     import jax.numpy as jnp
-    from scripts.fae.fae_naive.fae_latent_utils import make_fae_apply_fns
+    from mmsfm.fae.fae_latent_utils import make_fae_apply_fns
 
     encode_fn, decode_fn = make_fae_apply_fns(
         autoencoder, params, batch_stats, decode_mode="standard",
@@ -161,7 +161,7 @@ def compute_latent_codes(
     autoencoder, params, batch_stats, fields, coords, batch_size: int = 32,
 ):
     """Encode fields and return latent codes (T, N, K)."""
-    from scripts.fae.fae_naive.fae_latent_utils import make_fae_apply_fns
+    from mmsfm.fae.fae_latent_utils import make_fae_apply_fns
 
     encode_fn, _ = make_fae_apply_fns(
         autoencoder, params, batch_stats, decode_mode="standard",
@@ -223,7 +223,7 @@ def compute_jacobian_trace(
     """Estimate E[Tr(J^T J)] of the decoder via Hutchinson probes."""
     import jax
     import jax.numpy as jnp
-    from scripts.fae.fae_naive.fae_latent_utils import make_fae_apply_fns
+    from mmsfm.fae.fae_latent_utils import make_fae_apply_fns
 
     encode_fn, _ = make_fae_apply_fns(
         autoencoder, params, batch_stats, decode_mode="standard",
@@ -305,7 +305,7 @@ def compute_collapse_diagnostic(
     batch_size: int = 32, n_samples: int = 64,
 ):
     """Compare full-model MSE vs zero-latent MSE to detect collapse."""
-    from scripts.fae.fae_naive.fae_latent_utils import make_fae_apply_fns
+    from mmsfm.fae.fae_latent_utils import make_fae_apply_fns
 
     encode_fn, decode_fn = make_fae_apply_fns(
         autoencoder, params, batch_stats, decode_mode="standard",
@@ -451,8 +451,8 @@ def main():
     )
 
     # Lazy imports (JAX can be slow to start)
-    from scripts.fae.fae_naive.fae_latent_utils import (
-        build_attention_fae_from_checkpoint,
+    from mmsfm.fae.fae_latent_utils import (
+        build_fae_from_checkpoint,
         load_fae_checkpoint,
     )
 
@@ -464,7 +464,7 @@ def main():
         print(f"{'='*60}")
 
         ckpt = load_fae_checkpoint(run["ckpt_path"])
-        autoencoder, params, batch_stats, meta = build_attention_fae_from_checkpoint(ckpt)
+        autoencoder, params, batch_stats, meta = build_fae_from_checkpoint(ckpt)
 
         print("  Computing reconstruction MSE ...")
         overall_mse, per_time_mse = compute_reconstruction_mse(
