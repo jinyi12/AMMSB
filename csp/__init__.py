@@ -1,15 +1,4 @@
-from .conditional_models import (
-    ConditionalMLP,
-    IntervalConditionalModelStack,
-    build_interval_conditional_mlp_stack,
-    sample_interval_conditionals,
-    sample_rollouts as sample_interval_rollouts,
-)
-from .conditional_training import (
-    make_interval_conditional_ecmmd_loss_fn,
-    train_interval_conditional_ecmmd,
-)
-from ._conditional_bridge import BRIDGE_CONDITION_MODES, bridge_condition_dim
+from ._conditional_bridge import BRIDGE_CONDITION_MODES, bridge_condition_dim, bridge_condition_uses_global_state
 from .bridge_matching import make_bridge_matching_loss_fn, train_bridge_matching
 from .benchmark import (
     HIERARCHICAL_GAUSSIAN_BENCHMARK_NAME,
@@ -26,12 +15,13 @@ from .benchmark import (
     sample_hierarchical_gaussian_rollouts,
     wasserstein1_wasserstein2_latents,
 )
-from .ecmmd import ecmmd_loss
 from .sample import sample_batch, sample_conditional_batch, sample_conditional_trajectory, sample_trajectory
 from .sde import (
     ConditionalDriftNet,
+    ConditionalTransformerDriftNet,
     DriftNet,
     build_conditional_drift_model,
+    build_conditional_transformer_drift_model,
     build_drift_model,
     constant_sigma,
     exp_contract_sigma,
@@ -39,23 +29,27 @@ from .sde import (
     integrate_interval,
     sinusoidal_embedding,
 )
-from .train import train
+from .token_bridge_matching import make_token_bridge_matching_loss_fn, train_token_bridge_matching
+from .token_dit import TokenBridgeCondition, TokenConditionalDiT, build_token_conditional_dit
+from .token_sample import sample_token_conditional_batch, sample_token_conditional_trajectory
 
 __all__ = [
     "HIERARCHICAL_GAUSSIAN_BENCHMARK_NAME",
     "HierarchicalGaussianBenchmarkConfig",
     "HierarchicalGaussianPathProblem",
-    "ConditionalMLP",
     "ConditionalDriftNet",
+    "ConditionalTransformerDriftNet",
+    "TokenBridgeCondition",
+    "TokenConditionalDiT",
     "BRIDGE_CONDITION_MODES",
     "DriftNet",
-    "IntervalConditionalModelStack",
     "build_conditional_drift_model",
+    "build_conditional_transformer_drift_model",
+    "build_token_conditional_dit",
     "bridge_condition_dim",
+    "bridge_condition_uses_global_state",
     "build_drift_model",
-    "build_interval_conditional_mlp_stack",
     "constant_sigma",
-    "ecmmd_loss",
     "evaluate_hierarchical_gaussian_sampler_benchmark",
     "evaluate_hierarchical_gaussian_benchmark",
     "exp_contract_sigma",
@@ -65,20 +59,19 @@ __all__ = [
     "integrate_conditional_interval",
     "integrate_interval",
     "make_bridge_matching_loss_fn",
+    "make_token_bridge_matching_loss_fn",
     "make_hierarchical_gaussian_benchmark_splits",
-    "make_interval_conditional_ecmmd_loss_fn",
     "sample_hierarchical_gaussian_dataset",
     "sample_hierarchical_gaussian_interval",
     "sample_batch",
     "sample_conditional_batch",
     "sample_conditional_trajectory",
+    "sample_token_conditional_batch",
+    "sample_token_conditional_trajectory",
     "sample_hierarchical_gaussian_rollouts",
     "sample_trajectory",
-    "sample_interval_conditionals",
-    "sample_interval_rollouts",
     "sinusoidal_embedding",
-    "train",
     "train_bridge_matching",
-    "train_interval_conditional_ecmmd",
+    "train_token_bridge_matching",
     "wasserstein1_wasserstein2_latents",
 ]

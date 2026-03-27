@@ -6,8 +6,8 @@ import jax
 import jax.numpy as jnp
 
 
-BridgeConditionMode = Literal["previous_state", "global_and_previous"]
-BRIDGE_CONDITION_MODES = ("previous_state", "global_and_previous")
+BridgeConditionMode = Literal["coarse_only", "previous_state", "global_and_previous"]
+BRIDGE_CONDITION_MODES = ("coarse_only", "previous_state", "global_and_previous")
 
 
 def validate_bridge_condition_mode(condition_mode: str) -> BridgeConditionMode:
@@ -17,6 +17,11 @@ def validate_bridge_condition_mode(condition_mode: str) -> BridgeConditionMode:
             f"condition_mode must be one of {BRIDGE_CONDITION_MODES}, got {condition_mode!r}."
         )
     return mode  # type: ignore[return-value]
+
+
+def bridge_condition_uses_global_state(condition_mode: str) -> bool:
+    mode = validate_bridge_condition_mode(condition_mode)
+    return mode in {"coarse_only", "global_and_previous"}
 
 
 def bridge_condition_dim(
@@ -34,7 +39,7 @@ def bridge_condition_dim(
     if num_intervals_int <= 0:
         raise ValueError(f"num_intervals must be positive, got {num_intervals}.")
 
-    if mode == "previous_state":
+    if mode in {"coarse_only", "previous_state"}:
         dim = latent_dim_int
     else:
         dim = 2 * latent_dim_int
@@ -76,7 +81,9 @@ def make_bridge_condition(
             f"got {global_arr.shape} and {previous_arr.shape}."
         )
 
-    if mode == "previous_state":
+    if mode == "coarse_only":
+        parts = [global_arr]
+    elif mode == "previous_state":
         parts = [previous_arr]
     else:
         parts = [global_arr, previous_arr]

@@ -7,8 +7,6 @@ import sys
 from pathlib import Path
 from typing import Any
 
-# Keep JAX decoding on CPU by default so mixed Torch/JAX environments remain
-# stable during evaluation cache construction.
 os.environ.setdefault("JAX_PLATFORM_NAME", "cpu")
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
@@ -20,52 +18,30 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from csp import sample_batch, sample_conditional_batch
+from csp import sample_token_conditional_batch
 from data.transform_utils import apply_inverse_transform
-from scripts.csp.run_context import load_csp_sampling_runtime, load_fae_decode_context
+from scripts.csp.token_run_context import load_token_csp_sampling_runtime, load_token_fae_decode_context
 
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Build an evaluate.py-compatible decoded cache from a trained CSP run.",
+        description="Build an evaluate.py-compatible decoded cache from a trained token-native CSP run.",
     )
-    parser.add_argument("--run_dir", type=str, required=True, help="Completed CSP run directory.")
+    parser.add_argument("--run_dir", type=str, required=True, help="Completed token-native CSP run directory.")
     parser.add_argument(
         "--output_dir",
         type=str,
         default=None,
         help="Defaults to <run_dir>/eval/n{n_realizations}/cache.",
     )
-    parser.add_argument("--n_realizations", type=int, default=512, help="Number of CSP samples to generate.")
-    parser.add_argument("--seed", type=int, default=0, help="PRNG seed for coarse-seed selection and sampling.")
-    parser.add_argument(
-        "--coarse_split",
-        choices=("train", "test"),
-        default="train",
-        help="Which latent split provides coarse seeds.",
-    )
-    parser.add_argument(
-        "--coarse_selection",
-        choices=("random", "leading"),
-        default="random",
-        help="How to choose coarse seeds from the selected split.",
-    )
-    parser.add_argument("--dataset_path", type=str, default=None, help="Optional dataset override.")
-    parser.add_argument("--latents_path", type=str, default=None, help="Optional latent archive override.")
-    parser.add_argument(
-        "--fae_checkpoint",
-        type=str,
-        default=None,
-        help="Optional FAE checkpoint override for decode/runtime reconstruction.",
-    )
-    parser.add_argument("--decode_batch_size", type=int, default=64, help="Batch size for FAE decoding.")
-    parser.add_argument(
-        "--decode_mode",
-        type=str,
-        default="standard",
-        choices=["standard"],
-        help="FAE decode mode for active deterministic checkpoints.",
-    )
+    parser.add_argument("--n_realizations", type=int, default=512)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--coarse_split", choices=("train", "test"), default="train")
+    parser.add_argument("--coarse_selection", choices=("random", "leading"), default="random")
+    parser.add_argument("--dataset_path", type=str, default=None)
+    parser.add_argument("--latents_path", type=str, default=None)
+    parser.add_argument("--fae_checkpoint", type=str, default=None)
+    parser.add_argument("--decode_batch_size", type=int, default=64)
     parser.add_argument(
         "--no_clip_to_dataset_range",
         action="store_true",
@@ -97,35 +73,7 @@ def _select_seed_indices(
     return rng.choice(n_available, size=n_use, replace=replace).astype(np.int64)
 
 
-def _sample_latent_trajectories(
-    runtime: Any,
-    coarse_seeds: np.ndarray,
-    *,
-    seed: int,
-) -> np.ndarray:
-    if runtime.model_type == "conditional_bridge":
-        traj = sample_conditional_batch(
-            runtime.model,
-            jnp.asarray(coarse_seeds, dtype=jnp.float32),
-            jnp.asarray(runtime.archive.zt, dtype=jnp.float32),
-            runtime.sigma_fn,
-            float(runtime.dt0),
-            jax.random.PRNGKey(int(seed)),
-            condition_mode=str(runtime.condition_mode),
-        )
-    else:
-        traj = sample_batch(
-            runtime.model,
-            jnp.asarray(coarse_seeds, dtype=jnp.float32),
-            jnp.asarray(runtime.tau_knots, dtype=jnp.float32),
-            runtime.sigma_fn,
-            float(runtime.dt0),
-            jax.random.PRNGKey(int(seed)),
-        )
-    return np.asarray(traj, dtype=np.float32)
-
-
-def build_eval_cache(
+def build_eval_cache_token_dit(
     *,
     run_dir: Path,
     output_dir: Path,
@@ -137,10 +85,9 @@ def build_eval_cache(
     latents_override: str | None = None,
     fae_checkpoint_override: str | None = None,
     decode_batch_size: int = 64,
-    decode_mode: str = "standard",
     clip_to_dataset_range: bool = True,
 ) -> dict[str, Any]:
-    runtime = load_csp_sampling_runtime(
+    runtime = load_token_csp_sampling_runtime(
         run_dir,
         dataset_override=dataset_override,
         latents_override=latents_override,
@@ -157,12 +104,12 @@ def build_eval_cache(
 
     if runtime.source.fae_checkpoint_path is None:
         raise ValueError(
-            "The CSP run does not record a resolvable FAE checkpoint. "
+            "The token-native CSP run does not record a resolvable FAE checkpoint. "
             "Set --fae_checkpoint or train the run with archive/checkpoint provenance."
         )
 
     print("============================================================", flush=True)
-    print("CSP evaluation cache", flush=True)
+    print("Token-native CSP evaluation cache", flush=True)
     print(f"  run_dir         : {runtime.source.run_dir}", flush=True)
     print(f"  output_dir      : {output_dir}", flush=True)
     print(f"  model_type      : {runtime.model_type}", flush=True)
@@ -174,13 +121,23 @@ def build_eval_cache(
     print(f"  n_realizations  : {n_realizations}", flush=True)
     print("============================================================", flush=True)
 
-    traj_np = _sample_latent_trajectories(runtime, coarse_seeds, seed=int(seed))  # (N, T, K)
-    latent_knots = np.transpose(traj_np, (1, 0, 2))  # (T, N, K)
+    traj_np = np.asarray(
+        sample_token_conditional_batch(
+            runtime.model,
+            jnp.asarray(coarse_seeds, dtype=jnp.float32),
+            jnp.asarray(runtime.archive.zt, dtype=jnp.float32),
+            runtime.sigma_fn,
+            float(runtime.dt0),
+            jax.random.PRNGKey(int(seed)),
+            condition_mode=str(runtime.condition_mode),
+        ),
+        dtype=np.float32,
+    )  # (N, T, L, D)
+    latent_knots = np.transpose(traj_np, (1, 0, 2, 3))  # (T, N, L, D)
 
-    decode_context = load_fae_decode_context(
+    decode_context = load_token_fae_decode_context(
         dataset_path=runtime.source.dataset_path,
         fae_checkpoint_path=runtime.source.fae_checkpoint_path,
-        decode_mode=decode_mode,
     )
     clip_bounds = decode_context.clip_bounds if clip_to_dataset_range else None
 
@@ -229,7 +186,7 @@ def build_eval_cache(
     ).astype(np.float32)
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    latent_samples_path = output_dir / "latent_samples.npz"
+    latent_samples_path = output_dir / "latent_samples_tokens.npz"
     generated_cache_path = output_dir / "generated_realizations.npz"
     manifest_path = output_dir / "cache_manifest.json"
 
@@ -258,7 +215,7 @@ def build_eval_cache(
         sample_indices=seed_indices,
         resolution=np.asarray(decode_context.resolution, dtype=np.int64),
         is_realizations=np.asarray(True),
-        decode_mode=np.asarray(str(decode_mode)),
+        decode_mode=np.asarray("token_native"),
     )
 
     manifest = {
@@ -276,7 +233,6 @@ def build_eval_cache(
         "seed": int(seed),
         "coarse_split": str(coarse_split),
         "coarse_selection": str(coarse_selection),
-        "decode_mode": str(decode_mode),
         "clip_to_dataset_range": bool(clip_bounds is not None),
         "clip_bounds": list(clip_bounds) if clip_bounds is not None else None,
         "clipped_fraction_low": float(total_clipped_low / max(total_values, 1)),
@@ -299,7 +255,7 @@ def main() -> None:
         if args.output_dir is not None
         else _default_output_dir(run_dir, args.n_realizations)
     )
-    build_eval_cache(
+    build_eval_cache_token_dit(
         run_dir=run_dir,
         output_dir=output_dir,
         n_realizations=args.n_realizations,
@@ -310,7 +266,6 @@ def main() -> None:
         latents_override=args.latents_path,
         fae_checkpoint_override=args.fae_checkpoint,
         decode_batch_size=args.decode_batch_size,
-        decode_mode=args.decode_mode,
         clip_to_dataset_range=not args.no_clip_to_dataset_range,
     )
 

@@ -15,128 +15,55 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from csp import (
-    BRIDGE_CONDITION_MODES,
-    bridge_condition_dim,
-    build_conditional_drift_model,
-    constant_sigma,
-    sample_conditional_batch,
-    train_bridge_matching,
-)
-from scripts.csp.latent_archive import load_fae_latent_archive
-from scripts.csp.train_utils import format_duration, resolve_latents_path, resolve_log_every
+from csp import build_token_conditional_dit, constant_sigma, sample_token_conditional_batch, train_token_bridge_matching
+from scripts.csp.token_latent_archive import load_token_fae_latent_archive
+from scripts.csp.train_utils import format_duration, resolve_log_every
 
 
-MODEL_TYPE = "conditional_bridge"
+MODEL_TYPE = "conditional_bridge_token_dit"
 TRAINING_OBJECTIVE = "paired_conditional_bridge_matching"
-DRIFT_ARCHITECTURES = ("mlp", "transformer")
 
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Train a conditional Schr\u00f6dinger bridge on saved FAE latents.",
+        description="Train a token-native conditional Schrödinger bridge on transformer FAE token latents.",
     )
-    parser.add_argument(
-        "--source_run_dir",
-        type=str,
-        default=None,
-        help="Compatibility-only source run directory that contains fae_latents.npz.",
-    )
-    parser.add_argument(
-        "--latents_path",
-        type=str,
-        default=None,
-        help="Direct path to the canonical fae_latents.npz archive.",
-    )
-    parser.add_argument(
-        "--source_dataset_path",
-        type=str,
-        default=None,
-        help="Optional dataset path override stored for run provenance.",
-    )
-    parser.add_argument(
-        "--fae_checkpoint",
-        type=str,
-        default=None,
-        help="Optional FAE checkpoint override stored for decode/runtime provenance.",
-    )
+    parser.add_argument("--latents_path", type=str, required=True, help="Direct path to the token-native latent archive.")
+    parser.add_argument("--source_dataset_path", type=str, default=None)
+    parser.add_argument("--fae_checkpoint", type=str, default=None)
     parser.add_argument(
         "--outdir",
         type=str,
-        default="results/csp/conditional_bridge/manual_run",
+        default="results/csp/conditional_bridge_token_dit/manual_run",
         help="Output run directory.",
     )
-    parser.add_argument(
-        "--hidden",
-        type=int,
-        nargs="+",
-        default=[512, 512, 512],
-        help="Conditional drift MLP hidden widths.",
-    )
-    parser.add_argument("--time_dim", type=int, default=128, help="Sinusoidal time embedding width.")
-    parser.add_argument(
-        "--drift_architecture",
-        type=str,
-        choices=DRIFT_ARCHITECTURES,
-        default="mlp",
-        help="Flat vector drift backbone.",
-    )
-    parser.add_argument("--transformer_hidden_dim", type=int, default=256)
-    parser.add_argument("--transformer_n_layers", type=int, default=3)
-    parser.add_argument("--transformer_num_heads", type=int, default=4)
-    parser.add_argument("--transformer_mlp_ratio", type=float, default=2.0)
-    parser.add_argument(
-        "--transformer_token_dim",
-        type=int,
-        default=32,
-        help="Flat vector chunk width used by the transformer drift.",
-    )
-    parser.add_argument(
-        "--sigma",
-        type=float,
-        default=0.0625,
-        help="Brownian reference diffusion coefficient used for bridge matching and sampling.",
-    )
-    parser.add_argument("--dt0", type=float, default=0.01, help="Euler-Maruyama step size used at sampling time.")
-    parser.add_argument("--lr", type=float, default=1e-4, help="Optimizer learning rate.")
-    parser.add_argument("--num_steps", type=int, default=1000, help="Number of optimizer steps.")
-    parser.add_argument("--batch_size", type=int, default=256, help="Latent tuple minibatch size.")
+    parser.add_argument("--dit_hidden_dim", type=int, default=256)
+    parser.add_argument("--dit_n_layers", type=int, default=3)
+    parser.add_argument("--dit_num_heads", type=int, default=4)
+    parser.add_argument("--dit_mlp_ratio", type=float, default=2.0)
+    parser.add_argument("--dit_time_emb_dim", type=int, default=32)
+    parser.add_argument("--sigma", type=float, default=0.0625)
+    parser.add_argument("--dt0", type=float, default=0.01)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--num_steps", type=int, default=1000)
+    parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument(
         "--condition_mode",
         type=str,
-        choices=BRIDGE_CONDITION_MODES,
+        choices=("coarse_only", "previous_state", "global_and_previous"),
         default="global_and_previous",
-        help=(
-            "Sequential bridge condition: coarse_only uses only the coarse seed, previous_state uses "
-            "only the running interval state, and global_and_previous concatenates both."
-        ),
     )
-    parser.add_argument(
-        "--endpoint_epsilon",
-        type=float,
-        default=1e-3,
-        help="Absolute time truncation applied away from Brownian bridge endpoints during training.",
-    )
-    parser.add_argument(
-        "--sample_count",
-        type=int,
-        default=16,
-        help="Number of coarse conditions to sample after training.",
-    )
-    parser.add_argument(
-        "--log_every",
-        type=int,
-        default=0,
-        help="Progress print frequency in optimizer steps. Use 0 to choose an automatic interval.",
-    )
-    parser.add_argument("--seed", type=int, default=0, help="PRNG seed.")
+    parser.add_argument("--endpoint_epsilon", type=float, default=1e-3)
+    parser.add_argument("--sample_count", type=int, default=8)
+    parser.add_argument("--log_every", type=int, default=0)
+    parser.add_argument("--seed", type=int, default=0)
     return parser.parse_args()
 
 
 def main() -> None:
     args = _parse_args()
-    latents_path = resolve_latents_path(args.source_run_dir, args.latents_path).expanduser().resolve()
-    archive = load_fae_latent_archive(latents_path)
+    latents_path = Path(args.latents_path).expanduser().resolve()
+    archive = load_token_fae_latent_archive(latents_path)
     outdir = Path(args.outdir).expanduser().resolve()
     config_dir = outdir / "config"
     checkpoint_dir = outdir / "checkpoints"
@@ -149,8 +76,6 @@ def main() -> None:
     latent_test = archive.latent_test
     zt = archive.zt
     tau_knots = (1.0 - zt).astype(np.float32)
-    latent_dim = int(latent_train.shape[-1])
-    num_intervals = int(latent_train.shape[0] - 1)
     log_every = resolve_log_every(args.num_steps, args.log_every)
     effective_batch = min(int(args.batch_size), int(latent_train.shape[1]))
     source_dataset_path = args.source_dataset_path or archive.dataset_path
@@ -158,24 +83,21 @@ def main() -> None:
 
     key = jax.random.PRNGKey(int(args.seed))
     key, model_key, sample_key = jax.random.split(key, 3)
-    drift_net = build_conditional_drift_model(
-        latent_dim=latent_dim,
-        condition_dim=bridge_condition_dim(latent_dim, num_intervals, args.condition_mode),
-        hidden_dims=tuple(int(width) for width in args.hidden),
-        time_dim=int(args.time_dim),
-        architecture=str(args.drift_architecture),
-        transformer_hidden_dim=int(args.transformer_hidden_dim),
-        transformer_n_layers=int(args.transformer_n_layers),
-        transformer_num_heads=int(args.transformer_num_heads),
-        transformer_mlp_ratio=float(args.transformer_mlp_ratio),
-        transformer_token_dim=int(args.transformer_token_dim),
+    drift_net = build_token_conditional_dit(
+        token_shape=archive.token_shape,
+        hidden_dim=int(args.dit_hidden_dim),
+        n_layers=int(args.dit_n_layers),
+        num_heads=int(args.dit_num_heads),
+        mlp_ratio=float(args.dit_mlp_ratio),
+        time_emb_dim=int(args.dit_time_emb_dim),
+        num_intervals=archive.num_intervals,
         key=model_key,
     )
     sigma = float(args.sigma)
     sigma_fn = constant_sigma(sigma)
 
     print("============================================================", flush=True)
-    print("Conditional Schr\u00f6dinger bridge training", flush=True)
+    print("Token-native conditional Schrödinger bridge training", flush=True)
     print(f"  Latents archive : {latents_path}", flush=True)
     print(f"  Output dir      : {outdir}", flush=True)
     print(f"  Dataset         : {source_dataset_path}", flush=True)
@@ -186,19 +108,11 @@ def main() -> None:
     print("  generation task : coarse -> ... -> fine (constructed internally)", flush=True)
     print(f"  objective       : {TRAINING_OBJECTIVE}", flush=True)
     print(f"  condition_mode  : {args.condition_mode}", flush=True)
-    print(f"  drift_arch      : {args.drift_architecture}", flush=True)
     print("  training_signal : exact Brownian-bridge interior-state regression", flush=True)
     print("  interval_sample : stratified equal-weight average over all intervals", flush=True)
     print("  time_param      : local interval time", flush=True)
-    print("  interval_embed  : one-hot interval embedding", flush=True)
-    if str(args.drift_architecture) == "mlp":
-        print(f"  hidden_dims     : {tuple(int(width) for width in args.hidden)}", flush=True)
-    else:
-        print(f"  transformer_hid : {int(args.transformer_hidden_dim)}", flush=True)
-        print(f"  transformer_L   : {int(args.transformer_n_layers)}", flush=True)
-        print(f"  transformer_H   : {int(args.transformer_num_heads)}", flush=True)
-        print(f"  transformer_mlp : {float(args.transformer_mlp_ratio):.3g}", flush=True)
-        print(f"  transformer_tok : {int(args.transformer_token_dim)}", flush=True)
+    print("  interval_embed  : projected one-hot interval embedding", flush=True)
+    print("  architecture    : token-native DiT", flush=True)
     print(f"  sigma           : {sigma:.6g}", flush=True)
     print(f"  endpoint_eps    : {float(args.endpoint_epsilon):.6g}", flush=True)
     print(f"  num_steps       : {args.num_steps}", flush=True)
@@ -220,7 +134,7 @@ def main() -> None:
         )
 
     train_start = time.perf_counter()
-    trained_model, loss_history = train_bridge_matching(
+    trained_model, loss_history = train_token_bridge_matching(
         drift_net,
         jnp.asarray(latent_train),
         jnp.asarray(zt),
@@ -244,7 +158,7 @@ def main() -> None:
 
     sample_count = min(int(args.sample_count), int(latent_train.shape[1]))
     coarse_conditions = jnp.asarray(latent_train[-1, :sample_count], dtype=jnp.float32)
-    sampled = sample_conditional_batch(
+    sampled = sample_token_conditional_batch(
         trained_model,
         coarse_conditions,
         jnp.asarray(zt, dtype=jnp.float32),
@@ -254,7 +168,7 @@ def main() -> None:
         condition_mode=str(args.condition_mode),
     )
 
-    checkpoint_path = checkpoint_dir / "conditional_bridge.eqx"
+    checkpoint_path = checkpoint_dir / "conditional_bridge_token_dit.eqx"
     eqx.tree_serialise_leaves(checkpoint_path, trained_model)
 
     run_args = dict(vars(args))
@@ -271,12 +185,12 @@ def main() -> None:
             "conditioning_direction": "coarse_to_fine",
             "conditioning_level_index": int(latent_train.shape[0] - 1),
             "condition_mode": str(args.condition_mode),
-            "drift_architecture": str(args.drift_architecture),
             "bridge_time_parameterization": "local_interval",
             "interval_sampling": "stratified_equal_weight_all_intervals",
-            "interval_embedding": "one_hot",
+            "interval_embedding": "one_hot_projected",
             "training_signal": "exact_brownian_bridge_interior_state_regression",
-            "endpoint_epsilon": float(args.endpoint_epsilon),
+            "transport_latent_format": "token_native",
+            "token_shape": list(map(int, archive.token_shape)),
         }
     )
     with (config_dir / "args.json").open("w", encoding="utf-8") as handle:
@@ -294,14 +208,16 @@ def main() -> None:
         log_every=np.asarray(log_every, dtype=np.int64),
         model_type=np.asarray(MODEL_TYPE),
         training_objective=np.asarray(TRAINING_OBJECTIVE),
+        token_shape=np.asarray(archive.token_shape, dtype=np.int64),
         **(
             {"time_indices": archive.time_indices}
             | ({"t_dists": archive.t_dists} if archive.t_dists is not None else {})
         ),
     )
     np.savez_compressed(
-        samples_dir / "sampled_trajectories.npz",
+        samples_dir / "sampled_trajectories_tokens.npz",
         sampled_trajectories=np.asarray(sampled, dtype=np.float32),
+        sampled_trajectories_knots=np.asarray(np.transpose(np.asarray(sampled), (1, 0, 2, 3)), dtype=np.float32),
         coarse_seeds=np.asarray(coarse_conditions, dtype=np.float32),
         zt=zt,
         tau_knots=tau_knots,
@@ -310,7 +226,7 @@ def main() -> None:
     print(f"Saved config to {config_dir / 'args.json'}", flush=True)
     print(f"Saved model to {checkpoint_path}", flush=True)
     print(f"Saved training summary to {metrics_dir / 'training_summary.npz'}", flush=True)
-    print(f"Saved sampled trajectories to {samples_dir / 'sampled_trajectories.npz'}", flush=True)
+    print(f"Saved sampled trajectories to {samples_dir / 'sampled_trajectories_tokens.npz'}", flush=True)
 
 
 if __name__ == "__main__":

@@ -23,6 +23,11 @@ C_RAW = "0.75"
 C_TRAIN = EASTERN_HUES[7]
 FONT_LABEL = 7
 FONT_TICK = 7
+_BRIDGE_MATCHING_MODEL_TYPES = {"conditional_bridge", "conditional_bridge_token_dit"}
+_BRIDGE_MATCHING_OBJECTIVES = {
+    "paired_conditional_bridge_matching",
+    "paired_conditional_multimarginal_bridge_matching",
+}
 
 
 def _parse_args() -> argparse.Namespace:
@@ -62,6 +67,29 @@ def _moving_average(values: np.ndarray, window: int) -> np.ndarray:
     return np.asarray(smoothed[: values.shape[0]], dtype=np.float32)
 
 
+def _read_optional_scalar_string(data: np.lib.npyio.NpzFile, key: str) -> str | None:
+    if key not in data:
+        return None
+    value = np.asarray(data[key])
+    if value.shape == ():
+        return str(value.item())
+    if value.size == 1:
+        return str(value.reshape(()).item())
+    return None
+
+
+def _infer_loss_label(
+    *,
+    model_type: str | None,
+    training_objective: str | None,
+) -> str:
+    if training_objective in _BRIDGE_MATCHING_OBJECTIVES:
+        return "Bridge matching loss"
+    if model_type in _BRIDGE_MATCHING_MODEL_TYPES:
+        return "Bridge matching loss"
+    return "ECMMD loss"
+
+
 def plot_training_curve(
     *,
     run_dir: Path,
@@ -75,6 +103,8 @@ def plot_training_curve(
     with np.load(summary_path, allow_pickle=True) as data:
         loss_history = np.asarray(data["loss_history"], dtype=np.float32)
         training_seconds = float(np.asarray(data["training_seconds"]).item()) if "training_seconds" in data else None
+        model_type = _read_optional_scalar_string(data, "model_type")
+        training_objective = _read_optional_scalar_string(data, "training_objective")
 
     if loss_history.ndim != 1 or loss_history.size == 0:
         raise ValueError(f"loss_history must be a non-empty 1-D array, got {loss_history.shape}")
@@ -82,13 +112,14 @@ def plot_training_curve(
     window = _auto_smooth_window(int(loss_history.size), int(smooth_window))
     smooth = _moving_average(loss_history, window)
     steps = np.arange(1, loss_history.shape[0] + 1, dtype=np.int64)
+    loss_label = _infer_loss_label(model_type=model_type, training_objective=training_objective)
 
     format_for_paper()
     fig, ax = plt.subplots(figsize=(5.0, 3.2))
     ax.plot(steps, loss_history, color=C_RAW, linewidth=0.8, alpha=0.9)
     ax.plot(steps, smooth, color=C_TRAIN, linewidth=1.4)
     ax.set_xlabel("Optimizer step", fontsize=FONT_LABEL)
-    ax.set_ylabel("ECMMD loss", fontsize=FONT_LABEL)
+    ax.set_ylabel(loss_label, fontsize=FONT_LABEL)
     ax.grid(alpha=0.18)
     ax.tick_params(axis="both", labelsize=FONT_TICK)
     fig.tight_layout()
@@ -108,6 +139,9 @@ def plot_training_curve(
         "n_steps": int(loss_history.size),
         "smooth_window": int(window),
         "training_seconds": training_seconds,
+        "model_type": model_type,
+        "training_objective": training_objective,
+        "loss_label": loss_label,
     }
     (output_dir / "training_curve_summary.json").write_text(json.dumps(summary, indent=2))
 

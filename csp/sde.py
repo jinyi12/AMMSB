@@ -117,6 +117,237 @@ class ConditionalDriftNet(eqx.Module):
         return self.layers[-1](h)
 
 
+def _linear_sequence(linear: eqx.nn.Linear, x: jax.Array) -> jax.Array:
+    return jax.vmap(linear)(x)
+
+
+def _layer_norm_sequence(norm: eqx.nn.LayerNorm, x: jax.Array) -> jax.Array:
+    return jax.vmap(norm)(x)
+
+
+def _zero_linear(module: eqx.nn.Linear) -> eqx.nn.Linear:
+    module = eqx.tree_at(lambda m: m.weight, module, jnp.zeros_like(module.weight))
+    if module.bias is not None:
+        module = eqx.tree_at(lambda m: m.bias, module, jnp.zeros_like(module.bias))
+    return module
+
+
+def _modulate(x: jax.Array, shift: jax.Array, scale: jax.Array) -> jax.Array:
+    return x * (1.0 + scale[None, :]) + shift[None, :]
+
+
+def _get_1d_sincos_pos_embed(embed_dim: int, length: int, *, dtype: jnp.dtype) -> jax.Array:
+    if embed_dim <= 0:
+        raise ValueError(f"embed_dim must be positive, got {embed_dim}.")
+    positions = jnp.arange(length, dtype=dtype)
+    half = embed_dim // 2
+    if half == 0:
+        return jnp.broadcast_to(positions[:, None], (length, 1))
+
+    omega = jnp.arange(half, dtype=dtype)
+    denom = jnp.asarray(max(half, 1), dtype=dtype)
+    omega = 1.0 / (10000.0 ** (omega / denom))
+    args = positions[:, None] * omega[None, :]
+    pos_emb = jnp.concatenate([jnp.sin(args), jnp.cos(args)], axis=-1)
+    if embed_dim % 2 == 1:
+        pos_emb = jnp.concatenate([pos_emb, positions[:, None]], axis=-1)
+    return pos_emb
+
+
+class _VectorMlpBlock(eqx.Module):
+    proj_in: eqx.nn.Linear
+    proj_out: eqx.nn.Linear
+
+    def __init__(self, hidden_dim: int, out_dim: int, *, key: jax.Array) -> None:
+        key_in, key_out = jax.random.split(key)
+        self.proj_in = eqx.nn.Linear(out_dim, hidden_dim, key=key_in)
+        self.proj_out = eqx.nn.Linear(hidden_dim, out_dim, key=key_out)
+
+    def __call__(self, x: jax.Array) -> jax.Array:
+        x = _linear_sequence(self.proj_in, x)
+        x = jax.nn.gelu(x)
+        return _linear_sequence(self.proj_out, x)
+
+
+class _VectorTransformerBlock(eqx.Module):
+    norm_0: eqx.nn.LayerNorm
+    norm_1: eqx.nn.LayerNorm
+    attn: eqx.nn.MultiheadAttention
+    mlp: _VectorMlpBlock
+    adaln: eqx.nn.Linear
+
+    def __init__(
+        self,
+        *,
+        hidden_dim: int,
+        num_heads: int,
+        mlp_ratio: float,
+        key: jax.Array,
+    ) -> None:
+        key_attn, key_mlp, key_adaln = jax.random.split(key, 3)
+        self.norm_0 = eqx.nn.LayerNorm(hidden_dim, use_weight=False, use_bias=False)
+        self.norm_1 = eqx.nn.LayerNorm(hidden_dim, use_weight=False, use_bias=False)
+        self.attn = eqx.nn.MultiheadAttention(
+            num_heads=num_heads,
+            query_size=hidden_dim,
+            key=key_attn,
+        )
+        self.mlp = _VectorMlpBlock(int(hidden_dim * mlp_ratio), hidden_dim, key=key_mlp)
+        self.adaln = _zero_linear(eqx.nn.Linear(hidden_dim, 6 * hidden_dim, key=key_adaln))
+
+    def __call__(self, x: jax.Array, condition: jax.Array) -> jax.Array:
+        modulation = self.adaln(jax.nn.gelu(condition))
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = jnp.split(modulation, 6, axis=-1)
+
+        x_norm = _layer_norm_sequence(self.norm_0, x)
+        x_mod = _modulate(x_norm, shift_msa, scale_msa)
+        attn = self.attn(x_mod, x_mod, x_mod)
+        x = x + gate_msa[None, :] * attn
+
+        x_norm2 = _layer_norm_sequence(self.norm_1, x)
+        x_mod2 = _modulate(x_norm2, shift_mlp, scale_mlp)
+        mlp = self.mlp(x_mod2)
+        return x + gate_mlp[None, :] * mlp
+
+
+class _VectorTransformerFinalLayer(eqx.Module):
+    norm: eqx.nn.LayerNorm
+    adaln: eqx.nn.Linear
+    proj: eqx.nn.Linear
+
+    def __init__(self, out_dim: int, hidden_dim: int, *, key: jax.Array) -> None:
+        key_adaln, key_proj = jax.random.split(key)
+        self.norm = eqx.nn.LayerNorm(hidden_dim, use_weight=False, use_bias=False)
+        self.adaln = _zero_linear(eqx.nn.Linear(hidden_dim, 2 * hidden_dim, key=key_adaln))
+        self.proj = _zero_linear(eqx.nn.Linear(hidden_dim, out_dim, key=key_proj))
+
+    def __call__(self, x: jax.Array, condition: jax.Array) -> jax.Array:
+        shift, scale = jnp.split(self.adaln(jax.nn.gelu(condition)), 2, axis=-1)
+        x = _layer_norm_sequence(self.norm, x)
+        x = _modulate(x, shift, scale)
+        return _linear_sequence(self.proj, x)
+
+
+class ConditionalTransformerDriftNet(eqx.Module):
+    """Transformer-based conditional drift over chunked flat latent vectors."""
+
+    input_proj: eqx.nn.Linear
+    condition_proj: eqx.nn.Linear
+    time_proj: eqx.nn.Linear
+    blocks: tuple[_VectorTransformerBlock, ...]
+    final: _VectorTransformerFinalLayer
+    position_embedding: jax.Array
+    latent_dim: int
+    condition_dim: int
+    time_dim: int
+    token_dim: int
+    num_tokens: int
+    padded_latent_dim: int
+    hidden_dim: int
+    n_layers: int
+    num_heads: int
+    mlp_ratio: float
+
+    def __init__(
+        self,
+        *,
+        latent_dim: int,
+        condition_dim: int,
+        hidden_dim: int = 256,
+        n_layers: int = 3,
+        num_heads: int = 4,
+        mlp_ratio: float = 2.0,
+        time_dim: int = 32,
+        token_dim: int = 32,
+        key: jax.Array,
+    ) -> None:
+        latent_dim = int(latent_dim)
+        condition_dim = int(condition_dim)
+        hidden_dim = int(hidden_dim)
+        n_layers = int(n_layers)
+        num_heads = int(num_heads)
+        time_dim = int(time_dim)
+        token_dim = int(token_dim)
+        if latent_dim <= 0:
+            raise ValueError(f"latent_dim must be positive, got {latent_dim}.")
+        if condition_dim <= 0:
+            raise ValueError(f"condition_dim must be positive, got {condition_dim}.")
+        if hidden_dim <= 0:
+            raise ValueError(f"hidden_dim must be positive, got {hidden_dim}.")
+        if n_layers <= 0:
+            raise ValueError(f"n_layers must be positive, got {n_layers}.")
+        if num_heads <= 0 or hidden_dim % num_heads != 0:
+            raise ValueError(f"hidden_dim={hidden_dim} must be divisible by num_heads={num_heads}.")
+        if token_dim <= 0:
+            raise ValueError(f"token_dim must be positive, got {token_dim}.")
+        if time_dim <= 0:
+            raise ValueError(f"time_dim must be positive, got {time_dim}.")
+
+        num_tokens = (latent_dim + token_dim - 1) // token_dim
+        padded_latent_dim = num_tokens * token_dim
+
+        key_input, key_cond, key_time, key_blocks, key_final = jax.random.split(key, 5)
+        self.input_proj = eqx.nn.Linear(token_dim, hidden_dim, key=key_input)
+        self.condition_proj = eqx.nn.Linear(condition_dim, hidden_dim, key=key_cond)
+        self.time_proj = eqx.nn.Linear(time_dim, hidden_dim, key=key_time)
+        block_keys = jax.random.split(key_blocks, n_layers)
+        self.blocks = tuple(
+            _VectorTransformerBlock(
+                hidden_dim=hidden_dim,
+                num_heads=num_heads,
+                mlp_ratio=float(mlp_ratio),
+                key=subkey,
+            )
+            for subkey in block_keys
+        )
+        self.final = _VectorTransformerFinalLayer(token_dim, hidden_dim, key=key_final)
+        self.position_embedding = _get_1d_sincos_pos_embed(hidden_dim, num_tokens, dtype=jnp.float32)
+        self.latent_dim = latent_dim
+        self.condition_dim = condition_dim
+        self.time_dim = time_dim
+        self.token_dim = token_dim
+        self.num_tokens = num_tokens
+        self.padded_latent_dim = padded_latent_dim
+        self.hidden_dim = hidden_dim
+        self.n_layers = n_layers
+        self.num_heads = num_heads
+        self.mlp_ratio = float(mlp_ratio)
+
+    def _vector_to_tokens(self, y: jax.Array) -> jax.Array:
+        y_arr = jnp.asarray(y)
+        if y_arr.ndim != 1 or int(y_arr.shape[0]) != self.latent_dim:
+            raise ValueError(
+                "ConditionalTransformerDriftNet expects flat latent vectors with shape "
+                f"({self.latent_dim},), got {tuple(y_arr.shape)}."
+            )
+        if self.padded_latent_dim == self.latent_dim:
+            padded = y_arr
+        else:
+            padded = jnp.pad(y_arr, (0, self.padded_latent_dim - self.latent_dim))
+        return padded.reshape(self.num_tokens, self.token_dim)
+
+    def __call__(self, t: jax.Array | float, y: jax.Array, z: jax.Array) -> jax.Array:
+        y_arr = jnp.asarray(y)
+        z_arr = jnp.asarray(z, dtype=y_arr.dtype)
+        if z_arr.ndim != 1 or int(z_arr.shape[0]) != self.condition_dim:
+            raise ValueError(
+                "ConditionalTransformerDriftNet expects condition vectors with shape "
+                f"({self.condition_dim},), got {tuple(z_arr.shape)}."
+            )
+
+        y_tokens = self._vector_to_tokens(y_arr)
+        x = _linear_sequence(self.input_proj, y_tokens)
+        x = x + self.position_embedding.astype(x.dtype)
+
+        t_emb = sinusoidal_embedding(t, self.time_dim, dtype=y_arr.dtype)
+        condition_context = self.condition_proj(z_arr) + self.time_proj(t_emb)
+        for block in self.blocks:
+            x = block(x, condition_context)
+
+        out_tokens = self.final(x, condition_context)
+        return out_tokens.reshape(self.padded_latent_dim)[: self.latent_dim]
+
+
 def build_drift_model(
     latent_dim: int,
     hidden_dims: Sequence[int] = (256, 128, 64),
@@ -144,15 +375,62 @@ def build_conditional_drift_model(
     condition_dim: int | None = None,
     hidden_dims: Sequence[int] = (256, 128, 64),
     time_dim: int = 32,
+    architecture: str = "mlp",
+    transformer_hidden_dim: int = 256,
+    transformer_n_layers: int = 3,
+    transformer_num_heads: int = 4,
+    transformer_mlp_ratio: float = 2.0,
+    transformer_token_dim: int = 32,
     *,
     key: jax.Array,
-) -> ConditionalDriftNet:
+) -> ConditionalDriftNet | ConditionalTransformerDriftNet:
     condition_dim_int = int(latent_dim) if condition_dim is None else int(condition_dim)
+    architecture_name = str(architecture).lower()
+    if architecture_name == "transformer":
+        return ConditionalTransformerDriftNet(
+            latent_dim=latent_dim,
+            condition_dim=condition_dim_int,
+            hidden_dim=int(transformer_hidden_dim),
+            n_layers=int(transformer_n_layers),
+            num_heads=int(transformer_num_heads),
+            mlp_ratio=float(transformer_mlp_ratio),
+            time_dim=time_dim,
+            token_dim=int(transformer_token_dim),
+            key=key,
+        )
+    if architecture_name != "mlp":
+        raise ValueError(f"architecture must be 'mlp' or 'transformer', got {architecture!r}.")
     return ConditionalDriftNet(
         latent_dim=latent_dim,
         condition_dim=condition_dim_int,
         hidden_dims=hidden_dims,
         time_dim=time_dim,
+        key=key,
+    )
+
+
+def build_conditional_transformer_drift_model(
+    latent_dim: int,
+    condition_dim: int | None = None,
+    *,
+    hidden_dim: int = 256,
+    n_layers: int = 3,
+    num_heads: int = 4,
+    mlp_ratio: float = 2.0,
+    time_dim: int = 32,
+    token_dim: int = 32,
+    key: jax.Array,
+) -> ConditionalTransformerDriftNet:
+    condition_dim_int = int(latent_dim) if condition_dim is None else int(condition_dim)
+    return ConditionalTransformerDriftNet(
+        latent_dim=latent_dim,
+        condition_dim=condition_dim_int,
+        hidden_dim=int(hidden_dim),
+        n_layers=int(n_layers),
+        num_heads=int(num_heads),
+        mlp_ratio=float(mlp_ratio),
+        time_dim=int(time_dim),
+        token_dim=int(token_dim),
         key=key,
     )
 
@@ -256,9 +534,13 @@ def integrate_conditional_interval(
     solver: diffrax.AbstractSolver | None = None,
     adjoint: diffrax.AbstractAdjoint | None = None,
     max_steps: int = 4096,
-    time_mode: str = "absolute",
+    time_mode: str,
 ) -> jax.Array:
-    """Integrate a single conditional SDE interval with Euler-Maruyama."""
+    """Integrate a single conditional SDE interval with Euler-Maruyama.
+
+    `time_mode` is explicit by design so direct callers must choose whether the
+    drift and diffusion schedules see absolute interval time or local phase.
+    """
     y0_arr = jnp.asarray(y0)
     z_arr = jnp.asarray(z, dtype=y0_arr.dtype)
     dt0_arr = jnp.asarray(dt0, dtype=y0_arr.dtype)

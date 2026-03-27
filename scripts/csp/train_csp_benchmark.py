@@ -21,6 +21,7 @@ from csp import (
     HierarchicalGaussianBenchmarkConfig,
     HierarchicalGaussianPathProblem,
     bridge_condition_dim,
+    bridge_condition_uses_global_state,
     build_conditional_drift_model,
     constant_sigma,
     evaluate_hierarchical_gaussian_sampler_benchmark,
@@ -32,6 +33,8 @@ from scripts.csp.train_utils import format_duration, resolve_log_every
 
 
 MODEL_TYPE = "conditional_bridge"
+TRAINING_OBJECTIVE = "paired_conditional_bridge_matching"
+DRIFT_ARCHITECTURES = ("mlp", "transformer")
 
 
 def _parse_args() -> argparse.Namespace:
@@ -61,6 +64,18 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--time_dim", type=int, default=32, help="Sinusoidal time embedding width.")
     parser.add_argument(
+        "--drift_architecture",
+        type=str,
+        choices=DRIFT_ARCHITECTURES,
+        default="mlp",
+        help="Flat vector drift backbone.",
+    )
+    parser.add_argument("--transformer_hidden_dim", type=int, default=256)
+    parser.add_argument("--transformer_n_layers", type=int, default=3)
+    parser.add_argument("--transformer_num_heads", type=int, default=4)
+    parser.add_argument("--transformer_mlp_ratio", type=float, default=2.0)
+    parser.add_argument("--transformer_token_dim", type=int, default=32)
+    parser.add_argument(
         "--sigma",
         type=float,
         default=0.0625,
@@ -75,7 +90,10 @@ def _parse_args() -> argparse.Namespace:
         type=str,
         choices=BRIDGE_CONDITION_MODES,
         default="previous_state",
-        help="Sequential bridge condition. previous_state matches the benchmark oracle exactly.",
+        help=(
+            "Sequential bridge condition. previous_state matches the benchmark oracle exactly; "
+            "coarse_only tests the coarse-endpoint-only bridge from the reference formulation."
+        ),
     )
     parser.add_argument(
         "--endpoint_epsilon",
@@ -172,7 +190,7 @@ def _sample_truncated_interval_conditionals(
     truncated_num_intervals = int(coarse_level_int)
     repeated = np.repeat(conditions, n_realizations_int, axis=0)
     global_conditions = None
-    if condition_mode == "global_and_previous":
+    if bridge_condition_uses_global_state(condition_mode):
         global_conditions = np.repeat(
             _benchmark_global_conditions_from_states(problem, conditions),
             n_realizations_int,
@@ -268,6 +286,12 @@ def main() -> None:
         condition_dim=bridge_condition_dim(latent_dim, num_intervals, args.condition_mode),
         hidden_dims=tuple(int(width) for width in args.hidden),
         time_dim=int(args.time_dim),
+        architecture=str(args.drift_architecture),
+        transformer_hidden_dim=int(args.transformer_hidden_dim),
+        transformer_n_layers=int(args.transformer_n_layers),
+        transformer_num_heads=int(args.transformer_num_heads),
+        transformer_mlp_ratio=float(args.transformer_mlp_ratio),
+        transformer_token_dim=int(args.transformer_token_dim),
         key=model_key,
     )
     sigma = float(args.sigma)
@@ -281,11 +305,21 @@ def main() -> None:
     print(f"  latent_test     : {tuple(latent_test.shape)}", flush=True)
     print("  data order      : fine -> ... -> coarse (stored latent order)", flush=True)
     print("  generation task : coarse -> ... -> fine (constructed internally)", flush=True)
-    print("  teacher-forced  : sequential truncated rollout from the supplied interval state", flush=True)
+    print(f"  objective       : {TRAINING_OBJECTIVE}", flush=True)
+    print("  training_signal : exact Brownian-bridge interior-state regression", flush=True)
     print(f"  condition_mode  : {args.condition_mode}", flush=True)
+    print(f"  drift_arch      : {args.drift_architecture}", flush=True)
+    print("  interval_sample : stratified equal-weight average over all intervals", flush=True)
     print("  time_param      : local interval time", flush=True)
     print("  interval_embed  : one-hot interval embedding", flush=True)
-    print(f"  hidden_dims     : {tuple(int(width) for width in args.hidden)}", flush=True)
+    if str(args.drift_architecture) == "mlp":
+        print(f"  hidden_dims     : {tuple(int(width) for width in args.hidden)}", flush=True)
+    else:
+        print(f"  transformer_hid : {int(args.transformer_hidden_dim)}", flush=True)
+        print(f"  transformer_L   : {int(args.transformer_n_layers)}", flush=True)
+        print(f"  transformer_H   : {int(args.transformer_num_heads)}", flush=True)
+        print(f"  transformer_mlp : {float(args.transformer_mlp_ratio):.3g}", flush=True)
+        print(f"  transformer_tok : {int(args.transformer_token_dim)}", flush=True)
     print(f"  time_dim        : {int(args.time_dim)}", flush=True)
     print(f"  sigma           : {sigma:.6g}", flush=True)
     print(f"  endpoint_eps    : {float(args.endpoint_epsilon):.6g}", flush=True)
@@ -350,16 +384,19 @@ def main() -> None:
         {
             "benchmark_metadata": benchmark_metadata,
             "model_type": MODEL_TYPE,
+            "training_objective": TRAINING_OBJECTIVE,
             "sigma_schedule": "constant",
             "sigma0": sigma,
             "data_order": "fine_to_coarse",
             "conditioning_direction": "coarse_to_fine",
             "conditioning_level_index": int(latent_train.shape[0] - 1),
             "condition_mode": str(args.condition_mode),
+            "drift_architecture": str(args.drift_architecture),
             "bridge_time_parameterization": "local_interval",
+            "interval_sampling": "stratified_equal_weight_all_intervals",
             "interval_embedding": "one_hot",
             "endpoint_epsilon": float(args.endpoint_epsilon),
-            "teacher_forced_mode": "sequential_truncated_rollout_from_interval_state",
+            "training_signal": "exact_brownian_bridge_interior_state_regression",
         }
     )
     with (config_dir / "args.json").open("w", encoding="utf-8") as handle:
@@ -376,6 +413,7 @@ def main() -> None:
         training_seconds=np.asarray(training_seconds, dtype=np.float32),
         log_every=np.asarray(log_every, dtype=np.int64),
         model_type=np.asarray(MODEL_TYPE),
+        training_objective=np.asarray(TRAINING_OBJECTIVE),
         **extras,
     )
     np.savez_compressed(
@@ -431,7 +469,7 @@ def main() -> None:
     )
 
     finest_interval_key = "x1_to_x0"
-    finest_metrics = benchmark_summary["teacher_forced"][finest_interval_key]
+    finest_metrics = benchmark_summary["interval_conditioned"][finest_interval_key]
     path_logpdf = benchmark_summary["free_rollout"]["path_logpdf"]
     print(f"Saved config to {config_dir / 'args.json'}", flush=True)
     print(f"Saved model to {checkpoint_path}", flush=True)

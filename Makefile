@@ -63,7 +63,7 @@ test-tran-eval:
 		tests/test_latent_geometry.py
 
 test-csp:
-	$(PYTEST) -q tests/test_csp.py
+	$(PYTEST) -q tests/test_csp.py tests/test_csp_runtime.py tests/test_csp_token_dit.py tests/test_csp_token_runtime.py
 
 smoke-tran-eval:
 	$(PYTHON) scripts/fae/tran_evaluation/evaluate.py --help >/dev/null
@@ -77,10 +77,17 @@ smoke-tran-eval:
 	$(PYTHON) scripts/fae/tran_evaluation/visualize_conditional_latent_projections.py --help >/dev/null
 
 smoke-csp:
+	$(PYTHON) scripts/csp/encode_fae_latents.py --help >/dev/null
+	$(PYTHON) scripts/csp/encode_fae_token_latents.py --help >/dev/null
 	$(PYTHON) scripts/csp/train_csp.py --help >/dev/null
+	$(PYTHON) scripts/csp/train_csp_from_fae.py --help >/dev/null
+	$(PYTHON) scripts/csp/train_csp_token_dit.py --help >/dev/null
+	$(PYTHON) scripts/csp/train_csp_token_dit_from_fae.py --help >/dev/null
 	$(PYTHON) scripts/csp/evaluate_csp.py --help >/dev/null
 	$(PYTHON) scripts/csp/evaluate_csp_conditional.py --help >/dev/null
 	$(PYTHON) scripts/csp/build_eval_cache.py --help >/dev/null
+	$(PYTHON) scripts/csp/evaluate_csp_token_dit.py --help >/dev/null
+	$(PYTHON) scripts/csp/evaluate_csp_token_dit_conditional.py --help >/dev/null
+	$(PYTHON) scripts/csp/build_eval_cache_token_dit.py --help >/dev/null
 	$(PYTHON) scripts/csp/train_csp_benchmark.py --help >/dev/null
-	$(PYTHON) scripts/csp/train_conditional_mlp_benchmark.py --help >/dev/null
 	$(PYTHON) scripts/csp/plot_csp_training.py --help >/dev/null

@@ -11,9 +11,11 @@ cd "$REPO_ROOT"
 
 ENV_NAME="${ENV_NAME:-3MASB}"
 SOURCE_RUN_DIR="${SOURCE_RUN_DIR:-results/latent_msbm_muon_ntk_prior}"
-SOURCE_DATASET_PATH="${SOURCE_DATASET_PATH:-data/fae_tran_inclusions.npz}"
+LATENTS_PATH="${LATENTS_PATH:-${SOURCE_RUN_DIR}/fae_latents.npz}"
+DATA_PATH="${DATA_PATH:-data/fae_tran_inclusions.npz}"
+FAE_CHECKPOINT="${FAE_CHECKPOINT:-}"
 OUTPUT_BASE="${OUTPUT_BASE:-results/csp/latent128_muon_ntk_prior}"
-PROFILE="${PROFILE:-main}"  # smoke | main | constant
+PROFILE="${PROFILE:-main}"  # smoke | main | coarse_only
 BACKGROUND="${BACKGROUND:-0}"
 NOHUP_LOG="${NOHUP_LOG:-}"
 EXTRA_ARGS=()
@@ -32,70 +34,13 @@ while [[ $# -gt 0 ]]; do
       BACKGROUND="0"
       shift
       ;;
-    --outdir)
-      OUTDIR="$2"
+    --outdir|--num_steps|--batch_size|--sample_count|--dt0|--lr|--seed|--time_dim|--endpoint_epsilon|--condition_mode|--latents_path|--data_path|--fae_checkpoint)
       EXTRA_ARGS+=("$1" "$2")
       shift 2
       ;;
-    --num_steps)
-      NUM_STEPS="$2"
-      EXTRA_ARGS+=("$1" "$2")
-      shift 2
-      ;;
-    --batch_size)
-      BATCH_SIZE="$2"
-      EXTRA_ARGS+=("$1" "$2")
-      shift 2
-      ;;
-    --sample_count)
-      SAMPLE_COUNT="$2"
-      EXTRA_ARGS+=("$1" "$2")
-      shift 2
-      ;;
-    --sigma_schedule)
-      SIGMA_SCHEDULE="$2"
-      EXTRA_ARGS+=("$1" "$2")
-      shift 2
-      ;;
-    --sigma0)
-      SIGMA0="$2"
-      EXTRA_ARGS+=("$1" "$2")
-      shift 2
-      ;;
-    --decay_rate)
-      DECAY_RATE="$2"
-      EXTRA_ARGS+=("$1" "$2")
-      shift 2
-      ;;
-    --dt0)
-      DT0="$2"
-      EXTRA_ARGS+=("$1" "$2")
-      shift 2
-      ;;
-    --lr)
-      LR="$2"
-      EXTRA_ARGS+=("$1" "$2")
-      shift 2
-      ;;
-    --seed)
-      SEED="$2"
-      EXTRA_ARGS+=("$1" "$2")
-      shift 2
-      ;;
-    --time_dim)
-      TIME_DIM="$2"
-      EXTRA_ARGS+=("$1" "$2")
-      shift 2
-      ;;
-    --sigma_reference)
-      SIGMA_REFERENCE="$2"
-      EXTRA_ARGS+=("$1" "$2")
-      shift 2
-      ;;
-    --k_neighbors|--k-neighbors)
-      K_NEIGHBORS="$2"
-      EXTRA_ARGS+=("--k_neighbors" "$2")
-      shift 2
+    --hidden)
+      EXTRA_ARGS+=("$1" "$2" "$3" "$4")
+      shift 4
       ;;
     --nohup-log)
       NOHUP_LOG="$2"
@@ -117,24 +62,11 @@ if [[ -z "${CONDA_DEFAULT_ENV:-}" || "${CONDA_DEFAULT_ENV}" != "${ENV_NAME}" ]];
   conda activate "${ENV_NAME}"
 fi
 
-LATENTS_PATH="${SOURCE_RUN_DIR}/fae_latents.npz"
-if [[ ! -f "${LATENTS_PATH}" ]]; then
-  echo "ERROR: missing latent archive: ${LATENTS_PATH}" >&2
-  exit 1
-fi
-if [[ ! -f "${SOURCE_DATASET_PATH}" ]]; then
-  echo "ERROR: missing source dataset: ${SOURCE_DATASET_PATH}" >&2
-  exit 1
-fi
-
-SIGMA0="${SIGMA0:-0.15}"
+TIME_DIM="${TIME_DIM:-128}"
 DT0="${DT0:-0.01}"
 LR="${LR:-1e-4}"
 SEED="${SEED:-0}"
-TIME_DIM="${TIME_DIM:-128}"
-DECAY_RATE="${DECAY_RATE:-1.8}"
-SIGMA_REFERENCE="${SIGMA_REFERENCE:-fine_to_coarse}"
-K_NEIGHBORS="${K_NEIGHBORS:-32}"
+ENDPOINT_EPSILON="${ENDPOINT_EPSILON:-1e-3}"
 
 case "$PROFILE" in
   smoke)
@@ -142,24 +74,24 @@ case "$PROFILE" in
     NUM_STEPS="${NUM_STEPS:-10}"
     BATCH_SIZE="${BATCH_SIZE:-32}"
     SAMPLE_COUNT="${SAMPLE_COUNT:-4}"
-    SIGMA_SCHEDULE="${SIGMA_SCHEDULE:-exp_contract}"
+    CONDITION_MODE="${CONDITION_MODE:-global_and_previous}"
     ;;
   main)
     OUTDIR="${OUTDIR:-${OUTPUT_BASE}/main}"
     NUM_STEPS="${NUM_STEPS:-10000}"
     BATCH_SIZE="${BATCH_SIZE:-256}"
     SAMPLE_COUNT="${SAMPLE_COUNT:-128}"
-    SIGMA_SCHEDULE="${SIGMA_SCHEDULE:-exp_contract}"
+    CONDITION_MODE="${CONDITION_MODE:-global_and_previous}"
     ;;
-  constant)
-    OUTDIR="${OUTDIR:-${OUTPUT_BASE}/constant}"
+  coarse_only)
+    OUTDIR="${OUTDIR:-${OUTPUT_BASE}/coarse_only}"
     NUM_STEPS="${NUM_STEPS:-10000}"
     BATCH_SIZE="${BATCH_SIZE:-256}"
     SAMPLE_COUNT="${SAMPLE_COUNT:-128}"
-    SIGMA_SCHEDULE="${SIGMA_SCHEDULE:-constant}"
+    CONDITION_MODE="${CONDITION_MODE:-coarse_only}"
     ;;
   *)
-    echo "ERROR: --profile must be one of: smoke, main, constant." >&2
+    echo "ERROR: --profile must be one of: smoke, main, coarse_only." >&2
     exit 1
     ;;
 esac
@@ -169,27 +101,44 @@ mkdir -p "${LOG_DIR}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 
 CMD=(
-  "${PYTHON_BIN}" -u scripts/csp/train_csp.py
-  --source_run_dir "${SOURCE_RUN_DIR}"
-  --source_dataset_path "${SOURCE_DATASET_PATH}"
-  --outdir "${OUTDIR}"
+  "${PYTHON_BIN}" -u
+)
+if [[ -n "${FAE_CHECKPOINT}" ]]; then
+  CMD+=(
+    scripts/csp/train_csp_from_fae.py
+    --data_path "${DATA_PATH}"
+    --fae_checkpoint "${FAE_CHECKPOINT}"
+    --outdir "${OUTDIR}"
+  )
+  if [[ -n "${LATENTS_PATH}" ]]; then
+    CMD+=(--latents_path "${LATENTS_PATH}")
+  fi
+else
+  if [[ ! -f "${LATENTS_PATH}" ]]; then
+    echo "ERROR: missing latent archive: ${LATENTS_PATH}" >&2
+    echo "Set FAE_CHECKPOINT to use the FAE->latent-archive->CSP path." >&2
+    exit 1
+  fi
+  CMD+=(
+    scripts/csp/train_csp.py
+    --latents_path "${LATENTS_PATH}"
+    --source_dataset_path "${DATA_PATH}"
+    --outdir "${OUTDIR}"
+  )
+fi
+
+CMD+=(
   --time_dim "${TIME_DIM}"
-  --sigma_schedule "${SIGMA_SCHEDULE}"
-  --sigma_reference "${SIGMA_REFERENCE}"
-  --sigma0 "${SIGMA0}"
   --dt0 "${DT0}"
   --lr "${LR}"
   --num_steps "${NUM_STEPS}"
   --batch_size "${BATCH_SIZE}"
   --sample_count "${SAMPLE_COUNT}"
-  --k_neighbors "${K_NEIGHBORS}"
+  --condition_mode "${CONDITION_MODE}"
+  --endpoint_epsilon "${ENDPOINT_EPSILON}"
   --seed "${SEED}"
   --hidden 512 512 512
 )
-
-if [[ "${SIGMA_SCHEDULE}" == "exp_contract" ]]; then
-  CMD+=(--decay_rate "${DECAY_RATE}")
-fi
 
 if [[ ${#EXTRA_ARGS[@]} -gt 0 ]]; then
   CMD+=("${EXTRA_ARGS[@]}")
@@ -199,12 +148,11 @@ echo "============================================================"
 echo "  CSP training"
 echo "  Profile          : ${PROFILE}"
 echo "  Environment      : ${ENV_NAME}"
-echo "  Source run       : ${SOURCE_RUN_DIR}"
-echo "  Source dataset   : ${SOURCE_DATASET_PATH}"
+echo "  Dataset          : ${DATA_PATH}"
+echo "  FAE checkpoint   : ${FAE_CHECKPOINT:-<from archive / not set>}"
+echo "  Latents          : ${LATENTS_PATH}"
 echo "  Output           : ${OUTDIR}"
-echo "  Sigma schedule   : ${SIGMA_SCHEDULE}"
-echo "  Sigma reference  : ${SIGMA_REFERENCE}"
-echo "  K neighbors      : ${K_NEIGHBORS}"
+echo "  Condition mode   : ${CONDITION_MODE}"
 echo "  Steps / batch    : ${NUM_STEPS} / ${BATCH_SIZE}"
 if [[ ${#EXTRA_ARGS[@]} -gt 0 ]]; then
   echo "  Extra args       : ${EXTRA_ARGS[*]}"

@@ -6,9 +6,7 @@ import os
 import sys
 import warnings
 from pathlib import Path
-from typing import Any
 
-# Allow `--nogpu` to force JAX onto CPU before importing JAX.
 if "--nogpu" in sys.argv:
     os.environ.setdefault("JAX_PLATFORM_NAME", "cpu")
     os.environ.setdefault("JAX_PLATFORMS", "cpu")
@@ -17,15 +15,14 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-import equinox as eqx
 import jax
 import jax.numpy as jnp
 import numpy as np
 
+from csp import sample_token_conditional_batch
 from scripts.csp.conditional_ecmmd_plots import plot_conditioned_ecmmd_dashboard
-from csp import integrate_interval, sample_conditional_batch
 from scripts.csp.conditional_pdf_plots import plot_conditioned_latent_pdfs, pool_scalar_plot_values
-from scripts.csp.run_context import load_corpus_latents, load_csp_sampling_runtime
+from scripts.csp.token_run_context import load_corpus_latents, load_token_csp_sampling_runtime
 from scripts.fae.tran_evaluation.conditional_metrics import (
     add_bootstrap_ecmmd_calibration,
     compute_ecmmd_metrics,
@@ -40,15 +37,16 @@ from scripts.fae.tran_evaluation.conditional_support import (
     build_local_reference_samples,
     build_local_reference_spec,
     fit_whitened_pca_metric,
+    knn_gaussian_weights,
     make_pair_label,
     pack_reference_support_arrays,
     sample_weighted_rows,
     sampling_spec_ess,
     sampling_spec_eig_rse,
     sampling_spec_indices,
-    sampling_spec_weights,
     sampling_spec_mean_rse,
     sampling_spec_radius,
+    sampling_spec_weights,
     summarize_reference_sampling_specs,
     transform_condition_vectors,
     validate_conditional_eval_mode,
@@ -56,53 +54,20 @@ from scripts.fae.tran_evaluation.conditional_support import (
 )
 
 
-@eqx.filter_jit
-def _sample_interval_batch(
-    drift_net: Any,
-    z_start_batch: jax.Array,
-    tau_start: jax.Array,
-    tau_end: jax.Array,
-    dt0: jax.Array,
-    keys: jax.Array,
-    sigma_fn: Any,
-) -> jax.Array:
-    return jax.vmap(
-        lambda y0, key: integrate_interval(
-            drift_net,
-            y0,
-            tau_start,
-            tau_end,
-            dt0,
-            key,
-            sigma_fn,
-        )
-    )(z_start_batch, keys)
-
-
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="CSP latent conditional evaluation via latent W1/W2 and latent ECMMD.",
+        description="Token-native CSP latent conditional evaluation via latent W1/W2 and latent ECMMD.",
     )
     parser.add_argument("--run_dir", type=str, required=True)
-    parser.add_argument(
-        "--output_dir",
-        type=str,
-        default=None,
-        help="Defaults to <run_dir>/eval/conditional/latent.",
-    )
+    parser.add_argument("--output_dir", type=str, default=None)
     parser.add_argument(
         "--corpus_latents_path",
         type=str,
         default="data/corpus_latents_ntk_prior.npz",
-        help="Corpus latent codes npz with aligned latents_<time_idx> arrays.",
+        help="Flattened corpus latent codes npz with aligned latents_<time_idx> arrays.",
     )
-    parser.add_argument("--latents_path", type=str, default=None, help="Optional source latent archive override.")
-    parser.add_argument(
-        "--fae_checkpoint",
-        type=str,
-        default=None,
-        help="Optional FAE checkpoint override for run-contract reconstruction.",
-    )
+    parser.add_argument("--latents_path", type=str, default=None)
+    parser.add_argument("--fae_checkpoint", type=str, default=None)
     parser.add_argument(
         "--conditional_eval_mode",
         type=str,
@@ -113,6 +78,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--k_neighbors", type=int, default=200)
     parser.add_argument("--n_test_samples", type=int, default=50)
     parser.add_argument("--n_realizations", type=int, default=200)
+    parser.add_argument(
+        "--max_corpus_samples",
+        type=int,
+        default=None,
+        help="Optional cap on corpus rows used for KNN/ECMMD, sampled uniformly without replacement.",
+    )
     parser.add_argument("--n_plot_conditions", type=int, default=5)
     parser.add_argument(
         "--plot_value_budget",
@@ -125,12 +96,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--adaptive_metric_dim_cap", type=int, default=24)
     parser.add_argument("--adaptive_reference_bootstrap_reps", type=int, default=64)
     parser.add_argument("--adaptive_ess_min", type=int, default=32)
-    parser.add_argument(
-        "--H_meso_list",
-        type=str,
-        default="1.0,1.25,1.5,2.0,2.5,3.0",
-        help="Comma-separated mesoscale H values used for human-readable pair labels.",
-    )
+    parser.add_argument("--H_meso_list", type=str, default="1.0,1.25,1.5,2.0,2.5,3.0")
     parser.add_argument("--H_macro", type=float, default=6.0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--nogpu", action="store_true")
@@ -155,46 +121,110 @@ def _build_adaptive_reference_config(args: argparse.Namespace) -> AdaptiveRefere
     )
 
 
-def sample_csp_conditionals(
-    drift_net: Any,
+def _flatten_tokens(tokens: np.ndarray) -> np.ndarray:
+    token_arr = np.asarray(tokens, dtype=np.float32)
+    return token_arr.reshape(token_arr.shape[0], -1)
+
+
+def _unflatten_tokens(flat_latents: np.ndarray, token_shape: tuple[int, int]) -> np.ndarray:
+    flat_arr = np.asarray(flat_latents, dtype=np.float32)
+    expected_dim = int(token_shape[0] * token_shape[1])
+    if flat_arr.ndim != 2 or int(flat_arr.shape[-1]) != expected_dim:
+        raise ValueError(
+            "Expected flattened corpus latents with shape (N, L*D), "
+            f"got {flat_arr.shape} for token_shape={token_shape}."
+        )
+    return flat_arr.reshape(flat_arr.shape[0], int(token_shape[0]), int(token_shape[1]))
+
+
+def _default_corpus_dataset_path(dataset_path: Path) -> Path:
+    if dataset_path.stem.endswith("_corpus"):
+        return dataset_path
+    return dataset_path.with_name(f"{dataset_path.stem}_corpus{dataset_path.suffix}")
+
+
+def _validate_flat_corpus_latents(
+    corpus_latents_by_tidx: dict[int, np.ndarray],
+    *,
+    time_indices: np.ndarray,
+    token_shape: tuple[int, int],
+    expected_dim: int,
+    corpus_latents_path: Path,
+    run_dir: Path,
+    dataset_path: Path | None,
+) -> None:
+    for tidx in np.asarray(time_indices, dtype=np.int64).reshape(-1):
+        arr = np.asarray(corpus_latents_by_tidx[int(tidx)], dtype=np.float32)
+        if arr.ndim != 2:
+            raise ValueError(
+                "Token-native conditional evaluation expects flattened corpus latents with shape "
+                f"(N, {expected_dim}), but latents_{int(tidx)} in {corpus_latents_path} has shape {arr.shape}."
+            )
+        if int(arr.shape[-1]) == expected_dim:
+            continue
+
+        suggestion = "Re-encode the corpus against this run contract."
+        if dataset_path is not None:
+            suggested_corpus_path = _default_corpus_dataset_path(dataset_path)
+            suggested_output_path = run_dir / "corpus_latents.npz"
+            suggestion = (
+                "Re-encode the corpus against this run contract, for example:\n"
+                f"python scripts/fae/tran_evaluation/encode_corpus.py "
+                f"--corpus_path {suggested_corpus_path} "
+                f"--run_dir {run_dir} "
+                f"--output_path {suggested_output_path}"
+            )
+        raise ValueError(
+            "Token-native conditional evaluation expects flattened transformer corpus latents with feature "
+            f"dimension {expected_dim} for token_shape={token_shape}, but {corpus_latents_path} stores "
+            f"latents_{int(tidx)} with shape {arr.shape}. This usually means you passed a legacy vector-latent "
+            f"corpus archive. {suggestion}"
+        )
+
+
+def _maybe_subsample_corpus_latents(
+    corpus_latents_by_tidx: dict[int, np.ndarray],
+    *,
+    time_indices: np.ndarray,
+    max_corpus_samples: int | None,
+    seed: int,
+) -> tuple[dict[int, np.ndarray], int, np.ndarray | None]:
+    first_tidx = int(np.asarray(time_indices, dtype=np.int64).reshape(-1)[0])
+    n_corpus = int(np.asarray(corpus_latents_by_tidx[first_tidx]).shape[0])
+    if max_corpus_samples is None or int(max_corpus_samples) <= 0 or n_corpus <= int(max_corpus_samples):
+        return corpus_latents_by_tidx, n_corpus, None
+
+    rng = np.random.default_rng(int(seed))
+    keep_idx = np.sort(
+        rng.choice(n_corpus, size=int(max_corpus_samples), replace=False).astype(np.int64)
+    )
+    reduced = {
+        int(tidx): np.asarray(corpus_latents_by_tidx[int(tidx)][keep_idx], dtype=np.float32)
+        for tidx in np.asarray(time_indices, dtype=np.int64).reshape(-1)
+    }
+    return reduced, int(keep_idx.shape[0]), keep_idx
+
+
+def sample_token_csp_conditionals(
+    drift_net,
     coarse_conditions: np.ndarray,
     *,
-    tau_start: float | None = None,
-    tau_end: float | None = None,
-    zt: np.ndarray | None = None,
+    zt: np.ndarray,
     dt0: float,
-    sigma_fn: Any,
+    sigma_fn,
     n_realizations: int,
     seed: int,
-    condition_mode: str | None = None,
+    condition_mode: str,
     global_conditions: np.ndarray | None = None,
-    condition_num_intervals: int | None = None,
     interval_offset: int = 0,
 ) -> np.ndarray:
     coarse_np = np.asarray(coarse_conditions, dtype=np.float32)
-    if coarse_np.ndim != 2:
-        raise ValueError(f"coarse_conditions must have shape (n_conditions, latent_dim), got {coarse_np.shape}.")
-    if int(n_realizations) <= 0:
-        raise ValueError("n_realizations must be positive.")
-
-    repeated = np.repeat(coarse_np, int(n_realizations), axis=0)
-    if condition_mode is None:
-        if tau_start is None or tau_end is None:
-            raise ValueError("tau_start and tau_end are required for legacy unconditional interval sampling.")
-        keys = jax.random.split(jax.random.PRNGKey(int(seed)), repeated.shape[0])
-        generated = _sample_interval_batch(
-            drift_net,
-            jnp.asarray(repeated, dtype=jnp.float32),
-            jnp.asarray(float(tau_start), dtype=jnp.float32),
-            jnp.asarray(float(tau_end), dtype=jnp.float32),
-            jnp.asarray(float(dt0), dtype=jnp.float32),
-            keys,
-            sigma_fn,
+    if coarse_np.ndim != 3:
+        raise ValueError(
+            "coarse_conditions must have shape (n_conditions, num_latents, token_dim), "
+            f"got {coarse_np.shape}."
         )
-        return np.asarray(generated, dtype=np.float32).reshape(coarse_np.shape[0], int(n_realizations), coarse_np.shape[1])
-
-    if zt is None:
-        raise ValueError("zt is required for sequential conditional interval sampling.")
+    repeated = np.repeat(coarse_np, int(n_realizations), axis=0)
     repeated_global = repeated if global_conditions is None else np.repeat(
         np.asarray(global_conditions, dtype=np.float32),
         int(n_realizations),
@@ -202,11 +232,9 @@ def sample_csp_conditionals(
     )
     if repeated_global.shape != repeated.shape:
         raise ValueError(
-            "global_conditions must match coarse_conditions in shape before realization expansion, "
-            f"got {np.asarray(global_conditions).shape if global_conditions is not None else None} "
-            f"and {coarse_np.shape}."
+            "global_conditions must match coarse_conditions before realization expansion."
         )
-    traj = sample_conditional_batch(
+    traj = sample_token_conditional_batch(
         drift_net,
         jnp.asarray(repeated, dtype=jnp.float32),
         jnp.asarray(np.asarray(zt, dtype=np.float32), dtype=jnp.float32),
@@ -215,30 +243,30 @@ def sample_csp_conditionals(
         jax.random.PRNGKey(int(seed)),
         condition_mode=str(condition_mode),
         global_condition_batch=jnp.asarray(repeated_global, dtype=jnp.float32),
-        condition_num_intervals=condition_num_intervals,
         interval_offset=int(interval_offset),
     )
-    generated = np.asarray(traj[:, 0, :], dtype=np.float32)
-    return generated.reshape(coarse_np.shape[0], int(n_realizations), coarse_np.shape[1])
+    generated = np.asarray(traj[:, 0, :, :], dtype=np.float32)
+    return generated.reshape(coarse_np.shape[0], int(n_realizations), -1)
 
 
 def _evaluate_scale_pair(
     *,
     pair_idx: int,
-    latent_test: np.ndarray,
-    corpus_z_coarse: np.ndarray,
-    corpus_z_fine: np.ndarray,
-    test_global_conditions: np.ndarray | None,
-    corpus_global_conditions: np.ndarray | None,
+    latent_test_tokens: np.ndarray,
+    latent_test_flat: np.ndarray,
+    corpus_z_coarse_flat: np.ndarray,
+    corpus_z_fine_flat: np.ndarray,
+    token_shape: tuple[int, int],
+    test_global_conditions_tokens: np.ndarray | None,
+    corpus_global_conditions_tokens: np.ndarray | None,
     test_sample_indices: np.ndarray,
     corpus_eval_indices: np.ndarray,
-    drift_net: Any,
+    drift_net,
     zt: np.ndarray,
     tau_knots: np.ndarray,
-    condition_mode: str | None,
-    condition_num_intervals: int | None,
+    condition_mode: str,
     dt0: float,
-    sigma_fn: Any,
+    sigma_fn,
     conditional_eval_mode: str,
     adaptive_config: AdaptiveReferenceConfig,
     k_neighbors: int,
@@ -250,31 +278,29 @@ def _evaluate_scale_pair(
     base_seed: int,
     rng: np.random.Generator,
 ) -> dict[str, object]:
-    test_conditions = np.asarray(latent_test[pair_idx + 1, test_sample_indices], dtype=np.float32)
+    test_conditions_tokens = np.asarray(latent_test_tokens[pair_idx + 1, test_sample_indices], dtype=np.float32)
+    test_conditions_flat = np.asarray(latent_test_flat[pair_idx + 1, test_sample_indices], dtype=np.float32)
     condition_metric = None
     corpus_z_coarse_metric = None
     if conditional_eval_mode == DEFAULT_CONDITIONAL_EVAL_MODE:
         condition_metric = fit_whitened_pca_metric(
-            corpus_z_coarse,
+            corpus_z_coarse_flat,
             variance_retained=float(adaptive_config.variance_retained),
             dim_cap=int(adaptive_config.metric_dim_cap),
         )
-        corpus_z_coarse_metric = transform_condition_vectors(corpus_z_coarse, condition_metric)
+        corpus_z_coarse_metric = transform_condition_vectors(corpus_z_coarse_flat, condition_metric)
     pair_zt = np.asarray(zt[pair_idx : pair_idx + 2], dtype=np.float32)
     interval_offset = int(len(zt) - 2 - pair_idx)
-    test_generated = sample_csp_conditionals(
+    test_generated = sample_token_csp_conditionals(
         drift_net,
-        test_conditions,
+        test_conditions_tokens,
         zt=pair_zt,
-        tau_start=float(tau_knots[pair_idx + 1]),
-        tau_end=float(tau_knots[pair_idx]),
         dt0=float(dt0),
         sigma_fn=sigma_fn,
         n_realizations=n_realizations,
         seed=base_seed,
         condition_mode=condition_mode,
-        global_conditions=test_global_conditions,
-        condition_num_intervals=condition_num_intervals,
+        global_conditions=test_global_conditions_tokens,
         interval_offset=interval_offset,
     )
 
@@ -288,11 +314,11 @@ def _evaluate_scale_pair(
     plot_generated_values: list[np.ndarray] = []
     plot_limit = max(0, min(int(n_plot_conditions), len(test_sample_indices)))
 
-    for sample_offset, z_test_coarse in enumerate(test_conditions):
+    for sample_offset, z_test_coarse in enumerate(test_conditions_flat):
         sampling_spec = build_local_reference_spec(
             query=z_test_coarse,
-            corpus_conditions=corpus_z_coarse,
-            corpus_targets=corpus_z_fine,
+            corpus_conditions=corpus_z_coarse_flat,
+            corpus_targets=corpus_z_fine_flat,
             conditional_eval_mode=conditional_eval_mode,
             k_neighbors=k_neighbors,
             condition_metric=condition_metric,
@@ -302,7 +328,7 @@ def _evaluate_scale_pair(
         )
         support_idx = sampling_spec_indices(sampling_spec)
         support_weights = sampling_spec_weights(sampling_spec)
-        ref_latents = corpus_z_fine[support_idx]
+        ref_latents = corpus_z_fine_flat[support_idx]
         z_gen_np = test_generated[sample_offset]
 
         latent_w1, latent_w2 = wasserstein1_wasserstein2_latents(
@@ -314,9 +340,9 @@ def _evaluate_scale_pair(
         latent_w1_values.append(latent_w1)
         latent_w2_values.append(latent_w2)
 
-        n_null = int(min(n_realizations, corpus_z_fine.shape[0]))
-        null_idx = rng.choice(corpus_z_fine.shape[0], size=n_null, replace=False)
-        z_null = corpus_z_fine[null_idx]
+        n_null = int(min(n_realizations, corpus_z_fine_flat.shape[0]))
+        null_idx = rng.choice(corpus_z_fine_flat.shape[0], size=n_null, replace=False)
+        z_null = corpus_z_fine_flat[null_idx]
         latent_w1_null, latent_w2_null = wasserstein1_wasserstein2_latents(
             z_null,
             ref_latents,
@@ -329,7 +355,7 @@ def _evaluate_scale_pair(
         if sample_offset < plot_limit:
             plot_rng = np.random.default_rng(int(base_seed) + 500_000 + int(sample_offset))
             reference_plot_samples = sample_weighted_rows(
-                corpus_z_fine,
+                corpus_z_fine_flat,
                 support_idx,
                 np.asarray(support_weights, dtype=np.float64),
                 int(n_realizations),
@@ -359,26 +385,24 @@ def _evaluate_scale_pair(
                 flush=True,
             )
 
-    ecmmd_conditions = corpus_z_coarse[corpus_eval_indices].astype(np.float32)
-    ecmmd_generated = sample_csp_conditionals(
+    ecmmd_conditions_flat = corpus_z_coarse_flat[corpus_eval_indices].astype(np.float32)
+    ecmmd_conditions_tokens = _unflatten_tokens(ecmmd_conditions_flat, token_shape)
+    ecmmd_generated = sample_token_csp_conditionals(
         drift_net,
-        ecmmd_conditions,
+        ecmmd_conditions_tokens,
         zt=pair_zt,
-        tau_start=float(tau_knots[pair_idx + 1]),
-        tau_end=float(tau_knots[pair_idx]),
         dt0=float(dt0),
         sigma_fn=sigma_fn,
         n_realizations=n_realizations,
         seed=base_seed + 100_000,
         condition_mode=condition_mode,
-        global_conditions=corpus_global_conditions,
-        condition_num_intervals=condition_num_intervals,
+        global_conditions=corpus_global_conditions_tokens,
         interval_offset=interval_offset,
     )
     ecmmd_reference, ecmmd_sampling_specs = build_local_reference_samples(
-        conditions=ecmmd_conditions,
-        corpus_conditions=corpus_z_coarse,
-        corpus_targets=corpus_z_fine,
+        conditions=ecmmd_conditions_flat,
+        corpus_conditions=corpus_z_coarse_flat,
+        corpus_targets=corpus_z_fine_flat,
         corpus_condition_indices=corpus_eval_indices,
         k_neighbors=k_neighbors,
         n_realizations=n_realizations,
@@ -389,22 +413,24 @@ def _evaluate_scale_pair(
         adaptive_config=adaptive_config,
     )
     reference_support, reference_weights, reference_indices, reference_counts = pack_reference_support_arrays(
-        corpus_z_fine,
+        corpus_z_fine_flat,
         ecmmd_sampling_specs,
     )
     adaptive_radii = np.asarray([sampling_spec_radius(spec) for spec in ecmmd_sampling_specs], dtype=np.float32)
     reference_ess = np.asarray([sampling_spec_ess(spec) for spec in ecmmd_sampling_specs], dtype=np.float32)
     reference_mean_rse = np.asarray([sampling_spec_mean_rse(spec) for spec in ecmmd_sampling_specs], dtype=np.float32)
-    reference_eig_rse = np.stack([sampling_spec_eig_rse(spec) for spec in ecmmd_sampling_specs], axis=0).astype(np.float32)
+    reference_eig_rse = np.stack([sampling_spec_eig_rse(spec) for spec in ecmmd_sampling_specs], axis=0).astype(
+        np.float32
+    )
     graph_condition_vectors = (
-        transform_condition_vectors(ecmmd_conditions, condition_metric)
+        transform_condition_vectors(ecmmd_conditions_flat, condition_metric)
         if conditional_eval_mode == DEFAULT_CONDITIONAL_EVAL_MODE and condition_metric is not None
         else None
     )
     ecmmd_real_samples = reference_support if conditional_eval_mode == DEFAULT_CONDITIONAL_EVAL_MODE else ecmmd_reference
     ecmmd_reference_weights = reference_weights if conditional_eval_mode == DEFAULT_CONDITIONAL_EVAL_MODE else None
     latent_ecmmd = compute_ecmmd_metrics(
-        ecmmd_conditions,
+        ecmmd_conditions_flat,
         ecmmd_real_samples,
         ecmmd_generated,
         ecmmd_k_values,
@@ -415,9 +441,9 @@ def _evaluate_scale_pair(
     )
     latent_ecmmd = add_bootstrap_ecmmd_calibration(
         latent_ecmmd,
-        conditions=ecmmd_conditions,
+        conditions=ecmmd_conditions_flat,
         reference_samples=ecmmd_real_samples,
-        corpus_targets=corpus_z_fine,
+        corpus_targets=corpus_z_fine_flat,
         sampling_specs=ecmmd_sampling_specs,
         k_values=ecmmd_k_values,
         n_bootstrap=ecmmd_bootstrap_reps,
@@ -450,7 +476,7 @@ def _evaluate_scale_pair(
         "latent_w2_values": np.asarray(latent_w2_values, dtype=np.float64),
         "latent_w1_null_values": np.asarray(latent_w1_null_values, dtype=np.float64),
         "latent_w2_null_values": np.asarray(latent_w2_null_values, dtype=np.float64),
-        "latent_ecmmd_conditions": ecmmd_conditions.astype(np.float32),
+        "latent_ecmmd_conditions": ecmmd_conditions_flat.astype(np.float32),
         "latent_ecmmd_reference": ecmmd_reference.astype(np.float32),
         "latent_ecmmd_generated": ecmmd_generated.astype(np.float32),
         "latent_ecmmd": latent_ecmmd,
@@ -477,7 +503,7 @@ def _build_summary_text(
     metrics: dict[str, object],
 ) -> str:
     lines = [
-        "CSP Latent Conditional Evaluation",
+        "Token-Native CSP Latent Conditional Evaluation",
         "=" * 50,
         f"conditional_eval_mode: {conditional_eval_mode}",
         f"k_neighbors: {args.k_neighbors}",
@@ -575,36 +601,60 @@ def main() -> None:
     )
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    runtime = load_csp_sampling_runtime(
+    runtime = load_token_csp_sampling_runtime(
         run_dir,
         latents_override=args.latents_path,
         fae_checkpoint_override=args.fae_checkpoint,
     )
     latents_path = runtime.source.latents_path
-    latent_test = runtime.archive.latent_test
+    latent_test_tokens = runtime.archive.latent_test
+    latent_test_flat = latent_test_tokens.reshape(
+        latent_test_tokens.shape[0],
+        latent_test_tokens.shape[1],
+        -1,
+    )
     zt = runtime.archive.zt
     time_indices = runtime.archive.time_indices
     tau_knots = runtime.tau_knots
-    t_count, n_test, latent_dim = latent_test.shape
+    token_shape = runtime.archive.token_shape
+    t_count, n_test, _latent_dim = latent_test_flat.shape
     if n_test <= 0:
-        raise ValueError("No test latents available for CSP conditional evaluation.")
+        raise ValueError("No test latents available for token-native CSP conditional evaluation.")
 
     corpus_latents_path = Path(args.corpus_latents_path).expanduser()
     if not corpus_latents_path.is_absolute():
         corpus_latents_path = (_REPO_ROOT / corpus_latents_path).resolve()
-    corpus_latents_by_tidx, n_corpus = load_corpus_latents(corpus_latents_path, time_indices)
-    condition_mode = runtime.condition_mode if runtime.model_type == "conditional_bridge" else None
-    condition_num_intervals = int(t_count - 1) if condition_mode is not None else None
+    corpus_latents_by_tidx, n_corpus_original = load_corpus_latents(corpus_latents_path, time_indices)
+    _validate_flat_corpus_latents(
+        corpus_latents_by_tidx,
+        time_indices=time_indices,
+        token_shape=token_shape,
+        expected_dim=int(token_shape[0] * token_shape[1]),
+        corpus_latents_path=corpus_latents_path,
+        run_dir=run_dir,
+        dataset_path=getattr(runtime.source, "dataset_path", None),
+    )
+    corpus_latents_by_tidx, n_corpus, corpus_keep_indices = _maybe_subsample_corpus_latents(
+        corpus_latents_by_tidx,
+        time_indices=time_indices,
+        max_corpus_samples=getattr(args, "max_corpus_samples", None),
+        seed=args.seed,
+    )
+    condition_mode = runtime.condition_mode
 
     print("============================================================", flush=True)
-    print("CSP latent conditional evaluation", flush=True)
+    print("Token-native CSP latent conditional evaluation", flush=True)
     print(f"  run_dir            : {run_dir}", flush=True)
     print(f"  output_dir         : {output_dir}", flush=True)
     print(f"  model_type         : {runtime.model_type}", flush=True)
     print(f"  condition_mode     : {condition_mode}", flush=True)
     print(f"  conditional_eval_mode : {conditional_eval_mode}", flush=True)
+    print(f"  token_shape        : {token_shape}", flush=True)
     print(f"  source_latents     : {latents_path}", flush=True)
     print(f"  corpus_latents     : {corpus_latents_path}", flush=True)
+    print(f"  n_corpus           : {n_corpus}", flush=True)
+    if corpus_keep_indices is not None:
+        print(f"  n_corpus_original  : {n_corpus_original}", flush=True)
     print(f"  n_test_samples     : {min(args.n_test_samples, n_test)}", flush=True)
     print(f"  n_ecmmd_conditions : {min(args.n_test_samples, n_corpus)}", flush=True)
     print(f"  n_realizations     : {args.n_realizations}", flush=True)
@@ -620,21 +670,17 @@ def main() -> None:
     corpus_eval_indices = rng.choice(n_corpus, size=min(args.n_test_samples, n_corpus), replace=False)
     corpus_eval_indices.sort()
     full_H_schedule = build_full_H_schedule(args.H_meso_list, args.H_macro)
-    global_test_conditions = (
-        np.asarray(latent_test[-1, test_sample_indices], dtype=np.float32)
-        if condition_mode is not None and condition_mode != "previous_state"
+    global_test_conditions_tokens = (
+        np.asarray(latent_test_tokens[-1, test_sample_indices], dtype=np.float32)
+        if condition_mode != "previous_state"
         else None
     )
-    corpus_global_latents = (
-        np.asarray(corpus_latents_by_tidx[int(time_indices[-1])], dtype=np.float32)
-        if condition_mode is not None and condition_mode != "previous_state"
-        else None
-    )
-    corpus_global_conditions = (
-        np.asarray(corpus_global_latents[corpus_eval_indices], dtype=np.float32)
-        if corpus_global_latents is not None
-        else None
-    )
+    corpus_global_conditions_tokens = None
+    if condition_mode != "previous_state":
+        corpus_global_conditions_tokens = _unflatten_tokens(
+            np.asarray(corpus_latents_by_tidx[int(time_indices[-1])][corpus_eval_indices], dtype=np.float32),
+            token_shape,
+        )
 
     results_latent_w1_all: dict[str, np.ndarray] = {}
     results_latent_w2_all: dict[str, np.ndarray] = {}
@@ -695,18 +741,19 @@ def main() -> None:
 
         pair_result = _evaluate_scale_pair(
             pair_idx=pair_idx,
-            latent_test=latent_test,
-            corpus_z_coarse=corpus_latents_by_tidx[tidx_coarse],
-            corpus_z_fine=corpus_latents_by_tidx[tidx_fine],
-            test_global_conditions=global_test_conditions,
-            corpus_global_conditions=corpus_global_conditions,
+            latent_test_tokens=latent_test_tokens,
+            latent_test_flat=latent_test_flat,
+            corpus_z_coarse_flat=np.asarray(corpus_latents_by_tidx[tidx_coarse], dtype=np.float32),
+            corpus_z_fine_flat=np.asarray(corpus_latents_by_tidx[tidx_fine], dtype=np.float32),
+            token_shape=token_shape,
+            test_global_conditions_tokens=global_test_conditions_tokens,
+            corpus_global_conditions_tokens=corpus_global_conditions_tokens,
             test_sample_indices=test_sample_indices,
             corpus_eval_indices=corpus_eval_indices,
             drift_net=runtime.model,
             zt=zt,
             tau_knots=tau_knots,
             condition_mode=condition_mode,
-            condition_num_intervals=condition_num_intervals,
             dt0=float(runtime.dt0),
             sigma_fn=runtime.sigma_fn,
             conditional_eval_mode=conditional_eval_mode,
@@ -831,6 +878,7 @@ def main() -> None:
         "model_type": runtime.model_type,
         "condition_mode": condition_mode,
         "conditional_eval_mode": conditional_eval_mode,
+        "token_shape": list(map(int, token_shape)),
         "source_latents_path": str(latents_path),
         "corpus_latents_path": str(corpus_latents_path),
         "k_neighbors": int(args.k_neighbors),
@@ -843,6 +891,12 @@ def main() -> None:
         "n_ecmmd_conditions": int(len(corpus_eval_indices)),
         "n_realizations": int(args.n_realizations),
         "n_corpus": int(n_corpus),
+        "n_corpus_original": int(n_corpus_original),
+        "max_corpus_samples": (
+            None
+            if getattr(args, "max_corpus_samples", None) is None
+            else int(getattr(args, "max_corpus_samples"))
+        ),
         "time_indices": time_indices.tolist(),
         "zt": zt.astype(float).tolist(),
         "tau_knots": tau_knots.astype(float).tolist(),
@@ -855,9 +909,12 @@ def main() -> None:
         "time_indices": time_indices.astype(np.int64),
         "zt": zt.astype(np.float32),
         "tau_knots": tau_knots.astype(np.float32),
+        "token_shape": np.asarray(token_shape, dtype=np.int64),
         "ecmmd_k_values_requested": np.asarray(ecmmd_k_values, dtype=np.int64),
         "pair_labels": np.asarray(pair_labels, dtype=object),
     }
+    if corpus_keep_indices is not None:
+        npz_dict["corpus_keep_indices"] = corpus_keep_indices.astype(np.int64)
 
     for pair_label in pair_labels:
         mean_w1_null = float(results_latent_w1_null_all[pair_label].mean())
@@ -1019,17 +1076,25 @@ def main() -> None:
         "model_type": runtime.model_type,
         "condition_mode": condition_mode,
         "conditional_eval_mode": conditional_eval_mode,
+        "token_shape": list(map(int, token_shape)),
         "source_latents_path": str(latents_path),
         "corpus_latents_path": str(corpus_latents_path),
         "n_test_samples": int(len(test_sample_indices)),
         "n_ecmmd_conditions": int(len(corpus_eval_indices)),
         "n_realizations": int(args.n_realizations),
+        "n_corpus": int(n_corpus),
+        "n_corpus_original": int(n_corpus_original),
         "k_neighbors": int(args.k_neighbors),
         "ecmmd_k_values_requested": ecmmd_k_values,
         "ecmmd_bootstrap_reps": int(args.ecmmd_bootstrap_reps),
         "adaptive_metric_dim_cap": int(adaptive_config.metric_dim_cap),
         "adaptive_reference_bootstrap_reps": int(adaptive_config.bootstrap_reps),
         "adaptive_ess_min": int(adaptive_config.ess_min),
+        "max_corpus_samples": (
+            None
+            if getattr(args, "max_corpus_samples", None) is None
+            else int(getattr(args, "max_corpus_samples"))
+        ),
         "seed": int(args.seed),
         "n_plot_conditions": int(max(0, args.n_plot_conditions)),
         "plot_value_budget": int(args.plot_value_budget),
@@ -1037,7 +1102,7 @@ def main() -> None:
         "conditional_ecmmd_figures": conditional_ecmmd_figures,
     }
     (output_dir / "conditional_latent_manifest.json").write_text(json.dumps(manifest, indent=2))
-    print(f"\nAll CSP conditional latent results saved to {output_dir}/", flush=True)
+    print(f"\nAll token-native CSP conditional latent results saved to {output_dir}/", flush=True)
 
 
 if __name__ == "__main__":

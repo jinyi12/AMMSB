@@ -10,20 +10,16 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 
-from ._conditional_bridge import (
-    local_interval_time,
-    make_bridge_condition,
-    validate_bridge_condition_dim,
-)
+from ._conditional_bridge import local_interval_time
 from ._trajectory_layout import generation_zt_from_data_zt, reverse_level_order, validate_data_zt
-from .sde import ConditionalDriftNet
+from .token_dit import TokenConditionalDiT, make_token_bridge_condition
 
 
-def _validate_bridge_matching_inputs(latent_data: jax.Array, zt: jax.Array) -> None:
+def _validate_token_bridge_matching_inputs(latent_data: jax.Array, zt: jax.Array) -> None:
     latent_np = np.asarray(latent_data)
 
-    if latent_np.ndim != 3:
-        raise ValueError(f"latent_data must have shape (T, N, K), got {latent_np.shape}.")
+    if latent_np.ndim != 4:
+        raise ValueError(f"latent_data must have shape (T, N, L, D), got {latent_np.shape}.")
     validate_data_zt(zt)
     zt_np = np.asarray(zt)
     if latent_np.shape[0] != zt_np.shape[0]:
@@ -36,12 +32,8 @@ def _validate_bridge_matching_inputs(latent_data: jax.Array, zt: jax.Array) -> N
         raise ValueError("latent_data contains non-finite values.")
 
 
-def _generation_view(
-    latent_data: jax.Array,
-    zt: jax.Array,
-) -> tuple[jax.Array, jax.Array]:
-    """Return a coarse-to-fine view for training from stored fine-to-coarse data."""
-    _validate_bridge_matching_inputs(latent_data, zt)
+def _generation_view(latent_data: jax.Array, zt: jax.Array) -> tuple[jax.Array, jax.Array]:
+    _validate_token_bridge_matching_inputs(latent_data, zt)
     latent_jax = jnp.asarray(latent_data, dtype=jnp.float32)
     return reverse_level_order(latent_jax), generation_zt_from_data_zt(zt)
 
@@ -51,10 +43,10 @@ def _select_batch(latent_data: jax.Array, batch_size: int | None, key: jax.Array
     if batch_size is None or batch_size >= n_samples:
         return latent_data
     indices = jax.random.choice(key, n_samples, shape=(int(batch_size),), replace=False)
-    return latent_data[:, indices, :]
+    return latent_data[:, indices, :, :]
 
 
-def sample_brownian_bridge(
+def sample_token_brownian_bridge(
     x_start: jax.Array,
     x_end: jax.Array,
     t: jax.Array | float,
@@ -63,7 +55,6 @@ def sample_brownian_bridge(
     sigma: float,
     key: jax.Array,
 ) -> jax.Array:
-    """Sample an exact Brownian bridge state between two endpoints."""
     x_start_arr = jnp.asarray(x_start)
     x_end_arr = jnp.asarray(x_end, dtype=x_start_arr.dtype)
     t_arr = jnp.asarray(t, dtype=x_start_arr.dtype)
@@ -82,13 +73,12 @@ def sample_brownian_bridge(
     return mean_t + jnp.sqrt(var_t) * noise
 
 
-def bridge_target(
+def token_bridge_target(
     x_t: jax.Array,
     x_end: jax.Array,
     t: jax.Array | float,
     t_end: jax.Array | float,
 ) -> jax.Array:
-    """Analytical Brownian bridge drift target."""
     x_t_arr = jnp.asarray(x_t)
     return (jnp.asarray(x_end, dtype=x_t_arr.dtype) - x_t_arr) / (
         jnp.asarray(t_end, dtype=x_t_arr.dtype) - jnp.asarray(t, dtype=x_t_arr.dtype)
@@ -113,42 +103,27 @@ def _sample_truncated_interval_time(
     midpoint = jnp.asarray(t_start, dtype=dtype) + 0.5 * interval_length
     u = jax.random.uniform(time_key, (int(batch_size), 1), dtype=dtype)
     truncated = jnp.asarray(t_start, dtype=dtype) + epsilon + u * span
-    return jnp.where(span > 0.0, truncated, midpoint)
+    truncated = jnp.where(span > 0.0, truncated, midpoint)
+    return truncated.reshape((int(batch_size), 1, 1))
 
 
-def make_bridge_matching_loss_fn(
-    static_model: ConditionalDriftNet,
+def make_token_bridge_matching_loss_fn(
+    static_model: TokenConditionalDiT,
     latent_data: jax.Array | None = None,
     zt: jax.Array | None = None,
     sigma: float = 1.0,
     *,
     batch_size: int | None = 256,
     condition_mode: str = "global_and_previous",
-    include_interval_embedding: bool = True,
     endpoint_epsilon: float = 1e-3,
 ) -> Callable[..., jax.Array]:
-    """Return a pure loss function for sequential conditional Brownian bridge matching.
-
-    Args:
-        sigma: Brownian reference diffusion coefficient.
-        The loss uses an equal-weight interval average each step to remove the
-        avoidable variance from sampling a single interval for the whole batch.
-    """
     def loss_fn(
-        params: ConditionalDriftNet,
+        params: TokenConditionalDiT,
         key: jax.Array,
         latent_canonical: jax.Array,
         zt_canonical: jax.Array,
     ) -> jax.Array:
-        latent_dim = int(latent_canonical.shape[-1])
         num_intervals = int(latent_canonical.shape[0] - 1)
-        validate_bridge_condition_dim(
-            static_model,
-            latent_dim=latent_dim,
-            num_intervals=num_intervals,
-            condition_mode=condition_mode,
-            include_interval_embedding=include_interval_embedding,
-        )
         drift = eqx.combine(params, static_model)
         batch_key, time_key, bridge_key = jax.random.split(key, 3)
         batch = _select_batch(latent_canonical, batch_size, batch_key)
@@ -162,14 +137,14 @@ def make_bridge_matching_loss_fn(
             x_end = batch[interval_idx + 1]
             t_start = zt_canonical[interval_idx]
             t_end = zt_canonical[interval_idx + 1]
-            condition = make_bridge_condition(
-                global_condition,
-                x_start,
-                interval_idx=interval_idx,
-                num_intervals=num_intervals,
-                condition_mode=condition_mode,
-                include_interval_embedding=include_interval_embedding,
-            )
+            condition = jax.vmap(
+                lambda global_tokens, previous_tokens: make_token_bridge_condition(
+                    global_tokens,
+                    previous_tokens,
+                    interval_idx=interval_idx,
+                    condition_mode=condition_mode,
+                )
+            )(global_condition, x_start)
             t = _sample_truncated_interval_time(
                 time_key=interval_time_key,
                 batch_size=int(batch.shape[1]),
@@ -178,10 +153,14 @@ def make_bridge_matching_loss_fn(
                 t_end=t_end,
                 endpoint_epsilon=endpoint_epsilon,
             )
-            x_t = sample_brownian_bridge(x_start, x_end, t, t_start, t_end, sigma, interval_bridge_key)
-            target = bridge_target(x_t, x_end, t, t_end)
-            pred = jax.vmap(drift)(local_interval_time(t, t_start, t_end).squeeze(-1), x_t, condition)
-            return jnp.mean(jnp.sum(jnp.square(pred - target), axis=-1))
+            x_t = sample_token_brownian_bridge(x_start, x_end, t, t_start, t_end, sigma, interval_bridge_key)
+            target = token_bridge_target(x_t, x_end, t, t_end)
+            pred = jax.vmap(drift)(
+                local_interval_time(t, t_start, t_end).reshape((int(batch.shape[1]),)),
+                x_t,
+                condition,
+            )
+            return jnp.mean(jnp.sum(jnp.square(pred - target), axis=(-2, -1)))
 
         interval_losses = jax.vmap(_interval_loss)(interval_indices, time_keys, bridge_keys)
         return jnp.mean(interval_losses)
@@ -192,14 +171,14 @@ def make_bridge_matching_loss_fn(
         raise ValueError("latent_data and zt must both be provided for the legacy loss-factory form.")
     latent_canonical, zt_canonical = _generation_view(latent_data, zt)
 
-    def legacy_loss_fn(params: ConditionalDriftNet, key: jax.Array) -> jax.Array:
+    def legacy_loss_fn(params: TokenConditionalDiT, key: jax.Array) -> jax.Array:
         return loss_fn(params, key, latent_canonical, zt_canonical)
 
     return legacy_loss_fn
 
 
-def train_bridge_matching(
-    drift_net: ConditionalDriftNet,
+def train_token_bridge_matching(
+    drift_net: TokenConditionalDiT,
     latent_data: jax.Array,
     zt: jax.Array,
     sigma: float,
@@ -209,40 +188,32 @@ def train_bridge_matching(
     batch_size: int | None = 256,
     seed: int = 0,
     condition_mode: str = "global_and_previous",
-    include_interval_embedding: bool = True,
     endpoint_epsilon: float = 1e-3,
     return_losses: bool = False,
     progress_every: int | None = None,
     progress_fn: Callable[[dict[str, float | int | bool]], None] | None = None,
-) -> ConditionalDriftNet | tuple[ConditionalDriftNet, jax.Array]:
-    """Train a sequential paired-data conditional drift via bridge matching regression.
-
-    The stored training tuples and zt grid follow the repo-wide data order:
-    fine-to-coarse. The reverse coarse-to-fine conditional-generation direction
-    is constructed internally.
-    """
-    _validate_bridge_matching_inputs(latent_data, zt)
+) -> TokenConditionalDiT | tuple[TokenConditionalDiT, jax.Array]:
+    _validate_token_bridge_matching_inputs(latent_data, zt)
     latent_jax, zt_canonical = _generation_view(latent_data, zt)
     params, static = eqx.partition(drift_net, eqx.is_inexact_array)
     optimizer = optax.adamw(learning_rate=lr)
     opt_state = optimizer.init(params)
-    loss_fn = make_bridge_matching_loss_fn(
+    loss_fn = make_token_bridge_matching_loss_fn(
         static,
         sigma=sigma,
         batch_size=batch_size,
         condition_mode=condition_mode,
-        include_interval_embedding=include_interval_embedding,
         endpoint_epsilon=endpoint_epsilon,
     )
 
     @jax.jit
     def step(
-        params: ConditionalDriftNet,
+        params: TokenConditionalDiT,
         opt_state: optax.OptState,
         key: jax.Array,
         latent_canonical: jax.Array,
         zt_canonical: jax.Array,
-    ) -> tuple[ConditionalDriftNet, optax.OptState, jax.Array]:
+    ) -> tuple[TokenConditionalDiT, optax.OptState, jax.Array]:
         loss, grads = jax.value_and_grad(loss_fn)(params, key, latent_canonical, zt_canonical)
         updates, new_opt_state = optimizer.update(grads, opt_state, params=params)
         new_params = optax.apply_updates(params, updates)
@@ -307,3 +278,11 @@ def train_bridge_matching(
     if return_losses:
         return trained_model, jnp.asarray(losses, dtype=latent_jax.dtype)
     return trained_model
+
+
+__all__ = [
+    "make_token_bridge_matching_loss_fn",
+    "sample_token_brownian_bridge",
+    "token_bridge_target",
+    "train_token_bridge_matching",
+]

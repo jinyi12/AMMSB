@@ -1484,11 +1484,11 @@ def build_hierarchical_gaussian_summary_text(summary: dict[str, Any]) -> str:
         f"tau_knots: {summary['tau_knots']}",
         f"coarse_to_fine_dims: {summary['benchmark_config']['coarse_to_fine_dims']}",
         "",
-        "Teacher-forced one-step",
+        "Interval-conditioned one-step",
     ]
 
     for key in summary["interval_keys"]:
-        metrics = summary["teacher_forced"][key]
+        metrics = summary["interval_conditioned"][key]
         lines.append(
             f"  {key}: W1={metrics['w1']['mean']:.4f} +/- {metrics['w1']['std']:.4f}, "
             f"W2={metrics['w2']['mean']:.4f} +/- {metrics['w2']['std']:.4f}, "
@@ -1574,11 +1574,11 @@ def evaluate_hierarchical_gaussian_sampler_benchmark(
     seed_indices = np.sort(rng.choice(n_test, size=eval_count, replace=False)).astype(np.int64)
 
     interval_keys = [problem_obj.interval_key(coarse_level) for coarse_level in range(cfg.num_levels - 1, 0, -1)]
-    teacher_forced: dict[str, dict[str, object]] = {}
+    interval_conditioned: dict[str, dict[str, object]] = {}
     npz_payload: dict[str, Any] = {
         "tau_knots": tau_knots_np.astype(np.float32),
         "zt": (1.0 - tau_knots_np).astype(np.float32),
-        "teacher_forced_condition_indices": condition_indices,
+        "interval_conditioned_condition_indices": condition_indices,
         "free_rollout_seed_indices": seed_indices,
         "benchmark_coarse_to_fine_dims": np.asarray(cfg.coarse_to_fine_dims, dtype=np.int64),
     }
@@ -1614,14 +1614,14 @@ def evaluate_hierarchical_gaussian_sampler_benchmark(
         metrics["generated_logpdf"] = _metric_summary(generated_logpdf)
         metrics["generated_minus_oracle_logpdf_mean"] = float(np.mean(generated_logpdf) - np.mean(oracle_logpdf))
         metrics["root_copy_error"] = _summarize_root_copy_error(generated, root_ref, cfg)
-        teacher_forced[key] = metrics
-        npz_payload[f"teacher_forced_{key}_conditions"] = conditions.astype(np.float32)
-        npz_payload[f"teacher_forced_{key}_oracle"] = oracle.astype(np.float32)
-        npz_payload[f"teacher_forced_{key}_generated"] = generated.astype(np.float32)
-        npz_payload[f"teacher_forced_{key}_w1_values"] = w1_arr.astype(np.float32)
-        npz_payload[f"teacher_forced_{key}_w2_values"] = w2_arr.astype(np.float32)
-        npz_payload[f"teacher_forced_{key}_oracle_logpdf"] = np.asarray(oracle_logpdf, dtype=np.float32)
-        npz_payload[f"teacher_forced_{key}_generated_logpdf"] = np.asarray(generated_logpdf, dtype=np.float32)
+        interval_conditioned[key] = metrics
+        npz_payload[f"interval_conditioned_{key}_conditions"] = conditions.astype(np.float32)
+        npz_payload[f"interval_conditioned_{key}_oracle"] = oracle.astype(np.float32)
+        npz_payload[f"interval_conditioned_{key}_generated"] = generated.astype(np.float32)
+        npz_payload[f"interval_conditioned_{key}_w1_values"] = w1_arr.astype(np.float32)
+        npz_payload[f"interval_conditioned_{key}_w2_values"] = w2_arr.astype(np.float32)
+        npz_payload[f"interval_conditioned_{key}_oracle_logpdf"] = np.asarray(oracle_logpdf, dtype=np.float32)
+        npz_payload[f"interval_conditioned_{key}_generated_logpdf"] = np.asarray(generated_logpdf, dtype=np.float32)
 
     coarse_conditions = latent_test_np[-1, seed_indices]
     oracle_rollouts = problem_obj.sample_rollouts(
@@ -1692,48 +1692,48 @@ def evaluate_hierarchical_gaussian_sampler_benchmark(
         npz_payload[f"free_rollout_{prefix_key}_w2_values"] = prefix_w2.astype(np.float32)
 
     finest_interval_coarse_level = 1
-    teacher_figures_by_interval: dict[str, dict[str, str]] = {}
+    interval_conditioned_figures_by_interval: dict[str, dict[str, str]] = {}
     for coarse_level in range(cfg.num_levels - 1, 0, -1):
         interval_key = problem_obj.interval_key(coarse_level)
-        teacher_plot_indices = _select_plot_indices(
+        interval_plot_indices = _select_plot_indices(
             latent_test_np[coarse_level],
             int(n_plot_conditions),
             data_level=coarse_level,
             config=cfg,
         )
-        teacher_plot_conditions = latent_test_np[coarse_level, teacher_plot_indices]
-        teacher_plot_oracle = problem_obj.sample_interval(
-            teacher_plot_conditions,
+        interval_plot_conditions = latent_test_np[coarse_level, interval_plot_indices]
+        interval_plot_oracle = problem_obj.sample_interval(
+            interval_plot_conditions,
             coarse_level,
             n_realizations=int(plot_samples),
             seed=int(seed) + 200_000 + 10_000 * int(coarse_level),
         )
-        teacher_plot_generated = sample_conditionals_fn(
-            teacher_plot_conditions,
+        interval_plot_generated = sample_conditionals_fn(
+            interval_plot_conditions,
             coarse_level,
             int(plot_samples),
             int(seed) + 210_000 + 10_000 * int(coarse_level),
         )
-        teacher_figures = plot_conditioned_field_profiles(
-            condition_states=teacher_plot_conditions,
-            oracle_samples=teacher_plot_oracle,
-            generated_samples=teacher_plot_generated,
+        interval_figures = plot_conditioned_field_profiles(
+            condition_states=interval_plot_conditions,
+            oracle_samples=interval_plot_oracle,
+            generated_samples=interval_plot_generated,
             coarse_level=coarse_level,
             config=cfg,
-            output_stem=output_path / f"fig_teacher_forced_{interval_key}_field_profiles",
-            title=f"Teacher-forced conditional coordinate densities (pooled): {interval_key}",
+            output_stem=output_path / f"fig_interval_conditioned_{interval_key}_field_profiles",
+            title=f"Interval-conditioned conditional coordinate densities (pooled): {interval_key}",
         )
-        teacher_figures_by_interval[interval_key] = teacher_figures
-        npz_payload[f"teacher_plot_{interval_key}_indices"] = teacher_plot_indices.astype(np.int64)
-        npz_payload[f"teacher_plot_{interval_key}_conditions"] = teacher_plot_conditions.astype(np.float32)
-        npz_payload[f"teacher_plot_{interval_key}_oracle"] = teacher_plot_oracle.astype(np.float32)
-        npz_payload[f"teacher_plot_{interval_key}_generated"] = teacher_plot_generated.astype(np.float32)
+        interval_conditioned_figures_by_interval[interval_key] = interval_figures
+        npz_payload[f"interval_conditioned_plot_{interval_key}_indices"] = interval_plot_indices.astype(np.int64)
+        npz_payload[f"interval_conditioned_plot_{interval_key}_conditions"] = interval_plot_conditions.astype(np.float32)
+        npz_payload[f"interval_conditioned_plot_{interval_key}_oracle"] = interval_plot_oracle.astype(np.float32)
+        npz_payload[f"interval_conditioned_plot_{interval_key}_generated"] = interval_plot_generated.astype(np.float32)
 
         if coarse_level == finest_interval_coarse_level:
-            npz_payload["teacher_plot_indices"] = teacher_plot_indices.astype(np.int64)
-            npz_payload["teacher_plot_conditions"] = teacher_plot_conditions.astype(np.float32)
-            npz_payload["teacher_plot_oracle"] = teacher_plot_oracle.astype(np.float32)
-            npz_payload["teacher_plot_generated"] = teacher_plot_generated.astype(np.float32)
+            npz_payload["interval_conditioned_plot_indices"] = interval_plot_indices.astype(np.int64)
+            npz_payload["interval_conditioned_plot_conditions"] = interval_plot_conditions.astype(np.float32)
+            npz_payload["interval_conditioned_plot_oracle"] = interval_plot_oracle.astype(np.float32)
+            npz_payload["interval_conditioned_plot_generated"] = interval_plot_generated.astype(np.float32)
 
     rollout_plot_indices = _select_plot_indices(
         latent_test_np[-1],
@@ -1774,14 +1774,14 @@ def evaluate_hierarchical_gaussian_sampler_benchmark(
         "plot_samples": int(plot_samples),
         "tau_knots": tau_knots_np.astype(float).tolist(),
         "zt": (1.0 - tau_knots_np).astype(float).tolist(),
-        "teacher_forced_condition_indices": condition_indices.astype(int).tolist(),
+        "interval_conditioned_condition_indices": condition_indices.astype(int).tolist(),
         "free_rollout_seed_indices": seed_indices.astype(int).tolist(),
-        "teacher_forced": teacher_forced,
+        "interval_conditioned": interval_conditioned,
         "free_rollout": free_rollout,
         "figures": {
             **{
-                f"teacher_forced_{interval_key}_{ext}": path
-                for interval_key, figure_paths in teacher_figures_by_interval.items()
+                f"interval_conditioned_{interval_key}_{ext}": path
+                for interval_key, figure_paths in interval_conditioned_figures_by_interval.items()
                 for ext, path in figure_paths.items()
             },
             f"free_rollout_x{coarsest_level}_to_x0_png": rollout_figures["png"],

@@ -10,7 +10,7 @@ fi
 cd "$REPO_ROOT"
 
 ENV_NAME="${ENV_NAME:-3MASB}"
-CSP_RUN_DIR="${CSP_RUN_DIR:-results/csp/latent128_muon_ntk_prior/knn5}"
+CSP_RUN_DIR="${CSP_RUN_DIR:-results/csp/latent128_muon_ntk_prior/main}"
 PROFILE="${PROFILE:-publication}"  # smoke | publication
 BACKGROUND="${BACKGROUND:-0}"
 NOHUP_LOG="${NOHUP_LOG:-}"
@@ -66,6 +66,10 @@ while [[ $# -gt 0 ]]; do
       EXTRA_ARGS+=("$1" "$2")
       shift 2
       ;;
+    --fae_checkpoint)
+      EXTRA_ARGS+=("$1" "$2")
+      shift 2
+      ;;
     --sample_idx)
       SAMPLE_IDX="$2"
       EXTRA_ARGS+=("$1" "$2")
@@ -106,7 +110,7 @@ if [[ -z "${CONDA_DEFAULT_ENV:-}" || "${CONDA_DEFAULT_ENV}" != "${ENV_NAME}" ]];
   conda activate "${ENV_NAME}"
 fi
 
-if [[ ! -f "${CSP_RUN_DIR}/checkpoints/csp_drift.eqx" ]]; then
+if [[ ! -f "${CSP_RUN_DIR}/checkpoints/conditional_bridge.eqx" && ! -f "${CSP_RUN_DIR}/checkpoints/csp_drift.eqx" ]]; then
   echo "ERROR: missing CSP checkpoint under ${CSP_RUN_DIR}" >&2
   exit 1
 fi
