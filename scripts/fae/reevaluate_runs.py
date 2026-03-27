@@ -10,9 +10,12 @@ accurate metrics for publication figures.
 Outputs ``eval_results_full.json`` in each run directory with the same schema
 as ``eval_results.json``.
 
+Default registry: latent128 FiLM eight-run publication set.
+
 Usage::
 
-    python scripts/fae/reevaluate_runs.py [--batch-size 64] [--denoiser-steps 32]
+    python scripts/fae/reevaluate_runs.py [--batch-size 64]
+    python scripts/fae/reevaluate_runs.py --missing_only --run_dir results/fae_film_adam_ntk_99pct_latent128
 """
 
 from __future__ import annotations
@@ -36,11 +39,11 @@ if str(REPO_ROOT) not in sys.path:
 import jax
 import jax.numpy as jnp
 
-from scripts.fae.fae_naive.fae_latent_utils import (
+from mmsfm.fae.fae_latent_utils import (
     load_fae_checkpoint,
-    build_attention_fae_from_checkpoint,
+    build_fae_from_checkpoint,
 )
-from scripts.fae.multiscale_dataset_naive import (
+from mmsfm.fae.multiscale_dataset_naive import (
     load_held_out_data_naive,
     load_training_time_data_naive,
     MultiscaleFieldDatasetNaive,
@@ -52,21 +55,39 @@ from functional_autoencoders.datasets import NumpyLoader
 # Same runs as fae_publication_figures.py
 
 RUNS = [
-    # (label, run_dir)
-    ("Adam+L2",       "results/fae_film_adam_l2_99pct/run_bnqm4evk"),
-    ("Muon+L2",       "results/fae_deterministic_film_multiscale/run_ujlkslav"),
-    ("Adam+NTK",      "results/fae_film_adam_ntk_99pct/run_2hnr5shv"),
-    ("Muon+NTK",      "results/fae_film_muon_ntk_99pct/run_tug7ucuw"),
-    ("Muon+L2_s1",    "results/fae_deterministic_film/run_90ndogk3"),
-    ("FiLM+Prior",    "results/fae_film_prior_multiscale/run_66nrnp5e"),
-    ("Denoiser_s1",   "results/fae_denoiser_film_heek/run_ezndnxw0"),
-    ("Denoiser_ms",   "results/fae_denoiser_film_heek_multiscale/run_9vl5sblh"),
-    # ── NTK + prior runs ──────────────────────────────────────────────────
-    ("Adam+NTK+Prior",        "results/adam_ntk_prior/run_zaql9zhd"),
-    ("Muon+NTK+Prior",        "results/muon_ntk_prior/run_r6flmspu"),
-    ("Den+Adam+NTK+Prior",    "results/fae_denoiser_adam_ntk_prior/run_kz7gp1ny"),
-    ("Den+Muon+NTK+Prior",    "results/denoiser_muon_ntk_prior/run_l41wdiei"),
+    ("Adam+L2", "results/fae_film_adam_l2_latent128/run_g0ysv6bb"),
+    ("Adam+NTK", "results/fae_film_adam_ntk_99pct_latent128/run_sphluzvp"),
+    ("Adam+L2+Prior", "results/fae_film_adam_prior_latent128/run_mgn5f93n"),
+    ("Adam+NTK+Prior", "results/fae_film_adam_ntk_prior_latent128/run_uae85cd8"),
+    ("Muon+L2", "results/fae_film_muon_l2_latent128/run_4cyupstm"),
+    ("Muon+NTK", "results/fae_film_muon_ntk_99pct_latent128/run_ea5yckkq"),
+    ("Muon+L2+Prior", "results/fae_film_muon_prior_latent128/run_xn2xd51y"),
+    ("Muon+NTK+Prior", "results/fae_film_muon_ntk_prior_latent128/run_vq1adonq"),
 ]
+
+
+def _resolve_run_dir(path_str: str) -> Path:
+    """Resolve either an explicit run dir or an experiment root to a run leaf."""
+    path = (REPO_ROOT / path_str).resolve() if not os.path.isabs(path_str) else Path(path_str).resolve()
+    if (path / "args.json").exists():
+        return path
+
+    candidates = []
+    for child in sorted(path.glob("run_*")):
+        if not (child / "args.json").exists():
+            continue
+        ckpt_dir = child / "checkpoints"
+        if not any((ckpt_dir / name).exists() for name in ("best_state.pkl", "state.pkl")):
+            continue
+        score = (
+            1 if (child / "eval_results_full.json").exists() else 0,
+            1 if (child / "eval_results.json").exists() else 0,
+        )
+        candidates.append((score, child))
+    if not candidates:
+        raise FileNotFoundError(f"No completed run_* directory found under {path}")
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return candidates[0][1]
 
 
 # ── Minimal state wrapper ────────────────────────────────────────────────
@@ -238,7 +259,6 @@ def evaluate_single_run(
     label: str,
     run_dir: str,
     batch_size: int,
-    denoiser_steps: int,
     seed: int,
 ) -> Optional[dict]:
     """Load checkpoint, evaluate on full test split, return eval dict."""
@@ -261,45 +281,16 @@ def evaluate_single_run(
 
     print(f"\nLoading checkpoint: {ckpt_path}")
     ckpt = load_fae_checkpoint(ckpt_path)
-    autoencoder, params, batch_stats, meta = build_attention_fae_from_checkpoint(ckpt)
+    autoencoder, params, batch_stats, meta = build_fae_from_checkpoint(ckpt)
     state = EvalState(params=params, batch_stats=batch_stats)
 
-    decoder_type = run_args.get("decoder_type", "film")
-    loss_type = run_args.get("loss_type", "l2")
-    is_denoiser = decoder_type.startswith("denoiser")
     data_path = run_args.get("data_path", "data/fae_tran_inclusions.npz")
     if not os.path.isabs(data_path):
         data_path = str(REPO_ROOT / data_path)
     train_ratio = float(run_args.get("train_ratio", 0.8))
     encoder_point_ratio = float(run_args.get("encoder_point_ratio", 0.5))
 
-    # Build reconstruct_fn for denoiser runs
     reconstruct_fn = None
-    if is_denoiser:
-        from scripts.fae.fae_naive.diffusion_denoiser_decoder import (
-            reconstruct_with_denoiser,
-        )
-        sampler = str(run_args.get("denoiser_sampler", "ode"))
-        sde_sigma = float(run_args.get("denoiser_sde_sigma", 1.0))
-        eval_steps = denoiser_steps
-
-        def reconstruct_fn(ae, st, u_dec, x_dec, u_enc, x_enc, key):
-            del u_dec
-            return reconstruct_with_denoiser(
-                autoencoder=ae,
-                state=st,
-                u_enc=u_enc,
-                x_enc=x_enc,
-                x_dec=x_dec,
-                key=key,
-                num_steps=eval_steps,
-                sampler=sampler,
-                sde_sigma=sde_sigma,
-            )
-    elif loss_type == "denoiser":
-        # FiLM+Prior: deterministic decoder, but trained with denoiser ELBO.
-        # Evaluation uses standard encode/decode (no special reconstruct_fn).
-        reconstruct_fn = None
 
     # ── Build test dataset + loader ───────────────────────────────────────
     held_out_indices_str = run_args.get("held_out_indices", "")
@@ -331,14 +322,12 @@ def evaluate_single_run(
         key=jax.random.PRNGKey(seed + 2000),
     )
 
-    # ── Collapse diagnostics (full, deterministic only) ──────────────────
-    collapse_diag = None
-    if not is_denoiser:
-        print("  Computing collapse diagnostics (all test batches)...")
-        collapse_diag = compute_collapse_diagnostics_full(
-            autoencoder, state, test_loader,
-            seed=seed + 123,
-        )
+    # ── Collapse diagnostics (full) ──────────────────────────────────────
+    print("  Computing collapse diagnostics (all test batches)...")
+    collapse_diag = compute_collapse_diagnostics_full(
+        autoencoder, state, test_loader,
+        seed=seed + 123,
+    )
 
     # ── Per-time evaluation (all test samples, no max_samples cap) ───────
     ho_results = {}
@@ -407,7 +396,6 @@ def evaluate_single_run(
         "evaluation_config": {
             "batch_size": batch_size,
             "test_samples": len(test_dataset),
-            "denoiser_steps": denoiser_steps if is_denoiser else None,
             "full_test_split": True,
         },
     }
@@ -427,34 +415,53 @@ def main() -> None:
     )
     parser.add_argument("--batch-size", type=int, default=64,
                         help="Batch size for evaluation (default: 64).")
-    parser.add_argument("--denoiser-steps", type=int, default=32,
-                        help="Denoiser decode steps for denoiser runs (default: 32).")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed for evaluation.")
     parser.add_argument("--runs", type=str, default="",
                         help="Comma-separated run labels to evaluate (default: all).")
+    parser.add_argument(
+        "--run_dir",
+        action="append",
+        default=[],
+        help="Explicit run dir or experiment root. May be provided multiple times.",
+    )
+    parser.add_argument(
+        "--missing_only",
+        action="store_true",
+        help="Skip runs that already have eval_results_full.json.",
+    )
     args = parser.parse_args()
 
     selected = set()
     if args.runs:
         selected = {s.strip() for s in args.runs.split(",")}
 
+    run_specs = list(RUNS)
+    for run_dir in args.run_dir:
+        resolved = _resolve_run_dir(run_dir)
+        run_specs.append((resolved.parent.name if resolved.name.startswith("run_") else resolved.name, str(resolved)))
+
     print(f"JAX backend: {jax.default_backend()}")
     print(f"JAX devices: {jax.devices()}")
     print()
 
     results_summary = []
-    for label, run_dir in RUNS:
+    for label, run_dir in run_specs:
         if selected and label not in selected:
             continue
+        resolved_run_dir = _resolve_run_dir(run_dir)
+        if args.missing_only and (resolved_run_dir / "eval_results_full.json").exists():
+            print("=" * 70)
+            print(f"Skipping existing full eval: {label}  ({resolved_run_dir})")
+            print("=" * 70)
+            continue
         print("=" * 70)
-        print(f"Evaluating: {label}  ({run_dir})")
+        print(f"Evaluating: {label}  ({resolved_run_dir})")
         print("=" * 70)
         t0 = time.time()
         result = evaluate_single_run(
-            label, run_dir,
+            label, str(resolved_run_dir),
             batch_size=args.batch_size,
-            denoiser_steps=args.denoiser_steps,
             seed=args.seed,
         )
         elapsed = time.time() - t0
