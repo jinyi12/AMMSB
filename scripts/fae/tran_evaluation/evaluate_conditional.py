@@ -155,6 +155,8 @@ def _build_adaptive_reference_config(args: argparse.Namespace) -> AdaptiveRefere
         bootstrap_reps=int(getattr(args, "adaptive_reference_bootstrap_reps", 64)),
         ess_min=int(getattr(args, "adaptive_ess_min", 32)),
     )
+
+
 def _evaluate_scale_pair(
     *,
     pair_idx: int,
@@ -165,6 +167,8 @@ def _evaluate_scale_pair(
     corpus_eval_indices: np.ndarray,
     agent: LatentMSBMAgent,
     device: str,
+    conditional_eval_mode: str,
+    adaptive_config: AdaptiveReferenceConfig,
     k_neighbors: int,
     n_realizations: int,
     ecmmd_k_values: list[int],
@@ -174,6 +178,16 @@ def _evaluate_scale_pair(
     rng: np.random.Generator,
 ) -> dict[str, object]:
     """Evaluate one consecutive latent scale pair."""
+    condition_metric = None
+    corpus_z_coarse_metric = None
+    if conditional_eval_mode == DEFAULT_CONDITIONAL_EVAL_MODE:
+        condition_metric = fit_whitened_pca_metric(
+            corpus_z_coarse,
+            variance_retained=float(adaptive_config.variance_retained),
+            dim_cap=int(adaptive_config.metric_dim_cap),
+        )
+        corpus_z_coarse_metric = transform_condition_vectors(corpus_z_coarse, condition_metric)
+
     latent_w1_values: list[float] = []
     latent_w2_values: list[float] = []
     latent_w1_null_values: list[float] = []
@@ -182,12 +196,20 @@ def _evaluate_scale_pair(
     for sample_offset, test_idx in enumerate(test_sample_indices):
         z_test_coarse = latent_test[pair_idx + 1, int(test_idx)]
 
-        knn_idx, knn_weights = knn_gaussian_weights(
-            z_test_coarse,
-            corpus_z_coarse,
-            k_neighbors,
+        sampling_spec = build_local_reference_spec(
+            query=z_test_coarse,
+            corpus_conditions=corpus_z_coarse,
+            corpus_targets=corpus_z_fine,
+            conditional_eval_mode=conditional_eval_mode,
+            k_neighbors=k_neighbors,
+            condition_metric=condition_metric,
+            corpus_conditions_transformed=corpus_z_coarse_metric,
+            adaptive_config=adaptive_config,
+            rng=rng,
         )
-        ref_latents = corpus_z_fine[knn_idx]
+        support_idx = sampling_spec_indices(sampling_spec)
+        support_weights = np.asarray(sampling_spec["candidate_weights"], dtype=np.float64)
+        ref_latents = corpus_z_fine[support_idx]
 
         z_start = torch.from_numpy(z_test_coarse[None, :]).float().to(device)
         z_gen = sample_backward_one_interval(
@@ -205,7 +227,7 @@ def _evaluate_scale_pair(
             z_gen_np,
             ref_latents,
             weights_a=None,
-            weights_b=knn_weights,
+            weights_b=support_weights,
         )
         latent_w1_values.append(latent_w1)
         latent_w2_values.append(latent_w2)
@@ -217,7 +239,7 @@ def _evaluate_scale_pair(
             z_null,
             ref_latents,
             weights_a=None,
-            weights_b=knn_weights,
+            weights_b=support_weights,
         )
         latent_w1_null_values.append(latent_w1_null)
         latent_w2_null_values.append(latent_w2_null)
@@ -253,37 +275,85 @@ def _evaluate_scale_pair(
         k_neighbors=k_neighbors,
         n_realizations=n_realizations,
         rng=rng,
+        conditional_eval_mode=conditional_eval_mode,
+        condition_metric=condition_metric,
+        corpus_conditions_transformed=corpus_z_coarse_metric,
+        adaptive_config=adaptive_config,
     )
+    reference_support, reference_weights, reference_indices, reference_counts = pack_reference_support_arrays(
+        corpus_z_fine,
+        ecmmd_sampling_specs,
+    )
+    adaptive_radii = np.asarray([sampling_spec_radius(spec) for spec in ecmmd_sampling_specs], dtype=np.float32)
+    reference_ess = np.asarray([sampling_spec_ess(spec) for spec in ecmmd_sampling_specs], dtype=np.float32)
+    reference_mean_rse = np.asarray([sampling_spec_mean_rse(spec) for spec in ecmmd_sampling_specs], dtype=np.float32)
+    reference_eig_rse = np.stack([sampling_spec_eig_rse(spec) for spec in ecmmd_sampling_specs], axis=0).astype(
+        np.float32
+    )
+    graph_condition_vectors = (
+        transform_condition_vectors(ecmmd_conditions, condition_metric)
+        if conditional_eval_mode == DEFAULT_CONDITIONAL_EVAL_MODE and condition_metric is not None
+        else None
+    )
+    ecmmd_real_samples = reference_support if conditional_eval_mode == DEFAULT_CONDITIONAL_EVAL_MODE else ecmmd_reference
+    ecmmd_reference_weights = reference_weights if conditional_eval_mode == DEFAULT_CONDITIONAL_EVAL_MODE else None
     latent_ecmmd = _compute_ecmmd_metrics(
         ecmmd_conditions,
-        ecmmd_reference,
+        ecmmd_real_samples,
         np.stack(ecmmd_generated, axis=0),
         ecmmd_k_values,
+        reference_weights=ecmmd_reference_weights,
+        condition_graph_mode=conditional_eval_mode,
+        graph_condition_vectors=graph_condition_vectors,
+        adaptive_radii=adaptive_radii if conditional_eval_mode == DEFAULT_CONDITIONAL_EVAL_MODE else None,
     )
     latent_ecmmd = _add_bootstrap_ecmmd_calibration(
         latent_ecmmd,
         conditions=ecmmd_conditions,
-        reference_samples=ecmmd_reference,
+        reference_samples=ecmmd_real_samples,
         corpus_targets=corpus_z_fine,
         sampling_specs=ecmmd_sampling_specs,
         k_values=ecmmd_k_values,
         n_bootstrap=ecmmd_bootstrap_reps,
         rng=rng,
+        reference_weights=ecmmd_reference_weights,
+        condition_graph_mode=conditional_eval_mode,
+        graph_condition_vectors=graph_condition_vectors,
+        adaptive_radii=adaptive_radii if conditional_eval_mode == DEFAULT_CONDITIONAL_EVAL_MODE else None,
+        generated_samples=np.stack(ecmmd_generated, axis=0),
     )
+    latent_ecmmd["reference_mode"] = conditional_eval_mode
+    latent_ecmmd["reference_diagnostics"] = summarize_reference_sampling_specs(ecmmd_sampling_specs)
+    if conditional_eval_mode == DEFAULT_CONDITIONAL_EVAL_MODE and condition_metric is not None:
+        latent_ecmmd["condition_metric"] = {
+            "retained_dim": int(condition_metric.retained_dim),
+            "explained_variance": float(condition_metric.explained_variance),
+        }
 
     return {
         "latent_w1_values": np.asarray(latent_w1_values, dtype=np.float64),
         "latent_w2_values": np.asarray(latent_w2_values, dtype=np.float64),
         "latent_w1_null_values": np.asarray(latent_w1_null_values, dtype=np.float64),
         "latent_w2_null_values": np.asarray(latent_w2_null_values, dtype=np.float64),
+        "latent_ecmmd_conditions": ecmmd_conditions.astype(np.float32),
         "latent_ecmmd_reference": ecmmd_reference.astype(np.float32),
+        "latent_ecmmd_generated": np.stack(ecmmd_generated, axis=0).astype(np.float32),
         "latent_ecmmd": latent_ecmmd,
+        "latent_ecmmd_reference_support_indices": reference_indices.astype(np.int64),
+        "latent_ecmmd_reference_support_weights": reference_weights.astype(np.float32),
+        "latent_ecmmd_reference_support_counts": reference_counts.astype(np.int64),
+        "latent_ecmmd_reference_radius": adaptive_radii.astype(np.float32),
+        "latent_ecmmd_reference_ess": reference_ess.astype(np.float32),
+        "latent_ecmmd_reference_mean_rse": reference_mean_rse.astype(np.float32),
+        "latent_ecmmd_reference_eig_rse": reference_eig_rse.astype(np.float32),
     }
 
 
 def _build_summary_text(
     *,
     args: argparse.Namespace,
+    conditional_eval_mode: str,
+    adaptive_config: AdaptiveReferenceConfig,
     test_sample_indices: np.ndarray,
     corpus_eval_indices: np.ndarray,
     n_corpus: int,
@@ -294,6 +364,7 @@ def _build_summary_text(
     lines = [
         "Latent Conditional Evaluation",
         "=" * 50,
+        f"conditional_eval_mode: {conditional_eval_mode}",
         f"k_neighbors: {args.k_neighbors}",
         f"n_test_samples: {len(test_sample_indices)}",
         f"n_ecmmd_conditions: {len(corpus_eval_indices)}",
@@ -301,6 +372,9 @@ def _build_summary_text(
         f"n_corpus: {n_corpus}",
         f"ecmmd_k_values_requested: {_parse_int_list_arg(args.ecmmd_k_values)}",
         f"ecmmd_bootstrap_reps: {args.ecmmd_bootstrap_reps}",
+        f"adaptive_metric_dim_cap: {adaptive_config.metric_dim_cap}",
+        f"adaptive_reference_bootstrap_reps: {adaptive_config.bootstrap_reps}",
+        f"adaptive_ess_min: {adaptive_config.ess_min}",
         "pair_labels use physical H values; modeled marginal 1 is the first learned scale (H=1),",
         "and the last modeled marginal is the coarsest learned scale (H=6) for the default Tran ladder.",
         "",
@@ -342,16 +416,29 @@ def _build_summary_text(
             lines.append(
                 f"{'':>{len(pair_label) + 2}}latent ECMMD bandwidth = {ecmmd_metrics['bandwidth']:.4f}"
             )
-        for k_key, k_metrics in ecmmd_metrics.get("k_values", {}).items():
-            single = k_metrics["single_draw"]
-            multi = k_metrics["derandomized"]
-            single_boot = f", p_boot={single['bootstrap_p_value']:.3g}" if "bootstrap_p_value" in single else ""
-            multi_boot = f", p_boot={multi['bootstrap_p_value']:.3g}" if "bootstrap_p_value" in multi else ""
+        if str(ecmmd_metrics.get("graph_mode")) == DEFAULT_CONDITIONAL_EVAL_MODE and "adaptive_radius" in ecmmd_metrics:
+            adaptive = ecmmd_metrics["adaptive_radius"]
+            single = adaptive["single_draw"]
+            multi = adaptive["derandomized"]
+            ci_suffix = ""
+            if "bootstrap_ci_lower" in multi and "bootstrap_ci_upper" in multi:
+                ci_suffix = f", CI=[{multi['bootstrap_ci_lower']:.4e}, {multi['bootstrap_ci_upper']:.4e}]"
+            boot_suffix = f", p_boot={multi['bootstrap_p_value']:.3g}" if "bootstrap_p_value" in multi else ""
             lines.append(
-                f"{'':>{len(pair_label) + 2}}latent ECMMD K={k_metrics['k_effective']} "
-                f"(req={k_key}): single={single['score']:.4e}, z={single['z_score']:.3f}, p={single['p_value']:.3g}{single_boot}; "
-                f"D_n={multi['score']:.4e}, z={multi['z_score']:.3f}, p={multi['p_value']:.3g}{multi_boot}"
+                f"{'':>{len(pair_label) + 2}}latent ECMMD adaptive: "
+                f"single={single['score']:.4e}; D_n={multi['score']:.4e}{ci_suffix}{boot_suffix}"
             )
+        else:
+            for k_key, k_metrics in ecmmd_metrics.get("k_values", {}).items():
+                single = k_metrics["single_draw"]
+                multi = k_metrics["derandomized"]
+                single_boot = f", p_boot={single['bootstrap_p_value']:.3g}" if "bootstrap_p_value" in single else ""
+                multi_boot = f", p_boot={multi['bootstrap_p_value']:.3g}" if "bootstrap_p_value" in multi else ""
+                lines.append(
+                    f"{'':>{len(pair_label) + 2}}latent ECMMD K={k_metrics['k_effective']} "
+                    f"(req={k_key}): single={single['score']:.4e}, z={single['z_score']:.3f}, p={single['p_value']:.3g}{single_boot}; "
+                    f"D_n={multi['score']:.4e}, z={multi['z_score']:.3f}, p={multi['p_value']:.3g}{multi_boot}"
+                )
 
     return "\n".join(lines)
 
