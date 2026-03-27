@@ -445,9 +445,21 @@ def _build_summary_text(
 
 def main() -> None:
     args = _parse_args()
+    conditional_eval_mode = _resolve_conditional_eval_mode(args)
+    adaptive_config = _build_adaptive_reference_config(args)
     ecmmd_k_values = _parse_int_list_arg(args.ecmmd_k_values)
-    if not ecmmd_k_values:
+    ecmmd_k_values_raw = str(getattr(args, "ecmmd_k_values", "")).strip()
+    if conditional_eval_mode == LEGACY_CONDITIONAL_EVAL_MODE and not ecmmd_k_values:
         raise ValueError("--ecmmd_k_values must contain at least one positive integer.")
+    if (
+        conditional_eval_mode == DEFAULT_CONDITIONAL_EVAL_MODE
+        and ecmmd_k_values
+        and ecmmd_k_values_raw not in {"", "10,20,30"}
+    ):
+        warnings.warn(
+            "adaptive_radius ignores legacy --ecmmd_k_values and uses an adaptive radius graph instead.",
+            stacklevel=2,
+        )
 
     run_dir = Path(args.run_dir)
     output_dir = (
@@ -469,6 +481,7 @@ def main() -> None:
     print(f"MSBM: T={t_count}, n_train={n_train}, n_test={n_test}, latent_dim={latent_dim}")
     print(f"  time_indices: {time_indices.tolist()}")
     print(f"  zt: {np.round(zt, 4).tolist()}")
+    print(f"  conditional_eval_mode: {conditional_eval_mode}")
 
     corpus_latents_by_tidx, n_corpus = load_corpus_latents(Path(args.corpus_latents_path), time_indices)
     print(f"Corpus: {n_corpus} samples per time")
@@ -505,6 +518,16 @@ def main() -> None:
     results_latent_w1_null_all: dict[str, np.ndarray] = {}
     results_latent_w2_null_all: dict[str, np.ndarray] = {}
     results_ecmmd_latent_all: dict[str, dict[str, object]] = {}
+    results_ecmmd_conditions_all: dict[str, np.ndarray] = {}
+    results_ecmmd_reference_all: dict[str, np.ndarray] = {}
+    results_ecmmd_generated_all: dict[str, np.ndarray] = {}
+    results_ecmmd_reference_support_indices_all: dict[str, np.ndarray] = {}
+    results_ecmmd_reference_support_weights_all: dict[str, np.ndarray] = {}
+    results_ecmmd_reference_support_counts_all: dict[str, np.ndarray] = {}
+    results_ecmmd_reference_radius_all: dict[str, np.ndarray] = {}
+    results_ecmmd_reference_ess_all: dict[str, np.ndarray] = {}
+    results_ecmmd_reference_mean_rse_all: dict[str, np.ndarray] = {}
+    results_ecmmd_reference_eig_rse_all: dict[str, np.ndarray] = {}
     pair_metadata_all: dict[str, dict[str, object]] = {}
     pair_labels: list[str] = []
 
@@ -548,6 +571,8 @@ def main() -> None:
             corpus_eval_indices=corpus_eval_indices,
             agent=agent,
             device=device,
+            conditional_eval_mode=conditional_eval_mode,
+            adaptive_config=adaptive_config,
             k_neighbors=args.k_neighbors,
             n_realizations=args.n_realizations,
             ecmmd_k_values=ecmmd_k_values,
@@ -568,6 +593,30 @@ def main() -> None:
         results_latent_w1_null_all[pair_label] = latent_w1_null_arr
         results_latent_w2_null_all[pair_label] = latent_w2_null_arr
         results_ecmmd_latent_all[pair_label] = latent_ecmmd
+        results_ecmmd_conditions_all[pair_label] = np.asarray(pair_result["latent_ecmmd_conditions"], dtype=np.float32)
+        results_ecmmd_reference_all[pair_label] = np.asarray(pair_result["latent_ecmmd_reference"], dtype=np.float32)
+        results_ecmmd_generated_all[pair_label] = np.asarray(pair_result["latent_ecmmd_generated"], dtype=np.float32)
+        results_ecmmd_reference_support_indices_all[pair_label] = np.asarray(
+            pair_result["latent_ecmmd_reference_support_indices"], dtype=np.int64
+        )
+        results_ecmmd_reference_support_weights_all[pair_label] = np.asarray(
+            pair_result["latent_ecmmd_reference_support_weights"], dtype=np.float32
+        )
+        results_ecmmd_reference_support_counts_all[pair_label] = np.asarray(
+            pair_result["latent_ecmmd_reference_support_counts"], dtype=np.int64
+        )
+        results_ecmmd_reference_radius_all[pair_label] = np.asarray(
+            pair_result["latent_ecmmd_reference_radius"], dtype=np.float32
+        )
+        results_ecmmd_reference_ess_all[pair_label] = np.asarray(
+            pair_result["latent_ecmmd_reference_ess"], dtype=np.float32
+        )
+        results_ecmmd_reference_mean_rse_all[pair_label] = np.asarray(
+            pair_result["latent_ecmmd_reference_mean_rse"], dtype=np.float32
+        )
+        results_ecmmd_reference_eig_rse_all[pair_label] = np.asarray(
+            pair_result["latent_ecmmd_reference_eig_rse"], dtype=np.float32
+        )
 
         print(f"\n  Summary for {pair_label}:")
         print(
@@ -584,7 +633,18 @@ def main() -> None:
         w2_skill = 1.0 - float(latent_w2_arr.mean()) / mean_w2_null if mean_w2_null > 0.0 else float("nan")
         print(f"    latent W1 null mean={mean_w1_null:.4f}, skill_vs_null={w1_skill:+.4f}")
         print(f"    latent W2 null mean={mean_w2_null:.4f}, skill_vs_null={w2_skill:+.4f}")
-        if latent_ecmmd.get("k_values"):
+        if str(latent_ecmmd.get("graph_mode")) == DEFAULT_CONDITIONAL_EVAL_MODE and "adaptive_radius" in latent_ecmmd:
+            adaptive = latent_ecmmd["adaptive_radius"]
+            multi = adaptive["derandomized"]
+            ci_suffix = ""
+            if "bootstrap_ci_lower" in multi and "bootstrap_ci_upper" in multi:
+                ci_suffix = f", CI=[{multi['bootstrap_ci_lower']:.4e}, {multi['bootstrap_ci_upper']:.4e}]"
+            boot_suffix = f", p_boot={multi['bootstrap_p_value']:.3g}" if "bootstrap_p_value" in multi else ""
+            print(
+                f"    adaptive ECMMD: single={adaptive['single_draw']['score']:.4e}; "
+                f"D_n={multi['score']:.4e}{ci_suffix}{boot_suffix}"
+            )
+        elif latent_ecmmd.get("k_values"):
             print(f"    latent ECMMD bandwidth={latent_ecmmd['bandwidth']:.4f}")
             for k_key, k_metrics in latent_ecmmd["k_values"].items():
                 single = k_metrics["single_draw"]
@@ -602,9 +662,13 @@ def main() -> None:
                 )
 
     metrics: dict[str, object] = {
+        "conditional_eval_mode": conditional_eval_mode,
         "k_neighbors": args.k_neighbors,
         "ecmmd_k_values_requested": ecmmd_k_values,
         "ecmmd_bootstrap_reps": int(args.ecmmd_bootstrap_reps),
+        "adaptive_metric_dim_cap": int(adaptive_config.metric_dim_cap),
+        "adaptive_reference_bootstrap_reps": int(adaptive_config.bootstrap_reps),
+        "adaptive_ess_min": int(adaptive_config.ess_min),
         "n_test_samples": int(len(test_sample_indices)),
         "n_ecmmd_conditions": int(len(corpus_eval_indices)),
         "n_realizations": int(args.n_realizations),
@@ -650,10 +714,69 @@ def main() -> None:
         npz_dict[f"latent_w2_null_{pair_label}"] = results_latent_w2_null_all[pair_label].astype(np.float32)
         npz_dict[f"latent_w1_skill_vs_null_{pair_label}"] = np.float32(pair_metrics["latent_w1_skill_vs_null"])
         npz_dict[f"latent_w2_skill_vs_null_{pair_label}"] = np.float32(pair_metrics["latent_w2_skill_vs_null"])
+        npz_dict[f"latent_ecmmd_conditions_{pair_label}"] = np.asarray(
+            results_ecmmd_conditions_all[pair_label],
+            dtype=np.float32,
+        )
+        npz_dict[f"latent_ecmmd_reference_{pair_label}"] = np.asarray(
+            results_ecmmd_reference_all[pair_label],
+            dtype=np.float32,
+        )
+        npz_dict[f"latent_ecmmd_generated_{pair_label}"] = np.asarray(
+            results_ecmmd_generated_all[pair_label],
+            dtype=np.float32,
+        )
+        npz_dict[f"latent_ecmmd_reference_support_indices_{pair_label}"] = np.asarray(
+            results_ecmmd_reference_support_indices_all[pair_label],
+            dtype=np.int64,
+        )
+        npz_dict[f"latent_ecmmd_reference_support_weights_{pair_label}"] = np.asarray(
+            results_ecmmd_reference_support_weights_all[pair_label],
+            dtype=np.float32,
+        )
+        npz_dict[f"latent_ecmmd_reference_support_counts_{pair_label}"] = np.asarray(
+            results_ecmmd_reference_support_counts_all[pair_label],
+            dtype=np.int64,
+        )
+        npz_dict[f"latent_ecmmd_reference_radius_{pair_label}"] = np.asarray(
+            results_ecmmd_reference_radius_all[pair_label],
+            dtype=np.float32,
+        )
+        npz_dict[f"latent_ecmmd_reference_ess_{pair_label}"] = np.asarray(
+            results_ecmmd_reference_ess_all[pair_label],
+            dtype=np.float32,
+        )
+        npz_dict[f"latent_ecmmd_reference_mean_rse_{pair_label}"] = np.asarray(
+            results_ecmmd_reference_mean_rse_all[pair_label],
+            dtype=np.float32,
+        )
+        npz_dict[f"latent_ecmmd_reference_eig_rse_{pair_label}"] = np.asarray(
+            results_ecmmd_reference_eig_rse_all[pair_label],
+            dtype=np.float32,
+        )
 
         pair_ecmmd = results_ecmmd_latent_all[pair_label]
         if "bandwidth" in pair_ecmmd:
             npz_dict[f"latent_ecmmd_bandwidth_{pair_label}"] = np.float32(pair_ecmmd["bandwidth"])
+        if str(pair_ecmmd.get("graph_mode")) == DEFAULT_CONDITIONAL_EVAL_MODE and "adaptive_radius" in pair_ecmmd:
+            adaptive = pair_ecmmd["adaptive_radius"]
+            single = adaptive["single_draw"]
+            multi = adaptive["derandomized"]
+            npz_dict[f"latent_ecmmd_adaptive_single_score_{pair_label}"] = np.float32(single["score"])
+            npz_dict[f"latent_ecmmd_adaptive_derand_score_{pair_label}"] = np.float32(multi["score"])
+            if "bootstrap_p_value" in single:
+                npz_dict[f"latent_ecmmd_adaptive_single_boot_p_{pair_label}"] = np.float32(single["bootstrap_p_value"])
+                npz_dict[f"latent_ecmmd_adaptive_single_boot_z_{pair_label}"] = np.float32(single["bootstrap_z_score"])
+            if "bootstrap_p_value" in multi:
+                npz_dict[f"latent_ecmmd_adaptive_derand_boot_p_{pair_label}"] = np.float32(multi["bootstrap_p_value"])
+                npz_dict[f"latent_ecmmd_adaptive_derand_boot_z_{pair_label}"] = np.float32(multi["bootstrap_z_score"])
+            if "bootstrap_ci_lower" in multi and "bootstrap_ci_upper" in multi:
+                npz_dict[f"latent_ecmmd_adaptive_derand_ci_lower_{pair_label}"] = np.float32(
+                    multi["bootstrap_ci_lower"]
+                )
+                npz_dict[f"latent_ecmmd_adaptive_derand_ci_upper_{pair_label}"] = np.float32(
+                    multi["bootstrap_ci_upper"]
+                )
         for k_key, k_metrics in pair_ecmmd.get("k_values", {}).items():
             suffix = f"{pair_label}_k{k_key}"
             single = k_metrics["single_draw"]
@@ -680,6 +803,8 @@ def main() -> None:
 
     summary_text = _build_summary_text(
         args=args,
+        conditional_eval_mode=conditional_eval_mode,
+        adaptive_config=adaptive_config,
         test_sample_indices=test_sample_indices,
         corpus_eval_indices=corpus_eval_indices,
         n_corpus=n_corpus,
