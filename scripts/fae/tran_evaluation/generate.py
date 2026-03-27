@@ -30,19 +30,16 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from data.transform_utils import apply_inverse_transform, load_transform_info  # noqa: E402
-from scripts.fae.fae_naive.fae_latent_utils import (  # noqa: E402
-    build_attention_fae_from_checkpoint,
-    compute_exponential_step_schedule,
+from mmsfm.fae.fae_latent_utils import (  # noqa: E402
+    build_fae_from_checkpoint,
     decode_latent_knots_to_fields,
     load_fae_checkpoint,
     make_fae_apply_fns,
-    make_fae_decode_fn,
-    parse_step_schedule,
 )
-from scripts.fae.generate_full_trajectories import _sample_full_trajectory  # noqa: E402
 from scripts.fae.tran_evaluation.latent_msbm_runtime import (  # noqa: E402
     build_latent_msbm_agent,
     load_policy_checkpoints,
+    sample_full_trajectory,
 )
 from scripts.fae.tran_evaluation.run_support import (  # noqa: E402
     build_internal_time_dists,
@@ -179,10 +176,7 @@ def generate_backward_realizations(
     use_ema: bool = True,
     drift_clip_norm: Optional[float] = None,
     device: Optional[torch.device] = None,
-    decode_mode: str = "auto",
-    denoiser_num_steps: int = 32,
-    denoiser_noise_scale: float = 1.0,
-    denoiser_steps_schedule: Optional[str] = None,
+    decode_mode: str = "standard",
 ) -> dict:
     """Generate backward SDE realisations and decode to physical-scale fields.
 
@@ -212,21 +206,7 @@ def generate_backward_realizations(
     device : torch.device, optional
         Compute device.  Auto-detected if ``None``.
     decode_mode : str
-        Decode mode for FAE decoder (``"auto"``, ``"standard"``,
-        ``"one_step"``, ``"multistep"``).
-    denoiser_num_steps : int
-        Default number of Euler steps for multistep decoding.
-    denoiser_noise_scale : float
-        Noise scale for one-step decoding.
-    denoiser_steps_schedule : str, optional
-        Per-knot adaptive step schedule.  Overrides ``denoiser_num_steps``
-        when ``decode_mode="multistep"``.  Accepted formats:
-
-        - Comma-separated: ``"500,250,125,64,32,16,8"``
-        - Exponential: ``"exp:<max>:<decay>:<min>"`` e.g. ``"exp:500:0.5:8"``
-        - Uniform int: ``"32"``
-
-        When set, forces ``decode_mode="multistep"``.
+        Decode mode for active deterministic FAE checkpoints.
 
     Returns
     -------
@@ -316,7 +296,7 @@ def generate_backward_realizations(
     for i, init_idx in enumerate(sample_indices):
         torch.manual_seed(seed + 1000 + i)
         y0_single = agent.latent_train[-1, int(init_idx)].unsqueeze(0)  # (1, K)
-        knots_i, traj_i = _sample_full_trajectory(
+        knots_i, traj_i = sample_full_trajectory(
             agent=agent,
             policy=agent.z_b,
             y_init=y0_single,
@@ -357,48 +337,15 @@ def generate_backward_realizations(
         raise FileNotFoundError("FAE checkpoint not found from args.txt")
 
     ckpt = load_fae_checkpoint(fae_checkpoint_path)
-    autoencoder, fae_params, fae_batch_stats, _ = build_attention_fae_from_checkpoint(ckpt)
-
-    # Resolve decode mode — schedule forces multistep.
-    effective_decode_mode = decode_mode
-    if denoiser_steps_schedule is not None:
-        effective_decode_mode = "multistep"
+    autoencoder, fae_params, fae_batch_stats, _ = build_fae_from_checkpoint(ckpt)
 
     _, decode_fn = make_fae_apply_fns(
-        autoencoder, fae_params, fae_batch_stats,
-        decode_mode=effective_decode_mode,
-        denoiser_num_steps=denoiser_num_steps,
-        denoiser_noise_scale=denoiser_noise_scale,
+        autoencoder,
+        fae_params,
+        fae_batch_stats,
+        decode_mode=decode_mode,
     )
-
-    # Build per-knot decode functions if an adaptive schedule is requested.
     T_knots = knots_b_np.shape[0]
-    knot_decode_fns = None
-    if denoiser_steps_schedule is not None:
-        from scripts.fae.fae_naive.diffusion_denoiser_decoder import DiffusionDenoiserDecoder
-        diffusion_cap = (
-            autoencoder.decoder.diffusion_steps
-            if isinstance(autoencoder.decoder, DiffusionDenoiserDecoder)
-            else 1000
-        )
-        knot_steps = parse_step_schedule(
-            denoiser_steps_schedule, T_knots,
-            diffusion_steps_cap=diffusion_cap,
-        )
-        print(f"  Adaptive decode schedule (per knot): {knot_steps}")
-
-        # Build one decode_fn per unique step count (share JIT cache).
-        _cache: dict[int, object] = {}
-        knot_decode_fns = []
-        for s in knot_steps:
-            if s not in _cache:
-                _cache[s] = make_fae_decode_fn(
-                    autoencoder, fae_params, fae_batch_stats,
-                    decode_mode="multistep",
-                    denoiser_num_steps=s,
-                    denoiser_noise_scale=denoiser_noise_scale,
-                )
-            knot_decode_fns.append(_cache[s])
 
     encode_batch_size = int(train_cfg.get("encode_batch_size", 64))
 
@@ -429,7 +376,6 @@ def generate_backward_realizations(
         grid_coords=grid_coords,
         decode_fn=decode_fn,
         batch_size=encode_batch_size,
-        decode_fns_per_knot=knot_decode_fns,
     )
     # knot_fields_log shape: (T_knots, N, res^2) or (T_knots, N, res^2, 1)
     if knot_fields_log.ndim == 4:
@@ -502,8 +448,5 @@ def generate_backward_realizations(
         "sample_indices": sample_indices.astype(np.int64),
         "is_realizations": True,
         "transform_info": transform_info,
-        "decode_mode": effective_decode_mode,
-        "denoiser_steps_schedule": (
-            knot_steps if knot_decode_fns is not None else None
-        ),
+        "decode_mode": decode_mode,
     }

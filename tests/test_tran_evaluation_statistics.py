@@ -10,6 +10,14 @@ if str(_REPO_ROOT) not in sys.path:
 
 
 from scripts.fae.tran_evaluation.evaluate import _build_eval_scope
+from scripts.fae.tran_evaluation.coarse_consistency import (
+    aggregate_grouped_dirac_statistics,
+    compute_conditionwise_dirac_statistics,
+    evaluate_cache_global_coarse_return,
+    evaluate_interval_coarse_consistency,
+    evaluate_path_self_consistency,
+    summarize_conditioned_residuals,
+)
 from scripts.fae.tran_evaluation.first_order import (
     decorrelation_spacing_from_curves,
     evaluate_first_order_pair,
@@ -108,3 +116,186 @@ def test_first_order_pair_uses_decorrelated_samples_for_w1_and_quantiles():
     assert res["obs_values"].size == res["sampling"]["n_obs_values"]
     assert res["gen_values"].size == res["sampling"]["n_gen_values"]
     assert np.allclose(res["qq_obs"], res["qq_gen"])
+
+
+def test_conditionwise_dirac_statistics_decompose_total_into_bias_and_spread():
+    filtered = np.array(
+        [
+            [1.0, 0.0],
+            [3.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    condition = np.array([1.0, 0.0], dtype=np.float32)
+
+    stats = compute_conditionwise_dirac_statistics(filtered, condition, relative_eps=0.0)
+
+    assert stats["n_realizations"] == 2
+    assert stats["target_sq"] == 1.0
+    assert stats["total_sq"] == 2.0
+    assert stats["bias_sq"] == 1.0
+    assert stats["spread_sq"] == 1.0
+    assert stats["total_sq"] == stats["bias_sq"] + stats["spread_sq"]
+    np.testing.assert_allclose(stats["filtered_mean"], np.array([2.0, 0.0], dtype=np.float32))
+
+
+def test_summarize_conditioned_residuals_supports_tensor_fields():
+    residuals = np.array(
+        [
+            [
+                [[1.0, 0.0], [0.0, 0.0]],
+                [[0.0, 1.0], [0.0, 0.0]],
+            ],
+            [
+                [[0.0, 0.0], [1.0, 0.0]],
+                [[0.0, 0.0], [0.0, 1.0]],
+            ],
+        ],
+        dtype=np.float32,
+    )
+    targets = np.ones((2, 2, 2), dtype=np.float32)
+
+    summary = summarize_conditioned_residuals(residuals, targets, relative_eps=0.0)
+
+    assert summary["n_conditions"] == 2
+    assert summary["n_realizations_per_condition"] == 2
+    np.testing.assert_allclose(summary["per_condition"]["total_sq"], np.array([1.0, 1.0], dtype=np.float32))
+    np.testing.assert_allclose(summary["per_condition"]["bias_sq"], np.array([0.5, 0.5], dtype=np.float32))
+    np.testing.assert_allclose(summary["per_condition"]["spread_sq"], np.array([0.5, 0.5], dtype=np.float32))
+    np.testing.assert_allclose(summary["per_condition"]["target_sq"], np.array([4.0, 4.0], dtype=np.float32))
+    assert summary["stable_relative_total"] == 0.25
+    assert summary["stable_relative_bias"] == 0.125
+    assert summary["stable_relative_spread"] == 0.125
+
+
+def test_grouped_dirac_statistics_aggregate_per_condition_groups():
+    filtered = np.array(
+        [
+            [1.0, 0.0],
+            [3.0, 0.0],
+            [0.0, 2.0],
+            [0.0, 4.0],
+        ],
+        dtype=np.float32,
+    )
+    conditions = np.array(
+        [
+            [1.0, 0.0],
+            [1.0, 0.0],
+            [0.0, 2.0],
+            [0.0, 2.0],
+        ],
+        dtype=np.float32,
+    )
+    group_ids = np.array([0, 0, 1, 1], dtype=np.int64)
+
+    summary = aggregate_grouped_dirac_statistics(
+        filtered,
+        conditions,
+        group_ids,
+        relative_eps=0.0,
+    )
+
+    assert summary["n_conditions"] == 2
+    assert summary["n_realizations_per_condition"] == 2
+    np.testing.assert_allclose(summary["per_condition"]["total_sq"], np.array([2.0, 2.0], dtype=np.float32))
+    np.testing.assert_allclose(summary["per_condition"]["bias_sq"], np.array([1.0, 1.0], dtype=np.float32))
+    np.testing.assert_allclose(summary["per_condition"]["spread_sq"], np.array([1.0, 1.0], dtype=np.float32))
+    assert summary["stable_relative_total"] == 0.8
+    assert summary["stable_relative_bias"] == 0.4
+    assert summary["stable_relative_spread"] == 0.4
+    assert summary["decomposition_error_sq"] == 0.0
+
+
+class _IdentityLadder:
+    def filter_at_scale(self, fields_phys: np.ndarray, scale_idx: int) -> np.ndarray:
+        return np.asarray(fields_phys, dtype=np.float32).reshape(fields_phys.shape[0], -1)
+
+
+def test_interval_coarse_consistency_filters_generated_fields_before_scoring():
+    generated = np.array(
+        [
+            [[1.0, 0.0], [3.0, 0.0]],
+            [[0.0, 2.0], [0.0, 4.0]],
+        ],
+        dtype=np.float32,
+    )
+    conditions = np.array(
+        [
+            [1.0, 0.0],
+            [0.0, 2.0],
+        ],
+        dtype=np.float32,
+    )
+
+    summary = evaluate_interval_coarse_consistency(
+        generated,
+        conditions,
+        ladder=_IdentityLadder(),
+        coarse_scale_idx=1,
+        relative_eps=0.0,
+    )
+
+    assert summary["coarse_scale_idx"] == 1
+    np.testing.assert_allclose(summary["per_condition"]["total_sq"], np.array([2.0, 2.0], dtype=np.float32))
+    np.testing.assert_allclose(summary["per_condition"]["bias_sq"], np.array([1.0, 1.0], dtype=np.float32))
+    np.testing.assert_allclose(summary["per_condition"]["spread_sq"], np.array([1.0, 1.0], dtype=np.float32))
+
+
+def test_cache_global_coarse_return_filters_fine_fields_before_grouped_scoring():
+    finest = np.array(
+        [
+            [1.0, 0.0],
+            [3.0, 0.0],
+            [0.0, 2.0],
+            [0.0, 4.0],
+        ],
+        dtype=np.float32,
+    )
+    coarse_targets = np.array(
+        [
+            [1.0, 0.0],
+            [1.0, 0.0],
+            [0.0, 2.0],
+            [0.0, 2.0],
+        ],
+        dtype=np.float32,
+    )
+    group_ids = np.array([0, 0, 1, 1], dtype=np.int64)
+
+    summary = evaluate_cache_global_coarse_return(
+        finest,
+        coarse_targets,
+        group_ids,
+        ladder=_IdentityLadder(),
+        macro_scale_idx=1,
+        relative_eps=0.0,
+    )
+
+    assert summary["macro_scale_idx"] == 1
+    np.testing.assert_allclose(summary["per_condition"]["total_sq"], np.array([2.0, 2.0], dtype=np.float32))
+    np.testing.assert_allclose(summary["per_condition"]["bias_sq"], np.array([1.0, 1.0], dtype=np.float32))
+    np.testing.assert_allclose(summary["per_condition"]["spread_sq"], np.array([1.0, 1.0], dtype=np.float32))
+
+
+def test_path_self_consistency_zero_for_exactly_filtered_trajectory():
+    trajectory = np.array(
+        [
+            [[1.0, 2.0], [3.0, 4.0]],
+            [[1.0, 2.0], [3.0, 4.0]],
+            [[1.0, 2.0], [3.0, 4.0]],
+        ],
+        dtype=np.float32,
+    )
+
+    summary = evaluate_path_self_consistency(
+        trajectory,
+        ladder=_IdentityLadder(),
+        relative_eps=1e-8,
+        group_ids=np.array([0, 1], dtype=np.int64),
+    )
+
+    assert summary["n_intervals"] == 2
+    assert summary["mean_sq_across_intervals"] == 0.0
+    assert summary["mean_rel_across_intervals"] == 0.0
+    assert summary["mean_stable_relative_across_intervals"] == 0.0

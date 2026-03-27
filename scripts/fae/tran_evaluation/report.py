@@ -30,6 +30,7 @@ C_OK = EASTERN_HUES[2]       # deep green
 C_WARN = EASTERN_HUES[0]     # gold
 C_RISK = EASTERN_HUES[4]     # red
 C_ACCENT = EASTERN_HUES[3]   # light teal
+C_TEXT = "#1B1B1B"
 
 # ============================================================================
 # Colormap
@@ -245,143 +246,123 @@ def _density_pair_curve(
     return x.astype(np.float64, copy=False), y_obs_s, y_gen_s
 
 
-# ============================================================================
-# Figure 1 – Conditioning consistency
-# ============================================================================
-
-def plot_conditioning(
-    condition: NDArray,
-    filtered_macro: NDArray,
-    resolution: int,
+def plot_coarse_consistency_breakdown(
+    coarse_results: Dict,
     out_dir: Path,
 ) -> None:
-    """Conditioning-field consistency check.
+    """Plot interval-wise relative coarse-consistency totals and decomposition."""
+    conditioned_interval = coarse_results.get("conditioned_interval", {})
+    conditioned_global = coarse_results.get("conditioned_global_return")
+    cache_global = coarse_results.get("cache_global_return")
 
-    **What it shows.**  Top row: the macro-scale conditioning field *c_i*
-    alongside several generated fields re-filtered to the same macro scale.
-    Bottom row: self-difference (zero sanity check) followed by pixel-wise
-    difference maps with a shared colour scale.
+    display_labels: List[str] = []
+    total_rel_values: list[float] = []
+    bias_rel_values: list[float] = []
+    spread_rel_values: list[float] = []
 
-    **Diagnostic value.**  Verifies that macro-scale conditioning is
-    preserved.  Generated fields, when re-filtered to the macro scale,
-    should match the conditioning field almost exactly.  The leading
-    zero-field column in row 2 provides a visual reference for the
-    colour-scale midpoint.
+    for key in conditioned_interval:
+        display_labels.append(conditioned_interval[key]["pair_metadata"]["display_label"])
+        total_rel_values.append(float(conditioned_interval[key]["total_rel"]["mean"]))
+        bias_rel_values.append(float(conditioned_interval[key]["bias_rel"]["mean"]))
+        spread_rel_values.append(float(conditioned_interval[key]["spread_rel"]["mean"]))
 
-    **Pass / fail.**  The mean relative error should be < 5 %.  Systematic
-    bias or large outliers indicate a conditioning-enforcement bug.
-    """
-    K = filtered_macro.shape[0]
-    n_show = min(4, K)
-    n_cols = n_show + 1  # condition + n_show re-filtered
+    if conditioned_global is not None:
+        display_labels.append("Cond. global")
+        total_rel_values.append(float(conditioned_global["total_rel"]["mean"]))
+        bias_rel_values.append(float(conditioned_global["bias_rel"]["mean"]))
+        spread_rel_values.append(float(conditioned_global["spread_rel"]["mean"]))
 
-    fig, axes = plt.subplots(2, n_cols, figsize=(FIG_WIDTH, 2 * FIELD_ROW_HEIGHT))
+    if cache_global is not None:
+        display_labels.append("Cache global")
+        total_rel_values.append(float(cache_global["total_rel"]["mean"]))
+        bias_rel_values.append(float(cache_global["bias_rel"]["mean"]))
+        spread_rel_values.append(float(cache_global["spread_rel"]["mean"]))
 
-    c_flat = condition.ravel().astype(np.float64)
-    c_2d = c_flat.reshape(resolution, resolution)
+    if not display_labels:
+        return
 
-    # Global field limits across condition AND all re-filtered realisations.
-    field_vmin = float(c_2d.min())
-    field_vmax = float(c_2d.max())
-    for j in range(n_show):
-        fj = filtered_macro[j].ravel()
-        field_vmin = min(field_vmin, float(fj.min()))
-        field_vmax = max(field_vmax, float(fj.max()))
+    x = np.arange(len(display_labels), dtype=np.float64)
+    width = 0.24
 
-    # Top row: coarse field + re-filtered realisations.
-    ax = axes[0, 0]
-    ax.imshow(c_2d, origin="lower", cmap=CMAP_FIELD,
-              vmin=field_vmin, vmax=field_vmax)
-    ax.set_title("Coarse $c_i$", fontsize=FONT_TITLE)
-    ax.axis("off")
+    total_rel = np.asarray(total_rel_values, dtype=np.float64)
+    bias_rel = np.asarray(bias_rel_values, dtype=np.float64)
+    spread_rel = np.asarray(spread_rel_values, dtype=np.float64)
 
-    for j in range(n_show):
-        ax = axes[0, j + 1]
-        img = filtered_macro[j].reshape(resolution, resolution)
-        ax.imshow(img, origin="lower", cmap=CMAP_FIELD,
-                  vmin=field_vmin, vmax=field_vmax)
-        ax.set_title(f"$\\hat{{c}}^{{({j+1})}}$", fontsize=FONT_TITLE)
-        ax.axis("off")
+    fig, ax = plt.subplots(figsize=(FIG_WIDTH, SUBPLOT_HEIGHT + 0.4))
+    ax.bar(x - width, total_rel, width=width, color=C_GEN, label=r"$\mathcal{C}_i^{\mathrm{rel}}$")
+    ax.bar(x, bias_rel, width=width, color=C_OBS, label=r"$\mathcal{B}_i^{\mathrm{rel}}$")
+    ax.bar(x + width, spread_rel, width=width, color=C_FILL, label=r"$\mathcal{S}_i^{\mathrm{rel}}$")
 
-    # Bottom row: self-diff (zero reference) + difference maps.
-    # Note: differences must be visualised on a separate (near-zero) scale.
-    diffs = np.stack(
-        [
-            (filtered_macro[j].ravel().astype(np.float64) - c_flat)
-            .reshape(resolution, resolution)
-            for j in range(n_show)
-        ],
-        axis=0,
-    )
-    diff_abs_max = float(np.max(np.abs(diffs)))
-    diff_abs_max = max(diff_abs_max, 1e-12)
-
-    # Column 0: c_i − c_i ≡ 0 (sanity reference).
-    ax = axes[1, 0]
-    im_diff = ax.imshow(
-        np.zeros((resolution, resolution)),
-        origin="lower",
-        cmap=CMAP_DIFF,
-        vmin=-diff_abs_max,
-        vmax=diff_abs_max,
-    )
-    ax.set_title("$c_i - c_i$", fontsize=FONT_TITLE)
-    ax.axis("off")
-
-    for j in range(n_show):
-        ax = axes[1, j + 1]
-        im_diff = ax.imshow(
-            diffs[j],
-            origin="lower",
-            cmap=CMAP_DIFF,
-            vmin=-diff_abs_max,
-            vmax=diff_abs_max,
+    path_results = coarse_results.get("path_self_consistency")
+    if path_results is not None:
+        ax.axhline(
+            float(path_results["mean_rel_across_intervals"]),
+            color=C_WARN,
+            ls=":",
+            lw=1.8,
+            label=r"$\mathcal{C}_{\mathrm{path}}^{\mathrm{rel}}$",
         )
-        ax.set_title(f"$\\hat{{c}}^{{({j+1})}} - c_i$", fontsize=FONT_TITLE)
-        ax.axis("off")
 
-    # Shared colorbars in dedicated axes on the right (prevents overlap).
-    fig.tight_layout(rect=[0.0, 0.0, 0.84, 1.0])
-    cax_field = fig.add_axes([0.86, 0.55, 0.02, 0.33])
-    cax_diff = fig.add_axes([0.86, 0.12, 0.02, 0.33])
-    cbar_field = fig.colorbar(axes[0, 0].images[0], cax=cax_field)
-    cbar_diff = fig.colorbar(im_diff, cax=cax_diff)
-    cbar_field.ax.tick_params(labelsize=FONT_TICK)
-    cbar_diff.ax.tick_params(labelsize=FONT_TICK)
-
-    _save_fig(fig, out_dir, "fig1_conditioning")
+    ax.set_xticks(x)
+    ax.set_xticklabels(display_labels, rotation=20, ha="right")
+    ax.set_ylabel("Relative coarse defect", fontsize=FONT_LABEL)
+    ax.set_title("Conditioned coarse consistency", fontsize=FONT_TITLE)
+    ax.grid(axis="y", alpha=0.2)
+    _set_tick_fontsize(ax)
+    ax.legend(fontsize=FONT_LEGEND, framealpha=0.85, ncol=2)
+    plt.tight_layout()
+    _save_fig(fig, out_dir, "fig1_coarse_consistency_breakdown")
     plt.close(fig)
 
 
-def plot_conditioning_errors(
-    errors: NDArray,
+def plot_coarse_consistency_condition_distributions(
+    coarse_results: Dict,
     out_dir: Path,
 ) -> None:
-    """Per-realisation relative conditioning error histogram.
+    """Plot per-condition relative coarse defects as interval-wise boxplots."""
+    conditioned_interval = coarse_results.get("conditioned_interval", {})
+    conditioned_global = coarse_results.get("conditioned_global_return")
+    cache_global = coarse_results.get("cache_global_return")
+    display_labels: List[str] = []
+    values: list[NDArray[np.float64]] = []
 
-    **What it shows.**  Distribution of relative L2 errors between each
-    generated field (re-filtered to the macro scale) and the conditioning
-    field.
+    for key in conditioned_interval:
+        display_labels.append(conditioned_interval[key]["pair_metadata"]["display_label"])
+        values.append(np.asarray(conditioned_interval[key]["per_condition"]["total_rel"], dtype=np.float64))
 
-    **Diagnostic value.**  Quantifies how well the generator preserves
-    macro-scale structure.
+    if conditioned_global is not None:
+        values.append(np.asarray(conditioned_global["per_condition"]["total_rel"], dtype=np.float64))
+        display_labels.append("Cond. global")
 
-    **Pass / fail.**  Mean relative error < 5 % is a pass.
-    """
-    fig, ax = plt.subplots(figsize=(FIG_WIDTH / 2, SUBPLOT_HEIGHT))
+    if cache_global is not None:
+        values.append(np.asarray(cache_global["per_condition"]["total_rel"], dtype=np.float64))
+        display_labels.append("Cache global")
 
-    ax.hist(errors, bins=20, edgecolor="k", alpha=0.7)
-    ax.axvline(np.mean(errors), color="r", ls="--", lw=1.5,
-               label=f"mean={np.mean(errors):.4f}")
-    ax.set_xlabel("Relative error $E^{\\mathrm{coarse}}$", fontsize=FONT_LABEL)
-    ax.set_ylabel("Count", fontsize=FONT_LABEL)
-    ax.set_title("Coarse-field error distribution", fontsize=FONT_TITLE)
-    ax.legend(fontsize=FONT_LEGEND, framealpha=0.8)
-    ax.grid(alpha=0.2)
+    if not values:
+        return
+
+    fig, ax = plt.subplots(figsize=(FIG_WIDTH, SUBPLOT_HEIGHT))
+    box = ax.boxplot(values, patch_artist=True, widths=0.6, showfliers=False)
+    palette = [C_OBS if idx % 2 == 0 else C_GEN for idx in range(len(values))]
+    if conditioned_global is not None:
+        palette[len(values) - (1 if cache_global is None else 2)] = C_ACCENT
+    if cache_global is not None:
+        palette[-1] = C_WARN
+    for patch, color in zip(box["boxes"], palette, strict=True):
+        patch.set_facecolor(color)
+        patch.set_alpha(0.65)
+    for median in box["medians"]:
+        median.set_color(C_TEXT)
+        median.set_linewidth(1.5)
+
+    ax.set_xticks(np.arange(1, len(display_labels) + 1))
+    ax.set_xticklabels(display_labels, rotation=20, ha="right")
+    ax.set_ylabel("Per-condition relative coarse defect", fontsize=FONT_LABEL)
+    ax.set_title("Conditioned coarse defects", fontsize=FONT_TITLE)
+    ax.grid(axis="y", alpha=0.2)
     _set_tick_fontsize(ax)
-
     plt.tight_layout()
-    _save_fig(fig, out_dir, "fig1b_conditioning_errors")
+    _save_fig(fig, out_dir, "fig1b_coarse_consistency_conditions")
     plt.close(fig)
 
 
@@ -1165,7 +1146,7 @@ def plot_direct_field_correlation(
 # ============================================================================
 
 def print_summary_table(
-    cond_results: Dict,
+    coarse_results: Optional[Dict],
     first_order_results: Dict[int, Dict],
     second_order_results: Dict[int, Dict],
     spectral_results: Dict[int, Dict],
@@ -1178,12 +1159,62 @@ def print_summary_table(
     lines.append("TRAN-ALIGNED EVALUATION SUMMARY")
     lines.append(sep)
 
-    # Conditioning.
-    lines.append(f"\n1. CONDITIONING CONSISTENCY")
-    lines.append(f"   Mean E^coarse: {cond_results['mean']:.6f}")
-    lines.append(f"   Median:        {cond_results['median']:.6f}")
-    passed = cond_results["mean"] < 0.05
-    lines.append(f"   Pass (<5%):    {'YES' if passed else 'NO'}")
+    # Coarse consistency.
+    lines.append("\n1. COARSE CONSISTENCY")
+    if not coarse_results:
+        lines.append("   Not available.")
+    else:
+        lines.append(f"   Mode: {coarse_results.get('mode', 'unspecified')}")
+
+        conditioned_interval = coarse_results.get("conditioned_interval", {})
+        conditioned_meta = coarse_results.get("conditioned_interval_metadata", {})
+        if conditioned_interval:
+            lines.append(
+                "   Conditioned interval coarse consistency "
+                f"(n_cond={conditioned_meta.get('n_conditions', '?')}, "
+                f"n_realizations={conditioned_meta.get('n_realizations_per_condition', '?')}):"
+            )
+            lines.append(
+                f"   {'Pair':>18} | {'C_rel':>10} | {'B_rel':>10} | {'S_rel':>10} | {'stable':>10}"
+            )
+            lines.append(f"   {'-'*18}-+-{'-'*10}-+-{'-'*10}-+-{'-'*10}-+-{'-'*10}")
+            for pair_key in conditioned_interval:
+                item = conditioned_interval[pair_key]
+                label = item["pair_metadata"]["display_label"]
+                lines.append(
+                    f"   {label:>18} | {item['total_rel']['mean']:>10.6f} | "
+                    f"{item['bias_rel']['mean']:>10.6f} | {item['spread_rel']['mean']:>10.6f} | "
+                    f"{item['stable_relative_total']:>10.6f}"
+                )
+        else:
+            lines.append("   Conditioned interval coarse consistency: not available.")
+
+        conditioned_global = coarse_results.get("conditioned_global_return")
+        if conditioned_global is not None:
+            lines.append("   End-to-end conditioned global coarse return:")
+            lines.append(f"     Mean C_rel: {conditioned_global['total_rel']['mean']:.6f}")
+            lines.append(f"     Mean B_rel: {conditioned_global['bias_rel']['mean']:.6f}")
+            lines.append(f"     Mean S_rel: {conditioned_global['spread_rel']['mean']:.6f}")
+            lines.append(f"     Stable rel: {conditioned_global['stable_relative_total']:.6f}")
+
+        cache_global = coarse_results.get("cache_global_return")
+        if cache_global is not None:
+            lines.append("   Cache global coarse return:")
+            lines.append(f"     Mean C_rel: {cache_global['total_rel']['mean']:.6f}")
+            lines.append(f"     Mean B_rel: {cache_global['bias_rel']['mean']:.6f}")
+            lines.append(f"     Mean S_rel: {cache_global['spread_rel']['mean']:.6f}")
+            lines.append(f"     Stable rel: {cache_global['stable_relative_total']:.6f}")
+
+        path_results = coarse_results.get("path_self_consistency")
+        if path_results is not None:
+            lines.append("   Free-rollout path self-consistency:")
+            lines.append(
+                f"     Mean interval rel: {path_results['mean_rel_across_intervals']:.6f}"
+            )
+            lines.append(
+                f"     Mean stable rel:   "
+                f"{path_results['mean_stable_relative_across_intervals']:.6f}"
+            )
 
     # First-order.
     bands = sorted(first_order_results.keys())

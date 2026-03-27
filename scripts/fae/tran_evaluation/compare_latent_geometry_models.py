@@ -22,8 +22,8 @@ REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from scripts.fae.fae_naive.fae_latent_utils import (  # noqa: E402
-    build_attention_fae_from_checkpoint,
+from mmsfm.fae.fae_latent_utils import (  # noqa: E402
+    build_fae_from_checkpoint,
     load_fae_checkpoint,
 )
 from scripts.fae.tran_evaluation.run_support import (  # noqa: E402
@@ -32,7 +32,7 @@ from scripts.fae.tran_evaluation.run_support import (  # noqa: E402
     resolve_held_out_indices,
     resolve_run_checkpoint,
 )
-from scripts.fae.multiscale_dataset_naive import load_training_time_data_naive  # noqa: E402
+from mmsfm.fae.multiscale_dataset_naive import load_training_time_data_naive  # noqa: E402
 from scripts.fae.tran_evaluation.latent_geometry import (  # noqa: E402
     LatentGeometryConfig,
     evaluate_latent_geometry,
@@ -471,7 +471,7 @@ def _compute_run_latent_geometry(
     )
 
     ckpt = load_fae_checkpoint(checkpoint)
-    autoencoder, params, batch_stats, _meta = build_attention_fae_from_checkpoint(ckpt)
+    autoencoder, params, batch_stats, _meta = build_fae_from_checkpoint(ckpt)
     results = evaluate_latent_geometry(
         autoencoder, params, batch_stats,
         fields_per_time, coords,

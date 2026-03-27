@@ -10,6 +10,9 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from scripts.fae.tran_evaluation.coarse_consistency_runtime import (
+    split_ground_truth_fields_for_run,
+)
 from scripts.fae.tran_evaluation.run_support import (
     build_internal_time_dists,
     load_json_dict,
@@ -103,3 +106,27 @@ def test_resolve_existing_path_returns_none_for_missing_path(tmp_path):
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     assert resolve_existing_path("missing/file.txt", repo_root=repo_root) is None
+
+
+def test_split_ground_truth_fields_for_run_uses_saved_train_test_split():
+    gt_fields_by_index = {
+        1: np.arange(15, dtype=np.float32).reshape(5, 3),
+        3: (100 + np.arange(15, dtype=np.float32)).reshape(5, 3),
+    }
+    split = {"n_train": 3, "n_test": 2}
+    time_indices = np.array([1, 3], dtype=np.int64)
+    latent_train = np.zeros((2, 3, 4), dtype=np.float32)
+    latent_test = np.zeros((2, 2, 4), dtype=np.float32)
+
+    train_fields, test_fields = split_ground_truth_fields_for_run(
+        gt_fields_by_index,
+        split=split,
+        time_indices=time_indices,
+        latent_train=latent_train,
+        latent_test=latent_test,
+    )
+
+    np.testing.assert_array_equal(train_fields[1], gt_fields_by_index[1][:3])
+    np.testing.assert_array_equal(test_fields[1], gt_fields_by_index[1][3:5])
+    np.testing.assert_array_equal(train_fields[3], gt_fields_by_index[3][:3])
+    np.testing.assert_array_equal(test_fields[3], gt_fields_by_index[3][3:5])

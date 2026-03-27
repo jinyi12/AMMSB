@@ -11,7 +11,9 @@ if str(_REPO_ROOT) not in sys.path:
 
 from scripts.fae.tran_evaluation.latent_msbm_runtime import (
     load_policy_checkpoints,
+    sample_backward_full_trajectory_knots,
     sample_backward_one_interval,
+    sample_full_trajectory,
 )
 
 
@@ -37,7 +39,11 @@ class _DummySDE:
         direction,
     ):
         delta = float(t_final - t0)
-        return None, y + delta
+        y_end = y + delta
+        if save_traj:
+            traj = torch.stack([y, y_end], dim=1)
+            return traj, y_end
+        return None, y_end
 
 
 class _DummyPolicy:
@@ -68,6 +74,39 @@ def test_sample_backward_one_interval_reuses_reverse_interval_grid():
 
     assert out.shape == (3, 2)
     assert torch.allclose(out, torch.tensor([[1.75, 2.75]] * 3))
+
+
+def test_sample_full_trajectory_returns_backward_knots_in_stored_order():
+    agent = _DummyAgent()
+    knots, full_traj = sample_full_trajectory(
+        agent=agent,
+        policy=_DummyPolicy(),
+        y_init=torch.tensor([[1.0, 2.0]], dtype=torch.float32),
+        direction="backward",
+    )
+
+    assert knots.shape == (3, 1, 2)
+    assert full_traj.shape[1:] == (1, 2)
+    assert torch.allclose(
+        knots[:, 0, :],
+        torch.tensor([[2.0, 3.0], [1.25, 2.25], [1.0, 2.0]], dtype=torch.float32),
+    )
+
+
+def test_sample_backward_full_trajectory_knots_repeats_independent_full_rollouts():
+    agent = _DummyAgent()
+    knots = sample_backward_full_trajectory_knots(
+        agent,
+        _DummyPolicy(),
+        torch.tensor([[1.0, 2.0]], dtype=torch.float32),
+        n_realizations=3,
+        seed=7,
+    )
+
+    assert knots.shape == (3, 3, 2)
+    expected = torch.tensor([[2.0, 3.0], [1.25, 2.25], [1.0, 2.0]], dtype=torch.float32)
+    for idx in range(3):
+        assert torch.allclose(knots[:, idx, :], expected)
 
 
 def test_load_policy_checkpoints_prefers_ema_when_available(tmp_path):

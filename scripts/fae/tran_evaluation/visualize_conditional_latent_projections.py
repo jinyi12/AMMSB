@@ -45,8 +45,8 @@ os.environ.setdefault("JAX_PLATFORM_NAME", "cpu")
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
 from data.transform_utils import apply_inverse_transform, load_transform_info  # noqa: E402
-from scripts.fae.fae_naive.fae_latent_utils import (  # noqa: E402
-    build_attention_fae_from_checkpoint,
+from mmsfm.fae.fae_latent_utils import (  # noqa: E402
+    build_fae_from_checkpoint,
     load_fae_checkpoint,
     make_fae_apply_fns,
 )
@@ -148,9 +148,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--H_meso_list", type=str, default="1.0,1.25,1.5,2.0,2.5,3.0")
     p.add_argument("--H_macro", type=float, default=6.0)
     p.add_argument("--decode_batch_size", type=int, default=64)
-    p.add_argument("--decode_mode", type=str, default="standard")
-    p.add_argument("--denoiser_num_steps", type=int, default=32)
-    p.add_argument("--denoiser_noise_scale", type=float, default=1.0)
+    p.add_argument("--decode_mode", type=str, default="standard", choices=["standard"])
     return p.parse_args()
 
 
@@ -423,14 +421,12 @@ def _build_decoder_context(run_dir: Path, args: argparse.Namespace) -> DecoderCo
         grid_coords = np.asarray(ds["grid_coords"], dtype=np.float32)
 
     ckpt = load_fae_checkpoint(fae_checkpoint_path)
-    autoencoder, fae_params, fae_batch_stats, _ = build_attention_fae_from_checkpoint(ckpt)
+    autoencoder, fae_params, fae_batch_stats, _ = build_fae_from_checkpoint(ckpt)
     _, decode_fn = make_fae_apply_fns(
         autoencoder,
         fae_params,
         fae_batch_stats,
         decode_mode=str(args.decode_mode),
-        denoiser_num_steps=int(args.denoiser_num_steps),
-        denoiser_noise_scale=float(args.denoiser_noise_scale),
     )
 
     def decode_latents_to_fields(z: np.ndarray) -> np.ndarray:

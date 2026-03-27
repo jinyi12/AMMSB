@@ -17,6 +17,7 @@ from scripts.fae.tran_evaluation.conditional_support import (
     knn_gaussian_weights,
     make_pair_label,
     normalise_weights,
+    sampling_spec_indices,
 )
 
 
@@ -77,4 +78,4 @@ def test_knn_and_local_reference_sampling_respect_exclusions():
 
     assert ref_samples.shape == (1, 3, 4)
     assert len(specs) == 1
-    assert 1 not in specs[0][0].tolist()
+    assert 1 not in sampling_spec_indices(specs[0]).tolist()

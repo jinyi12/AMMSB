@@ -7,7 +7,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from scripts.fae.fae_naive.fae_latent_utils import NoopTimeModule
+from mmsfm.fae.fae_latent_utils import NoopTimeModule
 from scripts.fae.tran_evaluation.run_support import (
     build_internal_time_dists,
     parse_key_value_args_file,
@@ -200,6 +200,99 @@ def load_policy_checkpoints(
 
     if loaded_ema:
         print(f"Loaded EMA policy weights: {', '.join(loaded_ema)}")
+
+
+@torch.no_grad()
+def sample_full_trajectory(
+    *,
+    agent: LatentMSBMAgent,
+    policy: nn.Module,
+    y_init: torch.Tensor,
+    direction: str,
+    drift_clip_norm: float | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Generate knot-time and full latent trajectories for one sampling direction."""
+    ts_rel = agent.ts
+    y = y_init
+    knots_list: list[torch.Tensor] = []
+    full_traj_list: list[torch.Tensor] = []
+
+    if direction == "forward":
+        knots_list.append(y)
+        for idx in range(agent.t_dists.numel() - 1):
+            t0 = agent.t_dists[idx]
+            t1 = agent.t_dists[idx + 1]
+            traj, y = agent.sde.sample_traj(
+                ts_rel,
+                policy,
+                y,
+                t0,
+                t_final=t1,
+                save_traj=True,
+                drift_clip_norm=drift_clip_norm,
+                direction=getattr(policy, "direction", "forward"),
+            )
+            knots_list.append(y)
+            traj_t = traj.transpose(0, 1)
+            full_traj_list.append(traj_t if idx == 0 else traj_t[1:])
+
+    elif direction == "backward":
+        knots_list.append(y)
+        num_intervals = int(agent.t_dists.numel() - 1)
+        for idx in range(num_intervals - 1, -1, -1):
+            rev_idx = (num_intervals - 1) - idx
+            t0_rev = agent.t_dists[rev_idx]
+            t1_rev = agent.t_dists[rev_idx + 1]
+            traj, y = agent.sde.sample_traj(
+                ts_rel,
+                policy,
+                y,
+                t0_rev,
+                t_final=t1_rev,
+                save_traj=True,
+                drift_clip_norm=drift_clip_norm,
+                direction=getattr(policy, "direction", "backward"),
+            )
+            knots_list.append(y)
+            traj_t = traj.transpose(0, 1)
+            full_traj_list.append(traj_t if idx == num_intervals - 1 else traj_t[1:])
+
+        knots_list = list(reversed(knots_list))
+    else:
+        raise ValueError(f"Unknown direction: {direction}")
+
+    knots = torch.stack(knots_list, dim=0)
+    full_traj = torch.cat(full_traj_list, dim=0)
+    if direction == "backward":
+        full_traj = torch.flip(full_traj, dims=[0])
+    return knots, full_traj
+
+
+@torch.no_grad()
+def sample_backward_full_trajectory_knots(
+    agent: LatentMSBMAgent,
+    policy: nn.Module,
+    z_start: torch.Tensor,
+    n_realizations: int,
+    seed: int,
+    drift_clip_norm: float | None = None,
+) -> torch.Tensor:
+    """Run full backward rollouts and return knot marginals in stored fine-to-coarse order."""
+    if z_start.shape[0] != 1:
+        raise ValueError(f"z_start must have shape (1, K), got {tuple(z_start.shape)}.")
+
+    knots_list = []
+    for idx in range(int(n_realizations)):
+        torch.manual_seed(int(seed) + idx)
+        knots_i, _ = sample_full_trajectory(
+            agent=agent,
+            policy=policy,
+            y_init=z_start,
+            direction="backward",
+            drift_clip_norm=drift_clip_norm,
+        )
+        knots_list.append(knots_i[:, 0, :])
+    return torch.stack(knots_list, dim=1)
 
 
 @torch.no_grad()

@@ -22,22 +22,20 @@ from typing import Any, Optional
 
 import numpy as np
 import torch
-import torch.nn as nn
 
 # Make repo importable
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from scripts.fae.fae_naive.fae_latent_utils import (
+from mmsfm.fae.fae_latent_utils import (
     NoopTimeModule,
-    build_attention_fae_from_checkpoint,
+    build_fae_from_checkpoint,
     decode_latent_knots_to_fields,
     load_fae_checkpoint,
     make_fae_apply_fns,
-    make_fae_decode_fn,
-    parse_step_schedule,
 )
+from scripts.fae.tran_evaluation.latent_msbm_runtime import sample_full_trajectory as _sample_full_trajectory
 from scripts.fae.tran_evaluation.run_support import (
     build_internal_time_dists as _build_t_dists_from_cfg,
     parse_key_value_args_file as parse_args_file,
@@ -81,115 +79,12 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--decode_mode",
         type=str,
-        default="auto",
-        choices=["auto", "standard", "one_step", "multistep"],
-        help="Decode mode for FAE decoder. 'auto' uses one_step for denoiser decoders.",
-    )
-    p.add_argument("--denoiser_num_steps", type=int, default=32, help="Euler steps for multistep decode.")
-    p.add_argument("--denoiser_noise_scale", type=float, default=1.0, help="Noise scale for one_step decode.")
-    p.add_argument(
-        "--denoiser_steps_schedule", type=str, default=None,
-        help="Per-knot adaptive decode-step schedule. Overrides --denoiser_num_steps "
-             "and forces multistep mode.  Formats: comma-separated list, "
-             "'exp:<max>:<decay>:<min>', or a uniform integer.",
+        default="standard",
+        choices=["standard"],
+        help="Decode mode for active deterministic FAE checkpoints.",
     )
     p.add_argument("--decode_batch_size", type=int, default=None, help="Batch size for decoding (overrides train config).")
     return p.parse_args()
-
-
-@torch.no_grad()
-def _sample_full_trajectory(
-    *,
-    agent: LatentMSBMAgent,
-    policy: nn.Module,
-    y_init: torch.Tensor,  # (N, K)
-    direction: str,
-    drift_clip_norm: Optional[float],
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Generate full SDE trajectories (not just knots).
-
-    Returns
-    -------
-    knots : Tensor (T, N, K)
-        Values at marginal time points.
-    full_traj : Tensor (T_full, N, K)
-        Full trajectory including intermediate SDE steps.
-    """
-    ts_rel = agent.ts
-    y = y_init
-    knots_list: list[torch.Tensor] = []
-    full_traj_list: list[torch.Tensor] = []
-
-    if direction == "forward":
-        knots_list.append(y)
-
-        for i in range(agent.t_dists.numel() - 1):
-            t0 = agent.t_dists[i]
-            t1 = agent.t_dists[i + 1]
-
-            # save_traj=True returns (traj, final_state)
-            # traj has shape: (B, S, K) where B=batch, S=n_steps, K=latent_dim
-            traj, y = agent.sde.sample_traj(
-                ts_rel, policy, y, t0, t_final=t1,
-                save_traj=True,  # ← Key change: save intermediate steps
-                drift_clip_norm=drift_clip_norm,
-                direction=getattr(policy, "direction", "forward"),
-            )
-            knots_list.append(y)
-
-            # Transpose to (S, B, K) for concatenation along time dimension
-            traj_t = traj.transpose(0, 1)  # (S, B, K)
-
-            # For first interval, include everything. For subsequent intervals, skip first point to avoid duplication
-            if i == 0:
-                full_traj_list.append(traj_t)
-            else:
-                full_traj_list.append(traj_t[1:])  # Skip duplicate point
-
-    elif direction == "backward":
-        knots_list.append(y)
-
-        num_intervals = int(agent.t_dists.numel() - 1)
-        for i in range(num_intervals - 1, -1, -1):
-            rev_i = (num_intervals - 1) - i
-            t0_rev = agent.t_dists[rev_i]
-            t1_rev = agent.t_dists[rev_i + 1]
-
-            # traj has shape: (B, S, K)
-            traj, y = agent.sde.sample_traj(
-                ts_rel, policy, y, t0_rev, t_final=t1_rev,
-                save_traj=True,  # ← Save full trajectory
-                drift_clip_norm=drift_clip_norm,
-                direction=getattr(policy, "direction", "backward"),
-            )
-            knots_list.append(y)
-
-            # Transpose to (S, B, K)
-            traj_t = traj.transpose(0, 1)
-
-            # For first backward interval (last in time), include everything
-            # For subsequent intervals, skip first point to avoid duplication
-            if i == num_intervals - 1:
-                full_traj_list.append(traj_t)
-            else:
-                full_traj_list.append(traj_t[1:])
-
-        knots_list = list(reversed(knots_list))
-        # `full_traj_list` is currently ordered in the *sampling* direction
-        # (physical time: t_T -> t_0). For downstream visualization we want the
-        # saved tensor aligned with increasing `zt` (t_0 -> t_T), so we flip the
-        # concatenated trajectory at the end instead of reversing per-interval
-        # segments (which would break continuity at interval boundaries).
-    else:
-        raise ValueError(f"Unknown direction: {direction}")
-
-    knots = torch.stack(knots_list, dim=0)  # (T, N, K)
-    full_traj = torch.cat(full_traj_list, dim=0)  # (T_full, N, K)
-    if direction == "backward":
-        full_traj = torch.flip(full_traj, dims=[0])
-
-    return knots, full_traj
-
 
 def main() -> None:
     args = _parse_args()
@@ -530,49 +425,14 @@ def main() -> None:
             print(f"Warning: FAE checkpoint not found at {fae_checkpoint_path}, skipping decoding.")
         else:
             ckpt = load_fae_checkpoint(fae_checkpoint_path)
-            autoencoder, fae_params, fae_batch_stats, _ = build_attention_fae_from_checkpoint(ckpt)
-
-            # Resolve decode mode — schedule forces multistep.
-            effective_decode_mode = str(args.decode_mode)
-            if args.denoiser_steps_schedule is not None:
-                effective_decode_mode = "multistep"
+            autoencoder, fae_params, fae_batch_stats, _ = build_fae_from_checkpoint(ckpt)
 
             _, decode_fn = make_fae_apply_fns(
                 autoencoder,
                 fae_params,
                 fae_batch_stats,
-                decode_mode=effective_decode_mode,
-                denoiser_num_steps=int(args.denoiser_num_steps),
-                denoiser_noise_scale=float(args.denoiser_noise_scale),
+                decode_mode=str(args.decode_mode),
             )
-
-            # Build per-knot decode functions if schedule is provided.
-            knot_decode_fns = None
-            if args.denoiser_steps_schedule is not None:
-                from scripts.fae.fae_naive.diffusion_denoiser_decoder import DiffusionDenoiserDecoder
-                diffusion_cap = (
-                    autoencoder.decoder.diffusion_steps
-                    if isinstance(autoencoder.decoder, DiffusionDenoiserDecoder)
-                    else 1000
-                )
-                T_knots_dec = knots_b_np.shape[0] if "latent_backward_knots" in artifacts else knots_f_np.shape[0]
-                knot_steps = parse_step_schedule(
-                    args.denoiser_steps_schedule, T_knots_dec,
-                    diffusion_steps_cap=diffusion_cap,
-                )
-                print(f"  Adaptive decode schedule (per knot): {knot_steps}")
-
-                _cache: dict[int, object] = {}
-                knot_decode_fns = []
-                for s in knot_steps:
-                    if s not in _cache:
-                        _cache[s] = make_fae_decode_fn(
-                            autoencoder, fae_params, fae_batch_stats,
-                            decode_mode="multistep",
-                            denoiser_num_steps=s,
-                            denoiser_noise_scale=float(args.denoiser_noise_scale),
-                        )
-                    knot_decode_fns.append(_cache[s])
 
             encode_batch_size = args.decode_batch_size if args.decode_batch_size is not None else int(train_cfg.get("encode_batch_size", 64))
             print(f"FAE decode batch size: {encode_batch_size}")

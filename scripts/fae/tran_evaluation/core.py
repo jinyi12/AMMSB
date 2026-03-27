@@ -260,6 +260,32 @@ def load_generated_realizations(
     realizations_log = fields[time_idx]  # (K, res²)
     realizations_phys = apply_inverse_transform(realizations_log, transform_info)
 
+    trajectory_fields_log = None
+    trajectory_fields_phys = None
+    trajectory_fields_log_all = None
+    trajectory_fields_phys_all = None
+    trajectory_all_time_indices = None
+    if "trajectory_fields_log" in traj:
+        trajectory_fields_log = np.asarray(traj["trajectory_fields_log"], dtype=np.float32)
+    else:
+        trajectory_fields_log = fields.astype(np.float32)
+    if "trajectory_fields_phys" in traj:
+        trajectory_fields_phys = np.asarray(traj["trajectory_fields_phys"], dtype=np.float32)
+    elif trajectory_fields_log is not None:
+        trajectory_fields_phys = np.stack(
+            [
+                apply_inverse_transform(trajectory_fields_log[t], transform_info)
+                for t in range(int(trajectory_fields_log.shape[0]))
+            ],
+            axis=0,
+        ).astype(np.float32)
+    if "trajectory_fields_log_all" in traj:
+        trajectory_fields_log_all = np.asarray(traj["trajectory_fields_log_all"], dtype=np.float32)
+    if "trajectory_fields_phys_all" in traj:
+        trajectory_fields_phys_all = np.asarray(traj["trajectory_fields_phys_all"], dtype=np.float32)
+    if "trajectory_all_time_indices" in traj:
+        trajectory_all_time_indices = np.asarray(traj["trajectory_all_time_indices"], dtype=np.int64)
+
     zt = np.asarray(traj["zt"]) if "zt" in traj else None
     time_indices = (
         np.asarray(traj["time_indices"], dtype=np.int64)
@@ -277,8 +303,13 @@ def load_generated_realizations(
     return {
         "realizations_phys": realizations_phys.astype(np.float32),
         "realizations_log": realizations_log.astype(np.float32),
+        "trajectory_fields_phys": trajectory_fields_phys,
+        "trajectory_fields_log": trajectory_fields_log,
+        "trajectory_fields_phys_all": trajectory_fields_phys_all,
+        "trajectory_fields_log_all": trajectory_fields_log_all,
         "zt": zt,
         "time_indices": time_indices,
+        "trajectory_all_time_indices": trajectory_all_time_indices,
         "resolution": resolution,
         "sample_indices": sample_indices,
         "is_realizations": is_real,

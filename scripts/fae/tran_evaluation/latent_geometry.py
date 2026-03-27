@@ -7,7 +7,7 @@ from typing import Any, Dict
 
 import numpy as np
 
-from scripts.fae.fae_naive.ntk_estimators import (
+from mmsfm.fae.ntk_estimators import (
     estimate_psd_trace_hutchpp,
     estimate_psd_trace_of_square_hutchinson,
 )
@@ -498,7 +498,7 @@ def evaluate_latent_geometry(
     import jax.numpy as jnp
 
     from scripts.fae.analyze_latent_noise_sweep import compute_latent_codes
-    from scripts.fae.fae_naive.fae_latent_utils import make_fae_apply_fns
+    from mmsfm.fae.fae_latent_utils import make_fae_apply_fns
 
     fields = np.asarray(fields_per_time, dtype=np.float32)
     coords = np.asarray(coords, dtype=np.float32)

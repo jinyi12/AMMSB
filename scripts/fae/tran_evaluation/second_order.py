@@ -24,6 +24,9 @@ import numpy as np
 from numpy.typing import NDArray
 
 
+_TRAPEZOID = getattr(np, "trapezoid", np.trapz)
+
+
 # ============================================================================
 # Directional normalised correlation
 # ============================================================================
@@ -175,7 +178,7 @@ def correlation_lengths(
 
     # Integral scale: ∫₀^∞ R(τ) dτ  ≈  trapz over non-negative part.
     positive = np.maximum(R_clean, 0.0)
-    xi_int = float(np.trapz(positive, dx=pixel_size))
+    xi_int = float(_TRAPEZOID(positive, dx=pixel_size))
 
     return {
         "xi_e": xi_e,
@@ -232,8 +235,8 @@ def tran_J_mismatch(
 
     # Trapezoidal quadrature.
     dr = pixel_size
-    J_e1 = float(np.trapz(np.abs(R_gen_e1[:B] - R_obs_e1[:B]), dx=dr))
-    J_e2 = float(np.trapz(np.abs(R_gen_e2[:B] - R_obs_e2[:B]), dx=dr))
+    J_e1 = float(_TRAPEZOID(np.abs(R_gen_e1[:B] - R_obs_e1[:B]), dx=dr))
+    J_e2 = float(_TRAPEZOID(np.abs(R_gen_e2[:B] - R_obs_e2[:B]), dx=dr))
 
     J = J_e1 + J_e2
     r_max_phys = B * pixel_size

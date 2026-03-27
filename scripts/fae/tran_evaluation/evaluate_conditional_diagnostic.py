@@ -54,8 +54,8 @@ from scripts.fae.tran_evaluation.conditional_support import (
     make_pair_label,
     normalise_weights,
 )
-from scripts.fae.fae_naive.fae_latent_utils import (
-    build_attention_fae_from_checkpoint,
+from mmsfm.fae.fae_latent_utils import (
+    build_fae_from_checkpoint,
     load_fae_checkpoint,
     make_fae_apply_fns,
 )
@@ -266,10 +266,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--no_use_ema", action="store_false", dest="use_ema")
     p.add_argument("--drift_clip_norm", type=float, default=None)
     p.add_argument("--decode_batch_size", type=int, default=64)
-    p.add_argument("--decode_mode", type=str, default="auto",
-                   choices=["auto", "standard", "one_step", "multistep"])
-    p.add_argument("--denoiser_num_steps", type=int, default=32)
-    p.add_argument("--denoiser_noise_scale", type=float, default=1.0)
+    p.add_argument("--decode_mode", type=str, default="standard", choices=["standard"])
     p.add_argument("--L_domain", type=float, default=6.0)
     p.add_argument("--H_meso_list", type=str, default="1.0,1.25,1.5,2.0,2.5,3.0")
     p.add_argument("--H_macro", type=float, default=6.0)
@@ -377,12 +374,10 @@ def main() -> None:
     if fae_checkpoint_path is None:
         raise FileNotFoundError("Could not resolve FAE checkpoint from args.txt")
     ckpt = load_fae_checkpoint(fae_checkpoint_path)
-    autoencoder, fae_params, fae_batch_stats, _ = build_attention_fae_from_checkpoint(ckpt)
+    autoencoder, fae_params, fae_batch_stats, _ = build_fae_from_checkpoint(ckpt)
     encode_fn, decode_fn = make_fae_apply_fns(
         autoencoder, fae_params, fae_batch_stats,
         decode_mode=str(args.decode_mode),
-        denoiser_num_steps=int(args.denoiser_num_steps),
-        denoiser_noise_scale=float(args.denoiser_noise_scale),
     )
 
     agent = build_latent_msbm_agent(

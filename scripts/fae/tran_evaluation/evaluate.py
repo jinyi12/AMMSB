@@ -3,7 +3,7 @@
 
 Orchestrates all evaluation phases:
   0. Load data, build filter ladder, invert to physical scale
-  1. Conditioning consistency
+  1. Sequential coarse consistency
   2. Detail / residual field decomposition
   3. First-order statistics (one-point PDFs, W1)
   4. Second-order statistics (directional R(tau), Tran J mismatch)
@@ -81,9 +81,15 @@ from scripts.fae.tran_evaluation.core import (  # noqa: E402
     load_ground_truth,
     load_time_index_mapping,
 )
-from scripts.fae.tran_evaluation.conditioning import (  # noqa: E402
-    compute_conditioning_error,
-    conditioning_pass,
+from scripts.fae.tran_evaluation.coarse_consistency import (  # noqa: E402
+    evaluate_cache_global_coarse_return,
+    evaluate_path_self_consistency,
+)
+from scripts.fae.tran_evaluation.coarse_consistency_runtime import (  # noqa: E402
+    evaluate_conditioned_global_coarse_return_for_runtime,
+    evaluate_conditioned_interval_coarse_consistency_for_runtime,
+    load_coarse_consistency_runtime,
+    split_ground_truth_fields_for_run,
 )
 from scripts.fae.tran_evaluation.detail_fields import (  # noqa: E402
     build_generated_detail_fields,
@@ -105,8 +111,8 @@ from scripts.fae.tran_evaluation.run_support import (  # noqa: E402
     resolve_held_out_indices,
 )
 from scripts.fae.tran_evaluation.report import (  # noqa: E402
-    plot_conditioning,
-    plot_conditioning_errors,
+    plot_coarse_consistency_breakdown,
+    plot_coarse_consistency_condition_distributions,
     plot_detail_bands,
     plot_direct_field_correlation,
     plot_direct_field_pdfs,
@@ -127,6 +133,7 @@ from scripts.fae.tran_evaluation.report import (  # noqa: E402
     print_trajectory_summary_table,
 )
 from scripts.images.field_visualization import format_for_paper  # noqa: E402
+from scripts.utils import get_device  # noqa: E402
 
 def _save_generated_data_cache(path: Path, gen: dict[str, Any]) -> None:
     """Persist generated evaluation data for later plot-only reruns."""
@@ -157,10 +164,6 @@ def _save_generated_data_cache(path: Path, gen: dict[str, Any]) -> None:
     if decode_mode is not None:
         payload["decode_mode"] = np.asarray(str(decode_mode))
 
-    denoiser_steps_schedule = gen.get("denoiser_steps_schedule")
-    if denoiser_steps_schedule is not None:
-        payload["denoiser_steps_schedule"] = np.asarray(denoiser_steps_schedule)
-
     np.savez_compressed(path, **payload)
 
 
@@ -189,10 +192,60 @@ def _load_generated_data_cache(path: Path) -> dict[str, Any]:
             gen["is_realizations"] = bool(np.asarray(data["is_realizations"]).item())
         if "decode_mode" in data:
             gen["decode_mode"] = str(np.asarray(data["decode_mode"]).item())
-        if "denoiser_steps_schedule" in data:
-            sched = np.asarray(data["denoiser_steps_schedule"])
-            gen["denoiser_steps_schedule"] = sched.tolist() if sched.ndim > 0 else sched.item()
     return gen
+
+
+def _to_jsonable(value: Any) -> Any:
+    """Recursively convert numpy-heavy nested results into JSON-safe objects."""
+    if isinstance(value, dict):
+        return {str(k): _to_jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_to_jsonable(v) for v in value]
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, (np.integer, np.floating, np.bool_)):
+        return value.item()
+    return value
+
+
+def _npz_safe_key(label: str) -> str:
+    safe = str(label).replace(" ", "_").replace("=", "").replace(">", "to")
+    safe = safe.replace("-", "_").replace("/", "_").replace(".", "p")
+    while "__" in safe:
+        safe = safe.replace("__", "_")
+    return safe.strip("_")
+
+
+def _build_global_coarse_targets(
+    *,
+    gt_coarse_fields: np.ndarray,
+    sample_indices: np.ndarray | None,
+    default_sample_idx: int,
+    n_samples: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    if sample_indices is None:
+        index = int(default_sample_idx)
+        if not (0 <= index < int(gt_coarse_fields.shape[0])):
+            raise IndexError(
+                f"default_sample_idx={index} is out of range for coarse GT fields "
+                f"with shape {gt_coarse_fields.shape}."
+            )
+        coarse_targets = np.repeat(gt_coarse_fields[index : index + 1], int(n_samples), axis=0)
+        group_ids = np.zeros(int(n_samples), dtype=np.int64)
+        return coarse_targets.astype(np.float32), group_ids
+
+    indices = np.asarray(sample_indices, dtype=np.int64).reshape(-1)
+    if indices.shape[0] != int(n_samples):
+        raise ValueError(
+            f"sample_indices length {indices.shape[0]} does not match n_samples={n_samples}."
+        )
+    if np.any(indices < 0) or np.any(indices >= int(gt_coarse_fields.shape[0])):
+        raise IndexError(
+            "sample_indices contain values outside the available coarse GT field range: "
+            f"min={int(indices.min())}, max={int(indices.max())}, "
+            f"n_fields={int(gt_coarse_fields.shape[0])}."
+        )
+    return gt_coarse_fields[indices].astype(np.float32), indices
 
 
 # ============================================================================
@@ -234,6 +287,12 @@ def _parse_args() -> argparse.Namespace:
         "--reuse_generated_data",
         action="store_true",
         help="Reuse --generated_data_file when present instead of regenerating backward realizations.",
+    )
+    p.add_argument(
+        "--coarse_runtime_run_dir",
+        type=str,
+        default=None,
+        help="Optional runtime provider used for conditioned coarse metrics when evaluating a decoded cache.",
     )
 
     # --- Physics / geometry ---
@@ -283,36 +342,73 @@ def _parse_args() -> argparse.Namespace:
     )
     p.add_argument("--nogpu", action="store_true", help="Force CPU.")
 
-    # --- Denoiser decode settings ---
+    # --- Decode settings ---
     p.add_argument(
-        "--decode_mode", type=str, default="auto",
-        choices=["auto", "standard", "one_step", "multistep"],
-        help="Decode mode for FAE decoder. 'auto' uses one_step for "
-             "denoiser decoders.  Use 'multistep' for iterative ODE/SDE "
-             "sampling with controllable step counts.",
-    )
-    p.add_argument(
-        "--denoiser_num_steps", type=int, default=32,
-        help="Default number of Euler steps for multistep decoding.",
-    )
-    p.add_argument(
-        "--denoiser_noise_scale", type=float, default=1.0,
-        help="Noise scale for one-step decoding.",
-    )
-    p.add_argument(
-        "--denoiser_steps_schedule", type=str, default=None,
-        help="Per-knot adaptive decode-step schedule.  Overrides "
-             "--denoiser_num_steps and forces multistep mode.  Formats:\n"
-             "  Comma-separated: '500,250,125,64,32,16,8'\n"
-             "  Exponential:     'exp:<max>:<decay>:<min>'  "
-             "(e.g. 'exp:500:0.5:8')\n"
-             "  Uniform int:     '32'",
+        "--decode_mode",
+        type=str,
+        default="standard",
+        choices=["standard"],
+        help="Decode mode for active deterministic FAE checkpoints.",
     )
 
     # --- Ground truth ---
     p.add_argument(
         "--n_gt_neighbors", type=int, default=200,
         help="Number of GT samples for ensemble comparison.",
+    )
+    p.add_argument(
+        "--coarse_eval_mode",
+        type=str,
+        default="both",
+        choices=["sequential", "global", "both"],
+        help=(
+            "Phase 1 coarse-consistency mode: "
+            "'sequential' = conditioned per-interval evaluation using the true previous state; "
+            "'global' = end-to-end conditioned global coarse return; "
+            "'both' = run both."
+        ),
+    )
+    p.add_argument(
+        "--coarse_eval_conditions",
+        type=int,
+        default=16,
+        help="Number of held-out conditioning fields used for conditioned interval evaluation.",
+    )
+    p.add_argument(
+        "--coarse_eval_realizations",
+        type=int,
+        default=32,
+        help="Number of conditional realizations drawn per held-out conditioning field "
+             "for conditioned interval evaluation.",
+    )
+    p.add_argument(
+        "--conditioned_global_conditions",
+        type=int,
+        default=16,
+        help="Number of held-out coarse conditions used for end-to-end conditioned global coarse-return evaluation.",
+    )
+    p.add_argument(
+        "--conditioned_global_realizations",
+        type=int,
+        default=32,
+        help="Number of full rollouts drawn per held-out coarse condition for conditioned global evaluation.",
+    )
+    p.add_argument(
+        "--report_cache_global_return",
+        action="store_true",
+        help="Also report the cache-level fine-to-coarse return from generated_realizations.npz as a secondary diagnostic.",
+    )
+    p.add_argument(
+        "--coarse_relative_epsilon",
+        type=float,
+        default=1e-8,
+        help="Stabilizer used in relative coarse-consistency metrics.",
+    )
+    p.add_argument(
+        "--coarse_decode_batch_size",
+        type=int,
+        default=256,
+        help="Batch size for FAE decoding during conditioned coarse evaluation.",
     )
 
     # --- Options ---
@@ -399,6 +495,18 @@ def _parse_args() -> argparse.Namespace:
         p.error("--dataset_file is required when using --trajectory_file.")
     if args.latent_geom_max_samples_per_time < 0:
         p.error("--latent_geom_max_samples_per_time must be >= 0.")
+    if args.coarse_eval_conditions <= 0:
+        p.error("--coarse_eval_conditions must be > 0.")
+    if args.coarse_eval_realizations <= 0:
+        p.error("--coarse_eval_realizations must be > 0.")
+    if args.conditioned_global_conditions <= 0:
+        p.error("--conditioned_global_conditions must be > 0.")
+    if args.conditioned_global_realizations <= 0:
+        p.error("--conditioned_global_realizations must be > 0.")
+    if args.coarse_decode_batch_size <= 0:
+        p.error("--coarse_decode_batch_size must be > 0.")
+    if args.coarse_relative_epsilon < 0.0:
+        p.error("--coarse_relative_epsilon must be >= 0.")
 
     return args
 
@@ -520,11 +628,11 @@ def _compute_latent_geometry_results(
     args: argparse.Namespace,
     run_dir: Optional[Path],
 ) -> tuple[dict[str, Any], np.ndarray]:
-    from scripts.fae.fae_naive.fae_latent_utils import (  # noqa: E402
-        build_attention_fae_from_checkpoint,
+    from mmsfm.fae.fae_latent_utils import (  # noqa: E402
+        build_fae_from_checkpoint,
         load_fae_checkpoint,
     )
-    from scripts.fae.multiscale_dataset_naive import load_training_time_data_naive  # noqa: E402
+    from mmsfm.fae.multiscale_dataset_naive import load_training_time_data_naive  # noqa: E402
     from scripts.fae.tran_evaluation.latent_geometry import (  # noqa: E402
         LatentGeometryConfig,
         evaluate_latent_geometry,
@@ -559,7 +667,7 @@ def _compute_latent_geometry_results(
     dataset_time_indices = np.asarray([int(d["idx"]) for d in time_data], dtype=np.int64)
 
     ckpt = load_fae_checkpoint(Path(resolved["checkpoint_path"]))
-    autoencoder, fae_params, fae_batch_stats, _ = build_attention_fae_from_checkpoint(ckpt)
+    autoencoder, fae_params, fae_batch_stats, _ = build_fae_from_checkpoint(ckpt)
 
     lg_config = LatentGeometryConfig.from_preset(
         args.latent_geom_budget, seed=args.seed,
@@ -679,6 +787,13 @@ def main() -> None:
         return
 
     run_dir = Path(args.run_dir) if args.run_dir else None
+    coarse_runtime_run_dir = (
+        Path(args.coarse_runtime_run_dir).expanduser().resolve()
+        if args.coarse_runtime_run_dir is not None
+        else (run_dir.expanduser().resolve() if run_dir is not None else None)
+    )
+    if coarse_runtime_run_dir is not None and not coarse_runtime_run_dir.exists():
+        raise FileNotFoundError(f"Missing coarse runtime provider: {coarse_runtime_run_dir}")
 
     # ------------------------------------------------------------------
     # Resolve paths & generate / load realisations
@@ -732,9 +847,6 @@ def main() -> None:
                 drift_clip_norm=args.drift_clip_norm,
                 device=device,
                 decode_mode=args.decode_mode,
-                denoiser_num_steps=args.denoiser_num_steps,
-                denoiser_noise_scale=args.denoiser_noise_scale,
-                denoiser_steps_schedule=args.denoiser_steps_schedule,
             )
             _save_generated_data_cache(generated_data_path, gen)
             print(f"Saved generated data cache to {generated_data_path}")
@@ -795,11 +907,10 @@ def main() -> None:
 
     print(f"GT reference field: dataset index {gt_micro_dataset_idx} "
           f"(H={full_H_schedule[gt_micro_dataset_idx]:.2f})")
-    print(f"GT conditioning:    dataset index {gt_macro_dataset_idx} "
+    print(f"GT coarse target:   dataset index {gt_macro_dataset_idx} "
           f"(H={full_H_schedule[gt_macro_dataset_idx]:.2f})")
 
     gt_micro_sample = gt["fields_by_index"][gt_micro_dataset_idx][args.sample_idx]
-    gt_macro_sample = gt["fields_by_index"][gt_macro_dataset_idx][args.sample_idx]
 
     modeled_dataset_indices = (
         [int(idx) for idx in time_indices.tolist()]
@@ -841,8 +952,7 @@ def main() -> None:
     print(f"Eval H_schedule: {eval_H_schedule}  ({n_eval_bands} detail bands)")
     print("  Excluded from evaluation: raw microscale index 0 and any held-out dataset indices")
 
-    cond = None
-    passed = None
+    coarse_results: dict[str, Any] | None = None
     first_order = {}
     second_order = {}
     spectral = {}
@@ -854,19 +964,156 @@ def main() -> None:
 
     if not args.trajectory_only:
         # ---------------------------------------------------------------
-        # Phase 1: Conditioning consistency
+        # Phase 1: Sequential coarse consistency
         # ---------------------------------------------------------------
-        print("\n--- Phase 1: Conditioning consistency ---")
+        print("\n--- Phase 1: Sequential coarse consistency ---")
 
-        cond = compute_conditioning_error(
-            gen["realizations_phys"],
-            gt_macro_sample,
-            eval_ladder,
-            macro_scale_idx=eval_macro_scale_idx,
-        )
-        passed = conditioning_pass(cond["mean"])
-        print(f"  Mean E^coarse = {cond['mean']:.6f}  "
-              f"({'PASS' if passed else 'FAIL'})")
+        coarse_results = {
+            "mode": args.coarse_eval_mode,
+            "conditioned_interval": {},
+            "conditioned_interval_metadata": None,
+            "conditioned_global_return": None,
+            "cache_global_return": None,
+            "path_self_consistency": None,
+        }
+
+        coarse_runtime = None
+        test_fields_by_tidx = None
+        if coarse_runtime_run_dir is not None:
+            coarse_device = get_device(args.nogpu)
+            coarse_runtime = load_coarse_consistency_runtime(
+                run_dir=coarse_runtime_run_dir,
+                dataset_path=ds_path,
+                device=coarse_device,
+                decode_mode=args.decode_mode,
+                decode_batch_size=args.coarse_decode_batch_size,
+                use_ema=args.use_ema,
+            )
+            _train_fields_by_tidx, test_fields_by_tidx = split_ground_truth_fields_for_run(
+                gt["fields_by_index"],
+                split=coarse_runtime.split,
+                time_indices=coarse_runtime.time_indices,
+                latent_train=coarse_runtime.latent_train,
+                latent_test=coarse_runtime.latent_test,
+            )
+            print(
+                "  Coarse runtime provider: "
+                f"{coarse_runtime.provider} ({coarse_runtime.run_dir})"
+            )
+
+        if args.coarse_eval_mode in {"sequential", "both"}:
+            if coarse_runtime is None:
+                print("  Conditioned interval coarse consistency requires --run_dir or --coarse_runtime_run_dir; skipping.")
+            elif not coarse_runtime.supports_conditioned_metrics:
+                print(
+                    "  Conditioned interval coarse consistency unavailable for runtime provider "
+                    f"{coarse_runtime.provider}: conditioned sampling is not supported."
+                )
+            else:
+                conditioned_interval = evaluate_conditioned_interval_coarse_consistency_for_runtime(
+                    runtime=coarse_runtime,
+                    test_fields_by_tidx=test_fields_by_tidx,
+                    ladder=eval_ladder,
+                    full_h_schedule=full_H_schedule,
+                    n_conditions=args.coarse_eval_conditions,
+                    n_realizations=args.coarse_eval_realizations,
+                    seed=args.seed,
+                    drift_clip_norm=args.drift_clip_norm,
+                    relative_eps=args.coarse_relative_epsilon,
+                )
+                coarse_results["conditioned_interval"] = conditioned_interval["intervals"]
+                coarse_results["conditioned_interval_metadata"] = {
+                    "n_conditions": conditioned_interval["n_conditions"],
+                    "n_realizations_per_condition": conditioned_interval["n_realizations_per_condition"],
+                    "test_sample_indices": conditioned_interval["test_sample_indices"],
+                }
+                print(
+                    "  Conditioned interval coarse consistency: "
+                    f"{conditioned_interval['n_conditions']} conditions x "
+                    f"{conditioned_interval['n_realizations_per_condition']} realizations"
+                )
+                for pair_key in coarse_results["conditioned_interval"]:
+                    item = coarse_results["conditioned_interval"][pair_key]
+                    meta = item["pair_metadata"]
+                    print(
+                        f"    {meta['display_label']}: "
+                        f"C_rel={item['total_rel']['mean']:.6f}  "
+                        f"B_rel={item['bias_rel']['mean']:.6f}  "
+                        f"S_rel={item['spread_rel']['mean']:.6f}  "
+                        f"stable={item['stable_relative_total']:.6f}"
+                    )
+
+        if args.coarse_eval_mode in {"global", "both"}:
+            if coarse_runtime is None:
+                print("  Conditioned global coarse return requires --run_dir or --coarse_runtime_run_dir; skipping.")
+            elif not coarse_runtime.supports_conditioned_metrics:
+                print(
+                    "  Conditioned global coarse return unavailable for runtime provider "
+                    f"{coarse_runtime.provider}: conditioned sampling is not supported."
+                )
+            else:
+                conditioned_global = evaluate_conditioned_global_coarse_return_for_runtime(
+                    runtime=coarse_runtime,
+                    test_fields_by_tidx=test_fields_by_tidx,
+                    ladder=eval_ladder,
+                    full_h_schedule=full_H_schedule,
+                    n_conditions=args.conditioned_global_conditions,
+                    n_realizations=args.conditioned_global_realizations,
+                    seed=args.seed + 31_415,
+                    drift_clip_norm=args.drift_clip_norm,
+                    relative_eps=args.coarse_relative_epsilon,
+                )
+                coarse_results["conditioned_global_return"] = conditioned_global
+                print(
+                    "  End-to-end conditioned global coarse return: "
+                    f"C_rel={conditioned_global['total_rel']['mean']:.6f}  "
+                    f"B_rel={conditioned_global['bias_rel']['mean']:.6f}  "
+                    f"S_rel={conditioned_global['spread_rel']['mean']:.6f}  "
+                    f"stable={conditioned_global['stable_relative_total']:.6f}"
+                )
+
+        if args.report_cache_global_return:
+            coarse_targets, group_ids = _build_global_coarse_targets(
+                gt_coarse_fields=np.asarray(
+                    gt["fields_by_index"][gt_macro_dataset_idx],
+                    dtype=np.float32,
+                ),
+                sample_indices=gen.get("sample_indices"),
+                default_sample_idx=args.sample_idx,
+                n_samples=int(gen["realizations_phys"].shape[0]),
+            )
+            cache_global = evaluate_cache_global_coarse_return(
+                gen["realizations_phys"],
+                coarse_targets,
+                group_ids,
+                ladder=eval_ladder,
+                macro_scale_idx=eval_macro_scale_idx,
+                relative_eps=args.coarse_relative_epsilon,
+            )
+            coarse_results["cache_global_return"] = cache_global
+            print(
+                "  Cache global coarse return: "
+                f"C_rel={cache_global['total_rel']['mean']:.6f}  "
+                f"B_rel={cache_global['bias_rel']['mean']:.6f}  "
+                f"S_rel={cache_global['spread_rel']['mean']:.6f}  "
+                f"stable={cache_global['stable_relative_total']:.6f}"
+            )
+
+        if gen.get("trajectory_fields_phys") is not None:
+            path_results = evaluate_path_self_consistency(
+                gen["trajectory_fields_phys"],
+                ladder=eval_ladder,
+                relative_eps=args.coarse_relative_epsilon,
+                group_ids=gen.get("sample_indices"),
+            )
+            coarse_results["path_self_consistency"] = path_results
+            print(
+                "  Path self-consistency: "
+                f"mean_rel={path_results['mean_rel_across_intervals']:.6f}  "
+                f"mean_stable_rel={path_results['mean_stable_relative_across_intervals']:.6f}"
+            )
+        else:
+            print("  Path self-consistency unavailable: trajectory_fields_phys missing.")
 
         # ---------------------------------------------------------------
         # Phase 2: Detail field decomposition
@@ -1106,7 +1353,7 @@ def main() -> None:
         print("\n--- Phase 8: Reporting ---")
 
         summary = print_summary_table(
-            cond, first_order, second_order, spectral, diversity,
+            coarse_results, first_order, second_order, spectral, diversity,
         )
         print(summary)
 
@@ -1116,24 +1363,32 @@ def main() -> None:
     json_out = {
         "config": {
             "run_dir": str(run_dir) if run_dir else None,
+            "coarse_runtime_run_dir": str(coarse_runtime_run_dir) if coarse_runtime_run_dir is not None else None,
             "sample_idx": args.sample_idx,
             "n_realizations": K,
             "trajectory_only": args.trajectory_only,
             "trajectory_seed_mode": args.trajectory_seed_mode,
+            "coarse_eval_mode": args.coarse_eval_mode,
+            "coarse_eval_conditions": args.coarse_eval_conditions,
+            "coarse_eval_realizations": args.coarse_eval_realizations,
+            "conditioned_global_conditions": args.conditioned_global_conditions,
+            "conditioned_global_realizations": args.conditioned_global_realizations,
+            "coarse_relative_epsilon": args.coarse_relative_epsilon,
+            "coarse_decode_batch_size": args.coarse_decode_batch_size,
+            "report_cache_global_return": args.report_cache_global_return,
             "gt_micro_dataset_idx": gt_micro_dataset_idx,
             "gt_macro_dataset_idx": gt_macro_dataset_idx,
             "time_indices": time_indices.tolist() if time_indices is not None else None,
             "full_H_schedule": full_H_schedule,
             "eval_H_schedule": eval_H_schedule,
             "decode_mode": gen.get("decode_mode"),
-            "denoiser_steps_schedule": gen.get("denoiser_steps_schedule"),
             "sample_indices": (
                 gen.get("sample_indices").tolist()
                 if gen.get("sample_indices") is not None else None
             ),
             "latent_geom_time_indices": latent_geom_time_indices,
         },
-        "conditioning": None,
+        "coarse_consistency": _to_jsonable(coarse_results),
         "first_order": {},
         "second_order": {},
         "spectral": {},
@@ -1141,11 +1396,6 @@ def main() -> None:
         "latent_geometry": latent_geometry_results,
         "trajectory": {},
     }
-    if cond is not None:
-        json_out["conditioning"] = {
-            "mean": cond["mean"], "median": cond["median"],
-            "std": cond["std"], "pass": passed,
-        }
     if micro_d is not None:
         json_out["diversity"] = {
             "microscale_mean": micro_d["mean"],
@@ -1219,8 +1469,58 @@ def main() -> None:
 
     # Save full numpy arrays.
     npz_data = {}
-    if cond is not None:
-        npz_data["cond_errors"] = cond["per_realization"]
+    if coarse_results is not None:
+        conditioned_interval = coarse_results.get("conditioned_interval", {})
+        for pair_key in conditioned_interval:
+            item = conditioned_interval[pair_key]
+            key = _npz_safe_key(pair_key)
+            npz_data[f"cond_interval_total_rel_{key}"] = np.asarray(
+                item["per_condition"]["total_rel"],
+                dtype=np.float32,
+            )
+            npz_data[f"cond_interval_bias_rel_{key}"] = np.asarray(
+                item["per_condition"]["bias_rel"],
+                dtype=np.float32,
+            )
+            npz_data[f"cond_interval_spread_rel_{key}"] = np.asarray(
+                item["per_condition"]["spread_rel"],
+                dtype=np.float32,
+            )
+        conditioned_global = coarse_results.get("conditioned_global_return")
+        if conditioned_global is not None:
+            npz_data["cond_global_total_rel"] = np.asarray(
+                conditioned_global["per_condition"]["total_rel"],
+                dtype=np.float32,
+            )
+            npz_data["cond_global_bias_rel"] = np.asarray(
+                conditioned_global["per_condition"]["bias_rel"],
+                dtype=np.float32,
+            )
+            npz_data["cond_global_spread_rel"] = np.asarray(
+                conditioned_global["per_condition"]["spread_rel"],
+                dtype=np.float32,
+            )
+        cache_global = coarse_results.get("cache_global_return")
+        if cache_global is not None:
+            npz_data["cache_global_total_rel"] = np.asarray(
+                cache_global["per_condition"]["total_rel"],
+                dtype=np.float32,
+            )
+            npz_data["cache_global_bias_rel"] = np.asarray(
+                cache_global["per_condition"]["bias_rel"],
+                dtype=np.float32,
+            )
+            npz_data["cache_global_spread_rel"] = np.asarray(
+                cache_global["per_condition"]["spread_rel"],
+                dtype=np.float32,
+            )
+        path_results = coarse_results.get("path_self_consistency")
+        if path_results is not None:
+            for pair_idx, item in path_results["per_interval"].items():
+                npz_data[f"path_self_rel_interval{pair_idx}"] = np.asarray(
+                    item["per_group_rel"],
+                    dtype=np.float32,
+                )
     for b in sorted(second_order.keys()):
         npz_data[f"R_obs_e1_band{b}"] = second_order[b]["R_obs_e1"]
         npz_data[f"R_obs_e2_band{b}"] = second_order[b]["R_obs_e2"]
@@ -1278,13 +1578,10 @@ def main() -> None:
             # Filter generated fields at each eval scale for direct comparison.
             gen_filtered = eval_ladder.filter_all_scales(gen["realizations_phys"])
 
-            # Fig 1: Conditioning (uses macro field — not affected by micro).
-            plot_conditioning(
-                gt_macro_sample, cond["filtered_macro"],
-                resolution, out_dir,
-            )
-            # Fig 1b: Conditioning error histogram (separate figure).
-            plot_conditioning_errors(cond["per_realization"], out_dir)
+            # Fig 1-1b: Phase-1 coarse consistency.
+            if coarse_results is not None:
+                plot_coarse_consistency_breakdown(coarse_results, out_dir)
+                plot_coarse_consistency_condition_distributions(coarse_results, out_dir)
             # Fig 2: Sample realisations vs GT at gen's native scale (NOT raw micro).
             plot_sample_realizations(
                 gen["realizations_phys"], gt_micro_sample, resolution, out_dir,

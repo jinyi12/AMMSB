@@ -1,8 +1,15 @@
 #!/usr/bin/env python
-"""Evaluate post-filtered consistency in unconditional or conditional mode.
+"""Evaluate post-filtered field diagnostics in unconditional or conditional mode.
 
 This script isolates the diagnostics behind the manuscript's
-"Post-Filtered Consistency Evaluation" section:
+"Post-Filtered Consistency Evaluation" section as a companion analysis.
+
+It is not the primary coarse-consistency definition used by
+`evaluate.py`. The maintained Phase 1 coarse metric in `evaluate.py`
+now evaluates Dirac-target coarse consistency for the sequential
+conditional bridge. This script remains useful for the separate question:
+after re-filtering generated fine fields, how well do their induced
+unconditional or local conditional laws match reference ensembles?
 
 1. Decode/generated fine-scale fields from the backward MSBM model.
 2. Reapply the physical filter family to obtain post-filtered fields.
@@ -58,7 +65,7 @@ from scripts.fae.tran_evaluation.second_order import (  # noqa: E402
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Post-filtered consistency evaluation for MSBM fields.",
+        description="Companion post-filtered field diagnostics for MSBM fields.",
     )
     p.add_argument("--run_dir", type=str, required=True)
     p.add_argument("--output_dir", type=str, required=True)
@@ -106,11 +113,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--no_use_ema", action="store_false", dest="use_ema")
     p.add_argument("--drift_clip_norm", type=float, default=None)
     p.add_argument("--nogpu", action="store_true")
-    p.add_argument("--decode_mode", type=str, default="auto",
-                   choices=["auto", "standard", "one_step", "multistep"])
-    p.add_argument("--denoiser_num_steps", type=int, default=32)
-    p.add_argument("--denoiser_noise_scale", type=float, default=1.0)
-    p.add_argument("--denoiser_steps_schedule", type=str, default=None)
+    p.add_argument("--decode_mode", type=str, default="standard", choices=["standard"])
     p.add_argument("--L_domain", type=float, default=6.0)
     p.add_argument("--H_meso_list", type=str, default="1.0,1.25,1.5,2.0,2.5,3.0")
     p.add_argument("--H_macro", type=float, default=6.0)
@@ -288,9 +291,6 @@ def main() -> None:
         drift_clip_norm=args.drift_clip_norm,
         device=torch.device("cpu") if args.nogpu else None,
         decode_mode=args.decode_mode,
-        denoiser_num_steps=args.denoiser_num_steps,
-        denoiser_noise_scale=args.denoiser_noise_scale,
-        denoiser_steps_schedule=args.denoiser_steps_schedule,
     )
     gen_filtered = eval_ladder.filter_all_scales(gen["realizations_phys"])
 

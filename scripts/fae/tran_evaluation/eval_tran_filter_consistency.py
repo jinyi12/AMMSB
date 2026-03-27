@@ -35,8 +35,8 @@ if str(REPO_ROOT) not in sys.path:
 
 from data.transform_utils import apply_inverse_transform, load_transform_info
 from data.multimarginal_generation import tran_filter_periodic
-from scripts.fae.fae_naive.fae_latent_utils import (
-    build_attention_fae_from_checkpoint,
+from mmsfm.fae.fae_latent_utils import (
+    build_fae_from_checkpoint,
     load_fae_checkpoint,
     make_fae_apply_fns,
 )
@@ -119,9 +119,7 @@ def main() -> None:
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--nogpu", action="store_true")
     p.add_argument("--decode_batch_size", type=int, default=16)
-    p.add_argument("--decode_mode", type=str, default="auto", choices=["auto", "one_step", "multistep", "standard"])
-    p.add_argument("--denoiser_num_steps", type=int, default=32)
-    p.add_argument("--denoiser_noise_scale", type=float, default=1.0)
+    p.add_argument("--decode_mode", type=str, default="standard", choices=["standard"])
     p.add_argument("--L_domain", type=float, default=6.0)
     p.add_argument("--D_large", type=float, default=1.0)
     args = p.parse_args()
@@ -172,14 +170,12 @@ def main() -> None:
     # Load FAE checkpoint and make decode_fn.
     fae_ckpt_path = Path(train_cfg["fae_checkpoint"])
     ckpt = load_fae_checkpoint(fae_ckpt_path)
-    autoencoder, fae_params, fae_batch_stats, _meta = build_attention_fae_from_checkpoint(ckpt)
+    autoencoder, fae_params, fae_batch_stats, _meta = build_fae_from_checkpoint(ckpt)
     _encode_fn, decode_fn = make_fae_apply_fns(
         autoencoder,
         fae_params,
         fae_batch_stats,
         decode_mode=str(args.decode_mode),
-        denoiser_num_steps=int(args.denoiser_num_steps),
-        denoiser_noise_scale=float(args.denoiser_noise_scale),
     )
 
     # Decode selected particles at each knot into physical space fields.

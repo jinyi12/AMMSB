@@ -7,7 +7,7 @@ from typing import Any, Iterable, Optional
 
 import numpy as np
 
-from scripts.fae.dataset_metadata import (
+from mmsfm.fae.dataset_metadata import (
     load_dataset_metadata,
     parse_held_out_indices_arg,
     parse_held_out_times_arg,

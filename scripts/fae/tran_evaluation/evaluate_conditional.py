@@ -31,6 +31,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import warnings
 from pathlib import Path
 from typing import Any
 
@@ -42,10 +43,23 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from scripts.fae.tran_evaluation.conditional_support import (
+    AdaptiveReferenceConfig,
+    DEFAULT_CONDITIONAL_EVAL_MODE,
+    LEGACY_CONDITIONAL_EVAL_MODE,
     build_full_H_schedule,
     build_local_reference_samples,
-    knn_gaussian_weights,
+    build_local_reference_spec,
+    fit_whitened_pca_metric,
     make_pair_label,
+    pack_reference_support_arrays,
+    sampling_spec_ess,
+    sampling_spec_eig_rse,
+    sampling_spec_indices,
+    sampling_spec_mean_rse,
+    sampling_spec_radius,
+    summarize_reference_sampling_specs,
+    transform_condition_vectors,
+    validate_conditional_eval_mode,
     wasserstein1_wasserstein2_latents,
 )
 from scripts.fae.tran_evaluation.conditional_metrics import (
@@ -82,6 +96,12 @@ def _parse_args() -> argparse.Namespace:
         required=True,
         help="Corpus latent codes npz with aligned latents_<time_idx> arrays.",
     )
+    parser.add_argument(
+        "--conditional_eval_mode",
+        type=str,
+        default=DEFAULT_CONDITIONAL_EVAL_MODE,
+        choices=[LEGACY_CONDITIONAL_EVAL_MODE, DEFAULT_CONDITIONAL_EVAL_MODE],
+    )
     parser.add_argument("--k_neighbors", type=int, default=200)
     parser.add_argument("--n_test_samples", type=int, default=50, help="Number of test conditions for latent W1/W2.")
     parser.add_argument(
@@ -99,9 +119,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--ecmmd_bootstrap_reps",
         type=int,
-        default=0,
+        default=64,
         help="Number of local-empirical bootstrap replicates for ECMMD goodness-of-fit calibration.",
     )
+    parser.add_argument("--adaptive_metric_dim_cap", type=int, default=24)
+    parser.add_argument("--adaptive_reference_bootstrap_reps", type=int, default=64)
+    parser.add_argument("--adaptive_ess_min", type=int, default=32)
     parser.add_argument(
         "--H_meso_list",
         type=str,
@@ -120,6 +143,18 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--no_use_ema", action="store_false", dest="use_ema")
     parser.add_argument("--drift_clip_norm", type=float, default=None)
     return parser.parse_args()
+
+
+def _resolve_conditional_eval_mode(args: argparse.Namespace) -> str:
+    return validate_conditional_eval_mode(getattr(args, "conditional_eval_mode", DEFAULT_CONDITIONAL_EVAL_MODE))
+
+
+def _build_adaptive_reference_config(args: argparse.Namespace) -> AdaptiveReferenceConfig:
+    return AdaptiveReferenceConfig(
+        metric_dim_cap=int(getattr(args, "adaptive_metric_dim_cap", 24)),
+        bootstrap_reps=int(getattr(args, "adaptive_reference_bootstrap_reps", 64)),
+        ess_min=int(getattr(args, "adaptive_ess_min", 32)),
+    )
 def _evaluate_scale_pair(
     *,
     pair_idx: int,
