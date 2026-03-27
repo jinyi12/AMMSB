@@ -58,6 +58,7 @@ from scripts.fae.tran_evaluation.conditional_support import (  # noqa: E402
     build_local_reference_samples as _build_local_reference_samples,
     make_pair_label as _make_pair_label,
     rbf_kernel_from_sqdist as _rbf_kernel_from_sqdist,
+    sampling_spec_indices as _sampling_spec_indices,
     select_ecmmd_bandwidth as _select_ecmmd_bandwidth,
     standardize_condition_vectors as _standardize_condition_vectors,
 )
@@ -564,7 +565,7 @@ def _plot_pair_conditionals(
     for row, eval_idx in enumerate(selected_indices.tolist()):
         cond = conditions[eval_idx:eval_idx + 1]
         true_fine = aligned_fine[eval_idx:eval_idx + 1]
-        knn_idx, _ = sampling_specs[eval_idx]
+        knn_idx = _sampling_spec_indices(sampling_specs[eval_idx])
         neighborhood = corpus_targets[knn_idx]
         ref = reference_samples[eval_idx]
         gen = generated_samples[eval_idx]

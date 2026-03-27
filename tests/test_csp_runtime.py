@@ -921,6 +921,7 @@ def test_csp_conditional_main_writes_ecmmd_dashboard_artifacts(monkeypatch, tmp_
     evaluate_csp_conditional_module.main()
 
     manifest = json.loads((output_dir / "conditional_latent_manifest.json").read_text())
+    assert manifest["conditional_eval_mode"] == "adaptive_radius"
     with np.load(output_dir / "conditional_latent_results.npz", allow_pickle=True) as data:
         pair_labels = [str(item) for item in data["pair_labels"].tolist()]
         assert set(manifest["conditional_ecmmd_figures"].keys()) == set(pair_labels)
@@ -931,6 +932,9 @@ def test_csp_conditional_main_writes_ecmmd_dashboard_artifacts(monkeypatch, tmp_
             assert f"latent_ecmmd_conditions_{pair_label}" in data.files
             assert f"latent_ecmmd_reference_{pair_label}" in data.files
             assert f"latent_ecmmd_generated_{pair_label}" in data.files
+            assert f"latent_ecmmd_reference_support_indices_{pair_label}" in data.files
+            assert f"latent_ecmmd_reference_support_weights_{pair_label}" in data.files
+            assert f"latent_ecmmd_reference_radius_{pair_label}" in data.files
             assert f"latent_ecmmd_local_scores_{pair_label}" in data.files
             assert f"latent_ecmmd_selected_rows_{pair_label}" in data.files
             assert f"latent_ecmmd_selected_roles_{pair_label}" in data.files

@@ -303,20 +303,6 @@ def main() -> None:
     if not generated_cache_path.exists():
         raise FileNotFoundError(f"Missing generated cache: {generated_cache_path}")
 
-    latent_trajectory_manifest: dict[str, Any] | None = None
-    if not args.skip_latent_trajectory_plot:
-        publication_dir.mkdir(parents=True, exist_ok=True)
-        latent_trajectory_manifest = plot_latent_trajectory_summary(
-            run_dir=run_dir,
-            cache_dir=cache_dir,
-            output_dir=publication_dir,
-            coarse_split=str(args.coarse_split),
-            latents_override=str(source_context.latents_path),
-            n_plot_trajectories=int(args.latent_trajectory_count),
-            max_reference_cloud=int(args.latent_trajectory_reference_budget),
-            seed=int(args.seed),
-        )
-
     tran_cmd: list[str] | None = None
     if not args.skip_tran_eval:
         tran_eval_dir.mkdir(parents=True, exist_ok=True)
@@ -365,6 +351,20 @@ def main() -> None:
             ),
             adaptive_ess_min=int(getattr(args, "conditional_adaptive_ess_min", 32)),
             nogpu=bool(args.nogpu),
+        )
+
+    latent_trajectory_manifest: dict[str, Any] | None = None
+    if not args.skip_latent_trajectory_plot:
+        publication_dir.mkdir(parents=True, exist_ok=True)
+        latent_trajectory_manifest = plot_latent_trajectory_summary(
+            run_dir=run_dir,
+            cache_dir=cache_dir,
+            output_dir=publication_dir,
+            coarse_split=str(args.coarse_split),
+            latents_override=str(source_context.latents_path),
+            n_plot_trajectories=int(args.latent_trajectory_count),
+            max_reference_cloud=int(args.latent_trajectory_reference_budget),
+            seed=int(args.seed),
         )
 
     manifest = {

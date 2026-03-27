@@ -504,7 +504,7 @@ def test_token_dit_tran_eval_forwards_conditioned_coarse_arguments(monkeypatch, 
     assert "--report_cache_global_return" in cmd
 
 
-def test_token_dit_main_runs_tran_eval_before_conditional_eval(monkeypatch, tmp_path):
+def test_token_dit_main_runs_tran_eval_before_latent_plot_and_conditional_eval(monkeypatch, tmp_path):
     run_dir = tmp_path / "run"
     cache_dir = tmp_path / "eval" / "cache"
     cache_dir.mkdir(parents=True)
@@ -588,7 +588,7 @@ def test_token_dit_main_runs_tran_eval_before_conditional_eval(monkeypatch, tmp_
 
     evaluate_csp_token_dit_module.main()
 
-    assert call_order == ["latent_plot", "tran", "conditional"]
+    assert call_order == ["tran", "conditional", "latent_plot"]
 
 
 def test_token_csp_conditional_main_writes_ecmmd_dashboard_artifacts(monkeypatch, tmp_path):
@@ -709,6 +709,7 @@ def test_token_csp_conditional_main_writes_ecmmd_dashboard_artifacts(monkeypatch
     evaluate_csp_token_dit_conditional_module.main()
 
     manifest = json.loads((output_dir / "conditional_latent_manifest.json").read_text())
+    assert manifest["conditional_eval_mode"] == "adaptive_radius"
     with np.load(output_dir / "conditional_latent_results.npz", allow_pickle=True) as data:
         pair_labels = [str(item) for item in data["pair_labels"].tolist()]
         assert set(manifest["conditional_ecmmd_figures"].keys()) == set(pair_labels)
@@ -719,6 +720,9 @@ def test_token_csp_conditional_main_writes_ecmmd_dashboard_artifacts(monkeypatch
             assert f"latent_ecmmd_conditions_{pair_label}" in data.files
             assert f"latent_ecmmd_reference_{pair_label}" in data.files
             assert f"latent_ecmmd_generated_{pair_label}" in data.files
+            assert f"latent_ecmmd_reference_support_indices_{pair_label}" in data.files
+            assert f"latent_ecmmd_reference_support_weights_{pair_label}" in data.files
+            assert f"latent_ecmmd_reference_radius_{pair_label}" in data.files
             assert f"latent_ecmmd_local_scores_{pair_label}" in data.files
             assert f"latent_ecmmd_selected_rows_{pair_label}" in data.files
             assert f"latent_ecmmd_selected_roles_{pair_label}" in data.files

@@ -11,8 +11,12 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from scripts.fae.tran_evaluation.conditional_support import (
+    AdaptiveReferenceConfig,
+    DEFAULT_CONDITIONAL_EVAL_MODE,
     build_full_H_schedule,
     build_local_reference_samples,
+    build_local_reference_spec,
+    fit_whitened_pca_metric,
     format_h_slug,
     knn_gaussian_weights,
     make_pair_label,
@@ -79,3 +83,79 @@ def test_knn_and_local_reference_sampling_respect_exclusions():
     assert ref_samples.shape == (1, 3, 4)
     assert len(specs) == 1
     assert 1 not in sampling_spec_indices(specs[0]).tolist()
+
+
+def test_fit_whitened_pca_metric_caps_dimension():
+    conditions = np.array(
+        [
+            [0.0, 1.0, 2.0],
+            [1.0, 2.0, 3.0],
+            [2.0, 3.0, 4.0],
+            [3.0, 4.0, 5.0],
+        ],
+        dtype=np.float32,
+    )
+
+    metric = fit_whitened_pca_metric(conditions, variance_retained=0.9, dim_cap=2)
+
+    assert 1 <= metric.retained_dim <= 2
+    transformed = (conditions - metric.mean) @ metric.basis / metric.scale
+    assert transformed.shape == (4, metric.retained_dim)
+
+
+def test_adaptive_reference_uses_smaller_radius_in_dense_region():
+    dense_cluster = np.stack(
+        [
+            np.linspace(0.0, 0.18, 20, dtype=np.float32),
+            np.zeros(20, dtype=np.float32),
+        ],
+        axis=1,
+    )
+    sparse_cluster = np.stack(
+        [
+            np.linspace(2.0, 4.0, 12, dtype=np.float32),
+            np.zeros(12, dtype=np.float32),
+        ],
+        axis=1,
+    )
+    corpus_conditions = np.concatenate([dense_cluster, sparse_cluster], axis=0).astype(np.float32)
+    corpus_targets = np.stack(
+        [
+            corpus_conditions[:, 0],
+            corpus_conditions[:, 0] ** 2,
+            np.sin(corpus_conditions[:, 0]),
+        ],
+        axis=1,
+    ).astype(np.float32)
+    metric = fit_whitened_pca_metric(corpus_conditions, dim_cap=2)
+    config = AdaptiveReferenceConfig(
+        metric_dim_cap=2,
+        ess_min=4,
+        ess_fallback=6,
+        bootstrap_reps=16,
+        mean_rse_tol=1.0,
+        eig_rse_tol=1.0,
+    )
+
+    dense_spec = build_local_reference_spec(
+        query=corpus_conditions[5],
+        corpus_conditions=corpus_conditions,
+        corpus_targets=corpus_targets,
+        conditional_eval_mode=DEFAULT_CONDITIONAL_EVAL_MODE,
+        condition_metric=metric,
+        adaptive_config=config,
+        rng=np.random.default_rng(0),
+    )
+    sparse_spec = build_local_reference_spec(
+        query=corpus_conditions[-3],
+        corpus_conditions=corpus_conditions,
+        corpus_targets=corpus_targets,
+        conditional_eval_mode=DEFAULT_CONDITIONAL_EVAL_MODE,
+        condition_metric=metric,
+        adaptive_config=config,
+        rng=np.random.default_rng(1),
+    )
+
+    assert float(dense_spec["radius"]) < float(sparse_spec["radius"])
+    assert float(dense_spec["ess"]) >= 4.0
+    assert float(sparse_spec["ess"]) >= 4.0

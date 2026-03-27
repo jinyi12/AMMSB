@@ -85,6 +85,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--conditional_k_neighbors", type=int, default=200)
     parser.add_argument("--conditional_n_test_samples", type=int, default=50)
     parser.add_argument("--conditional_realizations", type=int, default=200)
+    parser.add_argument("--conditional_n_plot_conditions", type=int, default=5)
+    parser.add_argument("--conditional_plot_value_budget", type=int, default=20_000)
     parser.add_argument("--conditional_ecmmd_k_values", type=str, default="10,20,30")
     parser.add_argument("--conditional_ecmmd_bootstrap_reps", type=int, default=64)
     parser.add_argument("--conditional_eval_mode", type=str, default=DEFAULT_CONDITIONAL_EVAL_MODE)
@@ -198,6 +200,8 @@ def _run_conditional_eval(
     k_neighbors: int,
     n_test_samples: int,
     n_realizations: int,
+    n_plot_conditions: int,
+    plot_value_budget: int,
     ecmmd_k_values: str,
     ecmmd_bootstrap_reps: int,
     conditional_eval_mode: str,
@@ -221,6 +225,10 @@ def _run_conditional_eval(
         str(int(n_test_samples)),
         "--n_realizations",
         str(int(n_realizations)),
+        "--n_plot_conditions",
+        str(int(n_plot_conditions)),
+        "--plot_value_budget",
+        str(int(plot_value_budget)),
         "--ecmmd_k_values",
         str(ecmmd_k_values),
         "--ecmmd_bootstrap_reps",
@@ -267,6 +275,8 @@ def main() -> None:
     print(f"  conditional_n   : {args.conditional_realizations}", flush=True)
     print(f"  conditional_k   : {args.conditional_k_neighbors}", flush=True)
     print(f"  conditional_mode: {getattr(args, 'conditional_eval_mode', DEFAULT_CONDITIONAL_EVAL_MODE)}", flush=True)
+    print(f"  conditional_plot_conditions: {args.conditional_n_plot_conditions}", flush=True)
+    print(f"  conditional_plot_budget    : {args.conditional_plot_value_budget}", flush=True)
     print(f"  sample_idx      : {args.sample_idx}", flush=True)
     print(f"  coarse_mode     : {args.coarse_eval_mode}", flush=True)
     print("============================================================", flush=True)
@@ -324,6 +334,8 @@ def main() -> None:
             k_neighbors=args.conditional_k_neighbors,
             n_test_samples=args.conditional_n_test_samples,
             n_realizations=args.conditional_realizations,
+            n_plot_conditions=args.conditional_n_plot_conditions,
+            plot_value_budget=args.conditional_plot_value_budget,
             ecmmd_k_values=args.conditional_ecmmd_k_values,
             ecmmd_bootstrap_reps=args.conditional_ecmmd_bootstrap_reps,
             conditional_eval_mode=getattr(args, "conditional_eval_mode", DEFAULT_CONDITIONAL_EVAL_MODE),
@@ -407,6 +419,8 @@ def main() -> None:
         "conditional_n_test_samples": int(args.conditional_n_test_samples),
         "conditional_realizations": int(args.conditional_realizations),
         "conditional_eval_mode": str(getattr(args, "conditional_eval_mode", DEFAULT_CONDITIONAL_EVAL_MODE)),
+        "conditional_n_plot_conditions": int(args.conditional_n_plot_conditions),
+        "conditional_plot_value_budget": int(args.conditional_plot_value_budget),
         "conditional_ecmmd_k_values": str(args.conditional_ecmmd_k_values),
         "conditional_ecmmd_bootstrap_reps": int(args.conditional_ecmmd_bootstrap_reps),
         "conditional_adaptive_metric_dim_cap": int(getattr(args, "conditional_adaptive_metric_dim_cap", 24)),

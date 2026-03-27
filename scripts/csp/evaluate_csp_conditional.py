@@ -559,9 +559,14 @@ def main() -> None:
     conditional_eval_mode = _resolve_conditional_eval_mode(args)
     adaptive_config = _build_adaptive_reference_config(args)
     ecmmd_k_values = parse_positive_int_list_arg(args.ecmmd_k_values)
+    ecmmd_k_values_raw = str(getattr(args, "ecmmd_k_values", "")).strip()
     if conditional_eval_mode == LEGACY_CONDITIONAL_EVAL_MODE and not ecmmd_k_values:
         raise ValueError("--ecmmd_k_values must contain at least one positive integer.")
-    if conditional_eval_mode == DEFAULT_CONDITIONAL_EVAL_MODE and ecmmd_k_values:
+    if (
+        conditional_eval_mode == DEFAULT_CONDITIONAL_EVAL_MODE
+        and ecmmd_k_values
+        and ecmmd_k_values_raw not in {"", "10,20,30"}
+    ):
         warnings.warn(
             "adaptive_radius ignores legacy --ecmmd_k_values and uses an adaptive radius graph instead.",
             stacklevel=2,
