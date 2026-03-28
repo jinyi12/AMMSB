@@ -288,27 +288,28 @@ def add_ntk_args(parser: argparse.ArgumentParser) -> None:
         "--ntk-scale-norm",
         type=float,
         default=10.0,
-        help="Global scaling constant C for --loss-type=ntk_scaled.",
+        help="Global scaling constant C for legacy scale-based --loss-type=ntk_scaled.",
     )
     parser.add_argument(
         "--ntk-epsilon",
         type=float,
         default=1e-8,
-        help="Stability epsilon for NTK trace inversion (--loss-type=ntk_scaled).",
+        help="Stability epsilon for NTK-based trace inversion.",
     )
     parser.add_argument(
         "--ntk-estimate-total-trace",
         action="store_true",
         help=(
             "If set, use an EMA estimate of Tr(K_total) over reconstruction terms "
-            "as the NTK numerator (Wang et al.-style ratio-of-traces scaling)."
+            "as the legacy scale-based NTK numerator "
+            "(Wang et al.-style ratio-of-traces scaling)."
         ),
     )
     parser.add_argument(
         "--ntk-total-trace-ema-decay",
         type=float,
         default=0.99,
-        help="EMA decay in [0, 1) for total-trace estimation (--loss-type=ntk_scaled).",
+        help="EMA decay in [0, 1) for NTK trace smoothing.",
     )
     parser.add_argument(
         "--ntk-trace-update-interval",
@@ -343,7 +344,7 @@ def add_ntk_args(parser: argparse.ArgumentParser) -> None:
         default="fhutch",
         choices=["rhutch", "fhutch"],
         help=(
-            "Trace estimator backend for --loss-type=ntk_scaled. "
+            "Trace estimator backend for NTK-based loss types. "
             "'rhutch' uses output-space VJP probes; "
             "'fhutch' uses parameter-space JVP probes."
         ),
@@ -410,31 +411,48 @@ def validate_ntk_args(
     warn_scale_norm_ignored_when_estimating_total: bool = True,
     warn_output_chunk_ignored_for_fhutch: bool = False,
 ) -> None:
-    if active_loss_type == "ntk_scaled":
-        if args.ntk_scale_norm <= 0.0:
-            raise ValueError("--ntk-scale-norm must be > 0 for --loss-type=ntk_scaled.")
+    if active_loss_type in {"ntk_scaled", "ntk_prior_balanced"}:
+        if active_loss_type == "ntk_scaled":
+            if args.ntk_scale_norm <= 0.0:
+                raise ValueError("--ntk-scale-norm must be > 0 for --loss-type=ntk_scaled.")
         if args.ntk_epsilon <= 0.0:
-            raise ValueError("--ntk-epsilon must be > 0 for --loss-type=ntk_scaled.")
+            raise ValueError(f"--ntk-epsilon must be > 0 for --loss-type={active_loss_type}.")
         if args.ntk_total_trace_ema_decay < 0.0 or args.ntk_total_trace_ema_decay >= 1.0:
             raise ValueError("--ntk-total-trace-ema-decay must be in [0, 1).")
         if args.ntk_trace_update_interval < 1:
-            raise ValueError("--ntk-trace-update-interval must be >= 1 for --loss-type=ntk_scaled.")
+            raise ValueError(
+                f"--ntk-trace-update-interval must be >= 1 for --loss-type={active_loss_type}."
+            )
         if args.ntk_hutchinson_probes < 1:
-            raise ValueError("--ntk-hutchinson-probes must be >= 1 for --loss-type=ntk_scaled.")
+            raise ValueError(
+                f"--ntk-hutchinson-probes must be >= 1 for --loss-type={active_loss_type}."
+            )
         if args.ntk_output_chunk_size < 0:
-            raise ValueError("--ntk-output-chunk-size must be >= 0 for --loss-type=ntk_scaled.")
+            raise ValueError(
+                f"--ntk-output-chunk-size must be >= 0 for --loss-type={active_loss_type}."
+            )
         if args.ntk_trace_estimator not in {"rhutch", "fhutch"}:
             raise ValueError(
                 "--ntk-trace-estimator must be one of {'rhutch','fhutch'} "
-                "for --loss-type=ntk_scaled."
+                f"for --loss-type={active_loss_type}."
             )
-        if warn_scale_norm_ignored_when_estimating_total:
-            if args.ntk_estimate_total_trace and args.ntk_scale_norm != 10.0:
-                warnings.warn(
-                    "--ntk-scale-norm is ignored when --ntk-estimate-total-trace is set "
-                    "(numerator is estimated from the NTK trace).",
-                    UserWarning,
-                )
+        if active_loss_type == "ntk_scaled":
+            if warn_scale_norm_ignored_when_estimating_total:
+                if args.ntk_estimate_total_trace and args.ntk_scale_norm != 10.0:
+                    warnings.warn(
+                        "--ntk-scale-norm is ignored when --ntk-estimate-total-trace is set "
+                        "(numerator is estimated from the NTK trace).",
+                        UserWarning,
+                    )
+        else:
+            warn_ignored_flags(
+                args,
+                {
+                    "ntk_scale_norm": 10.0,
+                    "ntk_estimate_total_trace": False,
+                },
+                "NTK arguments {flags} are ignored when --loss-type=ntk_prior_balanced.",
+            )
         if warn_output_chunk_ignored_for_fhutch:
             if args.ntk_trace_estimator == "fhutch" and args.ntk_output_chunk_size > 0:
                 warnings.warn(

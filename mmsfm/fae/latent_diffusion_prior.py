@@ -10,6 +10,12 @@ import jax.numpy as jnp
 
 from functional_autoencoders.losses import _call_autoencoder_fn
 from mmsfm.fae.latent_tensor_support import squared_l2_per_sample
+from mmsfm.fae.ntk_prior_balancing import (
+    build_ntk_prior_balanced_loss_fn,
+    build_ntk_prior_balanced_metric,
+    estimate_trace_per_output,
+    get_stats_or_empty as _get_stats_or_empty,
+)
 from mmsfm.fae.ntk_estimators import (
     trace_per_output_from_jvp_probe,
     trace_per_output_from_vjp_probe,
@@ -114,16 +120,6 @@ class LatentDiffusionPrior(nn.Module):
         """Closed-form velocity target for linear latent mixing."""
 
         return noise - z_clean
-
-
-def _get_stats_or_empty(batch_stats, name: str):
-    if batch_stats is None:
-        return {}
-    if name in batch_stats:
-        return batch_stats[name]
-    return {}
-
-
 def _estimate_global_trace_per_output(
     *,
     residual_fn: Callable[[dict], jax.Array],
@@ -188,10 +184,30 @@ def _compute_x0_velocity_prior_loss(
     noise: jax.Array,
     prior_weight: float,
 ) -> jax.Array:
+    residual = _compute_x0_velocity_prior_residual(
+        prior=prior,
+        prior_params=prior_params,
+        z_t=z_t,
+        z_clean=z_clean,
+        t=t,
+        noise=noise,
+    )
+    return float(prior_weight) * jnp.mean(jnp.square(residual))
+
+
+def _compute_x0_velocity_prior_residual(
+    *,
+    prior: LatentDiffusionPrior,
+    prior_params,
+    z_t: jax.Array,
+    z_clean: jax.Array,
+    t: jax.Array,
+    noise: jax.Array,
+) -> jax.Array:
     z_clean_pred = prior.apply({"params": prior_params}, z_t, t)
     pred_velocity = prior.velocity_from_x0_prediction(z_t, z_clean_pred, t)
     target_velocity = prior.closed_form_velocity_target(z_clean, noise)
-    return float(prior_weight) * jnp.mean((pred_velocity - target_velocity) ** 2)
+    return pred_velocity - target_velocity
 
 
 def get_film_prior_loss_fn(
@@ -289,6 +305,59 @@ def reconstruct_with_film(
     }
     z = autoencoder.encoder.apply(encoder_vars, u_enc, x_enc, train=False)
     return autoencoder.decoder.apply(decoder_vars, z, x_dec, train=False)
+
+
+def build_ntk_prior_balanced_film_metric(
+    *,
+    autoencoder,
+    prior: LatentDiffusionPrior,
+    prior_weight: float,
+    epsilon: float,
+    hutchinson_probes: int,
+    output_chunk_size: int,
+    trace_estimator: str,
+):
+    return build_ntk_prior_balanced_metric(
+        autoencoder=autoencoder,
+        prior=prior,
+        compute_prior_residual=_compute_x0_velocity_prior_residual,
+        prior_weight=prior_weight,
+        epsilon=epsilon,
+        hutchinson_probes=hutchinson_probes,
+        output_chunk_size=output_chunk_size,
+        trace_estimator=trace_estimator,
+    )
+
+
+def get_ntk_prior_balanced_film_prior_loss_fn(
+    autoencoder,
+    beta: float = 1e-4,
+    prior: Optional[LatentDiffusionPrior] = None,
+    prior_weight: float = 1.0,
+    epsilon: float = 1e-8,
+    total_trace_ema_decay: float = 0.99,
+    trace_update_interval: int = 100,
+    hutchinson_probes: int = 1,
+    output_chunk_size: int = 0,
+    trace_estimator: str = "rhutch",
+) -> Callable:
+    """NTK-balance reconstruction and prior losses on shared encoder parameters."""
+
+    del beta
+    if prior is None:
+        raise ValueError("get_ntk_prior_balanced_film_prior_loss_fn requires a prior module.")
+    return build_ntk_prior_balanced_loss_fn(
+        autoencoder=autoencoder,
+        prior=prior,
+        compute_prior_residual=_compute_x0_velocity_prior_residual,
+        prior_weight=prior_weight,
+        epsilon=epsilon,
+        total_trace_ema_decay=total_trace_ema_decay,
+        trace_update_interval=trace_update_interval,
+        hutchinson_probes=hutchinson_probes,
+        output_chunk_size=output_chunk_size,
+        trace_estimator=trace_estimator,
+    )
 
 
 def get_ntk_scaled_film_prior_loss_fn(

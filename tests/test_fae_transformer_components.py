@@ -571,6 +571,143 @@ def test_transformer_prior_setup_initializes_prior_params_and_reconstruction_hoo
     assert "prior" in extra
 
 
+def test_transformer_prior_setup_adds_metric_for_ntk_prior_balanced() -> None:
+    autoencoder, _ = build_autoencoder(
+        key=jax.random.PRNGKey(62),
+        latent_dim=8,
+        n_freqs=4,
+        fourier_sigma=1.0,
+        decoder_features=(16, 16),
+        encoder_type="transformer",
+        decoder_type="transformer",
+        transformer_emb_dim=16,
+        transformer_num_latents=4,
+        transformer_encoder_depth=2,
+        transformer_cross_attn_depth=1,
+        transformer_decoder_depth=2,
+        transformer_mlp_ratio=2,
+        transformer_tokenization="patches",
+        transformer_patch_size=2,
+        transformer_grid_size=(4, 4),
+        n_heads=4,
+    )
+
+    args = SimpleNamespace(
+        n_heads=4,
+        beta=0.0,
+        loss_type="ntk_prior_balanced",
+        prior_hidden_dim=32,
+        prior_n_layers=2,
+        prior_time_emb_dim=8,
+        prior_logsnr_max=5.0,
+        prior_loss_weight=1.0,
+        prior_num_heads=4,
+        prior_mlp_ratio=2.0,
+        ntk_scale_norm=10.0,
+        ntk_epsilon=1e-8,
+        ntk_estimate_total_trace=False,
+        ntk_total_trace_ema_decay=0.99,
+        ntk_n_loss_terms=1,
+        ntk_trace_update_interval=100,
+        ntk_hutchinson_probes=1,
+        ntk_output_chunk_size=0,
+        ntk_trace_estimator="rhutch",
+    )
+
+    loss_fn, metrics, reconstruct_fn, extra_init_params_fn = setup_transformer_prior_training(
+        autoencoder,
+        args,
+    )
+    extra = extra_init_params_fn(jax.random.PRNGKey(63))
+
+    assert callable(loss_fn)
+    assert len(metrics) == 1
+    assert callable(reconstruct_fn)
+    assert "prior" in extra
+
+
+def test_transformer_prior_ntk_balanced_metric_runs_on_state() -> None:
+    autoencoder, _ = build_autoencoder(
+        key=jax.random.PRNGKey(64),
+        latent_dim=8,
+        n_freqs=4,
+        fourier_sigma=1.0,
+        decoder_features=(16, 16),
+        encoder_type="transformer",
+        decoder_type="transformer",
+        transformer_emb_dim=16,
+        transformer_num_latents=4,
+        transformer_encoder_depth=2,
+        transformer_cross_attn_depth=1,
+        transformer_decoder_depth=2,
+        transformer_mlp_ratio=2,
+        transformer_tokenization="patches",
+        transformer_patch_size=2,
+        transformer_grid_size=(4, 4),
+        n_heads=4,
+    )
+
+    args = SimpleNamespace(
+        n_heads=4,
+        beta=0.0,
+        loss_type="ntk_prior_balanced",
+        prior_hidden_dim=32,
+        prior_n_layers=2,
+        prior_time_emb_dim=8,
+        prior_logsnr_max=5.0,
+        prior_loss_weight=1.0,
+        prior_num_heads=4,
+        prior_mlp_ratio=2.0,
+        ntk_scale_norm=10.0,
+        ntk_epsilon=1e-8,
+        ntk_estimate_total_trace=False,
+        ntk_total_trace_ema_decay=0.99,
+        ntk_n_loss_terms=1,
+        ntk_trace_update_interval=100,
+        ntk_hutchinson_probes=1,
+        ntk_output_chunk_size=0,
+        ntk_trace_estimator="rhutch",
+    )
+
+    _, metrics, _, extra_init_params_fn = setup_transformer_prior_training(autoencoder, args)
+    assert len(metrics) == 1
+
+    batch_size = 2
+    side = 4
+    n_points = side * side
+    u = jnp.ones((batch_size, n_points, 1), dtype=jnp.float32)
+    coords = jnp.linspace(0.0, 1.0, side, dtype=jnp.float32)
+    x = jnp.stack(jnp.meshgrid(coords, coords, indexing="ij"), axis=-1)
+    x = jnp.reshape(x, (1, n_points, 2))
+    x = jnp.broadcast_to(x, (batch_size, n_points, 2))
+
+    variables = autoencoder.init(jax.random.PRNGKey(65), u, x, x, train=False)
+    params = dict(variables["params"])
+    params.update(extra_init_params_fn(jax.random.PRNGKey(66)))
+    state = SimpleNamespace(
+        params=params,
+        batch_stats=variables.get("batch_stats", {}),
+    )
+
+    metric_values = metrics[0](
+        state,
+        jax.random.PRNGKey(67),
+        [(u, x, u, x)],
+    )
+
+    assert set(metric_values.keys()) == {
+        "ntk_recon_trace",
+        "ntk_prior_trace",
+        "ntk_recon_weight",
+        "ntk_prior_weight",
+        "ntk_shared_trace_total",
+        "ntk_trace_ratio",
+        "mse",
+    }
+    for value in metric_values.values():
+        assert np.isfinite(float(value))
+
+
 def test_transformer_apply_fns_ignore_extra_prior_params() -> None:
     autoencoder, _ = build_autoencoder(
         key=jax.random.PRNGKey(70),

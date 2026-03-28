@@ -141,7 +141,7 @@ def _add_loss_args(parser: argparse.ArgumentParser) -> None:
         "--loss-type",
         type=str,
         default="l2",
-        choices=["l2", "sobolev_h1", "ntk_scaled"],
+        choices=["l2", "sobolev_h1"],
         help="Training objective variant.",
     )
     add_ntk_args(parser)
@@ -239,12 +239,15 @@ def build_transformer_prior_parser() -> argparse.ArgumentParser:
         parser,
         "loss_type",
         default="l2",
-        choices=["l2", "ntk_scaled"],
+        choices=["l2", "ntk_prior_balanced", "ntk_scaled"],
         help_text=(
             "Training objective selector. "
             "'l2' uses deterministic MSE reconstruction plus the token-latent "
             "x0-parameterized velocity prior. "
-            "'ntk_scaled' adds NTK trace balancing to the reconstruction term."
+            "'ntk_prior_balanced' adaptively balances reconstruction and prior "
+            "losses using shared-encoder NTK traces. "
+            "'ntk_scaled' keeps the older scale-based reconstruction balancing path "
+            "as a legacy transformer-prior option."
         ),
     )
     parser.set_defaults(loss_type="l2", beta=0.0)
@@ -324,9 +327,10 @@ def validate_transformer_args(args: argparse.Namespace) -> None:
 
 def validate_transformer_prior_args(args: argparse.Namespace) -> None:
     validate_transformer_args(args)
-    if args.loss_type not in {"l2", "ntk_scaled"}:
+    if args.loss_type not in {"l2", "ntk_prior_balanced", "ntk_scaled"}:
         raise ValueError(
-            "train_fae_transformer_prior.py only supports --loss-type in {'l2', 'ntk_scaled'}."
+            "train_fae_transformer_prior.py only supports --loss-type in "
+            "{'l2', 'ntk_prior_balanced', 'ntk_scaled'}."
         )
 
     if getattr(args, "latent_noise_scale", 0.0) != 0.0:
@@ -346,6 +350,12 @@ def validate_transformer_prior_args(args: argparse.Namespace) -> None:
     if int(args.prior_hidden_dim) % int(args.prior_num_heads) != 0:
         raise ValueError(
             "--prior-hidden-dim must be divisible by --prior-num-heads for the transformer DiT prior."
+        )
+    if args.loss_type == "ntk_scaled":
+        warnings.warn(
+            "--loss-type=ntk_scaled is the legacy scale-based transformer-prior objective. "
+            "Prefer --loss-type=ntk_prior_balanced for new prior balancing runs.",
+            UserWarning,
         )
     validate_latent_prior_args(args, prior_enabled=True)
 

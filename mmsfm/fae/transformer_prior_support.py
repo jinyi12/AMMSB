@@ -8,6 +8,8 @@ import jax
 
 from mmsfm.fae.transformer_dit_prior import (
     TransformerDiTPrior,
+    build_ntk_prior_balanced_transformer_metric,
+    get_ntk_prior_balanced_transformer_prior_loss_fn,
     get_ntk_scaled_transformer_prior_loss_fn,
     get_transformer_prior_loss_fn,
     reconstruct_with_transformer_prior,
@@ -62,8 +64,33 @@ def setup_transformer_prior_training(autoencoder, args):
     """Return loss/metric/reconstruction hooks for transformer FAE + DiT prior."""
 
     prior, extra_init_params_fn = build_transformer_prior_components(autoencoder, args)
+    metrics = []
 
-    if getattr(args, "loss_type", "l2") == "ntk_scaled":
+    if getattr(args, "loss_type", "l2") == "ntk_prior_balanced":
+        loss_fn = get_ntk_prior_balanced_transformer_prior_loss_fn(
+            autoencoder,
+            beta=args.beta,
+            prior=prior,
+            prior_weight=getattr(args, "prior_loss_weight", 1.0),
+            epsilon=args.ntk_epsilon,
+            total_trace_ema_decay=float(args.ntk_total_trace_ema_decay),
+            trace_update_interval=int(args.ntk_trace_update_interval),
+            hutchinson_probes=int(args.ntk_hutchinson_probes),
+            output_chunk_size=int(getattr(args, "ntk_output_chunk_size", 0)),
+            trace_estimator=str(getattr(args, "ntk_trace_estimator", "rhutch")).lower(),
+        )
+        metrics = [
+            build_ntk_prior_balanced_transformer_metric(
+                autoencoder=autoencoder,
+                prior=prior,
+                prior_weight=getattr(args, "prior_loss_weight", 1.0),
+                epsilon=args.ntk_epsilon,
+                hutchinson_probes=int(args.ntk_hutchinson_probes),
+                output_chunk_size=int(getattr(args, "ntk_output_chunk_size", 0)),
+                trace_estimator=str(getattr(args, "ntk_trace_estimator", "rhutch")).lower(),
+            )
+        ]
+    elif getattr(args, "loss_type", "l2") == "ntk_scaled":
         loss_fn = get_ntk_scaled_transformer_prior_loss_fn(
             autoencoder,
             beta=args.beta,
@@ -91,7 +118,7 @@ def setup_transformer_prior_training(autoencoder, args):
         del u_dec_, key_
         return reconstruct_with_transformer_prior(autoencoder_, state_, u_enc_, x_enc_, x_dec_)
 
-    return loss_fn, [], reconstruct_fn, extra_init_params_fn
+    return loss_fn, metrics, reconstruct_fn, extra_init_params_fn
 
 
 __all__ = [

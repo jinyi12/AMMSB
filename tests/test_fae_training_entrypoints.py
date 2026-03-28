@@ -59,6 +59,15 @@ def test_prior_parser_defaults_to_film_decoder() -> None:
     assert args.prior_logsnr_max == pytest.approx(5.5)
 
 
+def test_prior_parser_accepts_ntk_prior_balanced() -> None:
+    parser = build_prior_parser()
+    args = parser.parse_args(_required_args() + ["--loss-type", "ntk_prior_balanced"])
+
+    validate_prior_args(args)
+
+    assert args.loss_type == "ntk_prior_balanced"
+
+
 def test_prior_parser_calibrates_logsnr_from_stable_latent_variance() -> None:
     parser = build_prior_parser()
     args = parser.parse_args(
@@ -95,6 +104,12 @@ def test_prior_parser_rejects_non_film_decoder() -> None:
         parser.parse_args(_required_args() + ["--decoder-type", "standard"])
 
 
+def test_prior_parser_does_not_accept_legacy_ntk_scaled() -> None:
+    parser = build_prior_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(_required_args() + ["--loss-type", "ntk_scaled"])
+
+
 def test_transformer_parser_defaults_to_transformer_architecture() -> None:
     parser = build_transformer_parser()
     args = parser.parse_args(_required_args())
@@ -124,6 +139,22 @@ def test_transformer_prior_parser_validates_successfully() -> None:
     assert args.prior_mlp_ratio == 2.0
 
 
+def test_transformer_prior_parser_accepts_ntk_prior_balanced() -> None:
+    parser = build_transformer_prior_parser()
+    args = parser.parse_args(_required_args() + ["--loss-type", "ntk_prior_balanced"])
+    validate_transformer_prior_args(args)
+
+    assert args.loss_type == "ntk_prior_balanced"
+
+
+def test_transformer_prior_parser_warns_on_legacy_ntk_scaled() -> None:
+    parser = build_transformer_prior_parser()
+    args = parser.parse_args(_required_args() + ["--loss-type", "ntk_scaled"])
+
+    with pytest.warns(UserWarning, match="legacy scale-based"):
+        validate_transformer_prior_args(args)
+
+
 def test_transformer_prior_parser_rejects_incompatible_prior_width() -> None:
     parser = build_transformer_prior_parser()
     args = parser.parse_args(
@@ -151,3 +182,10 @@ def test_transformer_parser_does_not_accept_standard_vector_flags() -> None:
 
     with pytest.raises(SystemExit):
         parser.parse_args(_required_args() + ["--latent-dim", "64"])
+
+
+def test_transformer_parser_does_not_accept_legacy_ntk_scaled() -> None:
+    parser = build_transformer_parser()
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(_required_args() + ["--loss-type", "ntk_scaled"])

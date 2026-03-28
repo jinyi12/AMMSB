@@ -171,12 +171,13 @@ def build_film_prior_parser() -> argparse.ArgumentParser:
         parser,
         "loss_type",
         default="l2",
-        choices=["l2", "ntk_scaled"],
+        choices=["l2", "ntk_prior_balanced"],
         help_text=(
             "Training objective selector. "
             "'l2' uses deterministic MSE reconstruction plus the latent x0-parameterized "
             "velocity prior. "
-            "'ntk_scaled' adds NTK trace balancing to the reconstruction term."
+            "'ntk_prior_balanced' adaptively balances reconstruction and prior losses "
+            "using shared-encoder NTK traces."
         ),
     )
     parser.set_defaults(decoder_type="film", loss_type="l2", beta=0.0)
@@ -249,9 +250,9 @@ def validate_film_prior_args(args: argparse.Namespace) -> None:
     validate_standard_args(args)
     if args.decoder_type != "film":
         raise ValueError("train_fae_film_prior.py only supports --decoder-type film.")
-    if args.loss_type not in {"l2", "ntk_scaled"}:
+    if args.loss_type not in {"l2", "ntk_prior_balanced"}:
         raise ValueError(
-            "train_fae_film_prior.py only supports --loss-type in {'l2', 'ntk_scaled'}."
+            "train_fae_film_prior.py only supports --loss-type in {'l2', 'ntk_prior_balanced'}."
         )
     if getattr(args, "latent_noise_scale", 0.0) != 0.0:
         warnings.warn(
