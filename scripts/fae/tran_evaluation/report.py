@@ -159,6 +159,101 @@ def _sample_finite(
     return np.concatenate(out, axis=0)
 
 
+def _figure_safe_key(label: str) -> str:
+    safe = str(label).replace(" ", "_").replace("=", "").replace(">", "to")
+    safe = safe.replace("-", "_").replace("/", "_").replace(".", "p")
+    while "__" in safe:
+        safe = safe.replace("__", "_")
+    return safe.strip("_")
+
+
+def _field_to_image(field: NDArray, resolution: int) -> NDArray[np.float64]:
+    arr = np.asarray(field, dtype=np.float64)
+    if arr.ndim == 1:
+        return arr.reshape(resolution, resolution)
+    if arr.ndim == 2:
+        if arr.shape != (resolution, resolution):
+            raise ValueError(
+                f"Expected field image shape {(resolution, resolution)}, got {arr.shape}."
+            )
+        return arr
+    raise ValueError(f"Expected a flattened or 2D field image, got shape {arr.shape}.")
+
+
+def _plot_conditioned_qualitative_panel(
+    qualitative_examples: Dict,
+    *,
+    resolution: int,
+    out_dir: Path,
+    name: str,
+) -> None:
+    if not qualitative_examples:
+        return
+
+    generated_fields = np.asarray(qualitative_examples.get("generated_fields"))
+    coarsened_fields = np.asarray(qualitative_examples.get("coarsened_fields"))
+    condition_fields = np.asarray(qualitative_examples.get("condition_fields"))
+    if generated_fields.size == 0 or coarsened_fields.size == 0 or condition_fields.size == 0:
+        return
+
+    n_cols = min(
+        int(generated_fields.shape[0]),
+        int(coarsened_fields.shape[0]),
+        int(condition_fields.shape[0]),
+    )
+    generated_imgs = [_field_to_image(generated_fields[col], resolution) for col in range(n_cols)]
+    coarsened_imgs = [_field_to_image(coarsened_fields[col], resolution) for col in range(n_cols)]
+    condition_imgs = [_field_to_image(condition_fields[col], resolution) for col in range(n_cols)]
+    all_imgs = generated_imgs + coarsened_imgs + condition_imgs
+    shared_vmin = float(min(img.min() for img in all_imgs))
+    shared_vmax = float(max(img.max() for img in all_imgs))
+
+    panel_size = 1.35
+    fig, axes = plt.subplots(
+        3,
+        n_cols,
+        figsize=(panel_size * n_cols, panel_size * 3),
+    )
+    axes = np.asarray(axes).reshape(3, n_cols)
+    row_labels = ("Generated", "Coarsened", "GT / Cond.")
+
+    for col in range(n_cols):
+        axes[0, col].imshow(
+            generated_imgs[col],
+            origin="lower",
+            cmap=CMAP_FIELD,
+            vmin=shared_vmin,
+            vmax=shared_vmax,
+        )
+        axes[0, col].axis("off")
+
+        axes[1, col].imshow(
+            coarsened_imgs[col],
+            origin="lower",
+            cmap=CMAP_FIELD,
+            vmin=shared_vmin,
+            vmax=shared_vmax,
+        )
+        axes[1, col].axis("off")
+
+        axes[2, col].imshow(
+            condition_imgs[col],
+            origin="lower",
+            cmap=CMAP_FIELD,
+            vmin=shared_vmin,
+            vmax=shared_vmax,
+        )
+        axes[2, col].axis("off")
+
+    row_y = (0.83, 0.50, 0.17)
+    for label, y in zip(row_labels, row_y, strict=True):
+        fig.text(0.035, y, label, rotation=90, va="center", ha="center", fontsize=FONT_LABEL)
+
+    fig.subplots_adjust(left=0.08, right=0.99, top=0.99, bottom=0.01, wspace=0.02, hspace=0.02)
+    _save_fig(fig, out_dir, name)
+    plt.close(fig)
+
+
 def _fd_nbins(values: NDArray[np.float64], *, min_bins: int, max_bins: int) -> int:
     """Freedman–Diaconis-style bin count with sane clamps."""
     v = np.asarray(values, dtype=np.float64).ravel()
@@ -364,6 +459,38 @@ def plot_coarse_consistency_condition_distributions(
     plt.tight_layout()
     _save_fig(fig, out_dir, "fig1b_coarse_consistency_conditions")
     plt.close(fig)
+
+
+def plot_coarse_consistency_global_qualitative(
+    coarse_qualitative_results: Dict,
+    resolution: int,
+    out_dir: Path,
+) -> None:
+    qualitative_examples = coarse_qualitative_results.get("conditioned_global_return")
+    if not qualitative_examples:
+        return
+    _plot_conditioned_qualitative_panel(
+        qualitative_examples,
+        resolution=resolution,
+        out_dir=out_dir,
+        name="fig1c_coarse_consistency_global_qualitative",
+    )
+
+
+def plot_coarse_consistency_interval_qualitative(
+    coarse_results: Dict,
+    coarse_qualitative_results: Dict,
+    resolution: int,
+    out_dir: Path,
+) -> None:
+    qualitative_interval = coarse_qualitative_results.get("conditioned_interval", {})
+    for pair_key, qualitative_examples in qualitative_interval.items():
+        _plot_conditioned_qualitative_panel(
+            qualitative_examples,
+            resolution=resolution,
+            out_dir=out_dir,
+            name=f"fig1d_coarse_consistency_{_figure_safe_key(pair_key)}_qualitative",
+        )
 
 
 # ============================================================================

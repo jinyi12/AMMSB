@@ -11,11 +11,15 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from scripts.fae.tran_evaluation.conditional_metrics import (
+    compute_chatterjee_local_scores,
     compute_ecmmd_metrics,
     metric_summary,
     parse_positive_int_list_arg,
 )
-from scripts.fae.tran_evaluation.conditional_support import DEFAULT_CONDITIONAL_EVAL_MODE
+from scripts.fae.tran_evaluation.conditional_support import (
+    CHATTERJEE_CONDITIONAL_EVAL_MODE,
+    DEFAULT_CONDITIONAL_EVAL_MODE,
+)
 
 
 def test_parse_positive_int_list_arg_rejects_non_positive_values():
@@ -99,3 +103,72 @@ def test_compute_ecmmd_metrics_supports_adaptive_weighted_reference():
     assert adaptive["radius"]["min"] == pytest.approx(float(np.min(adaptive_radii)))
     assert np.isfinite(adaptive["single_draw"]["score"])
     assert np.isfinite(adaptive["derandomized"]["score"])
+
+
+def test_compute_ecmmd_metrics_chatterjee_knn_uses_matched_draw_average():
+    conditions = np.asarray([[0.0], [1.0]], dtype=np.float32)
+    real_samples = np.asarray([[0.0], [1.0]], dtype=np.float32)
+    generated = np.asarray(
+        [
+            [[0.0], [10.0]],
+            [[1.0], [10.0]],
+        ],
+        dtype=np.float32,
+    )
+
+    metrics = compute_ecmmd_metrics(
+        conditions=conditions,
+        real_samples=real_samples,
+        generated_samples=generated,
+        k_values=[1],
+        bandwidth_override=1.0,
+        condition_graph_mode=CHATTERJEE_CONDITIONAL_EVAL_MODE,
+    )
+
+    branch = metrics["k_values"]["1"]
+    expected = (
+        np.exp(-1.0)
+        + 0.5 * (np.exp(-1.0) + 1.0)
+        - 0.5 * (np.exp(-1.0) + np.exp(-100.0))
+        - 0.5 * (np.exp(-1.0) + np.exp(-81.0))
+    )
+
+    assert metrics["graph_mode"] == CHATTERJEE_CONDITIONAL_EVAL_MODE
+    assert branch["k_effective"] == 1
+    assert branch["single_draw"]["score"] == pytest.approx(0.0)
+    assert branch["derandomized"]["score"] == pytest.approx(float(expected))
+
+
+def test_compute_chatterjee_local_scores_match_global_graph_average():
+    conditions = np.asarray([[0.0], [1.0], [3.0]], dtype=np.float32)
+    real_samples = np.asarray([[0.0], [1.0], [2.5]], dtype=np.float32)
+    generated = np.asarray(
+        [
+            [[0.0], [0.1]],
+            [[1.1], [0.9]],
+            [[2.7], [2.6]],
+        ],
+        dtype=np.float32,
+    )
+
+    metrics = compute_ecmmd_metrics(
+        conditions=conditions,
+        real_samples=real_samples,
+        generated_samples=generated,
+        k_values=[1],
+        bandwidth_override=0.75,
+        condition_graph_mode=CHATTERJEE_CONDITIONAL_EVAL_MODE,
+    )
+    local = compute_chatterjee_local_scores(
+        conditions=conditions,
+        real_samples=real_samples,
+        generated_samples=generated,
+        k=1,
+        bandwidth_override=0.75,
+    )
+
+    branch = metrics["k_values"]["1"]
+    assert local["k_effective"] == 1
+    assert local["neighbor_indices"].shape == (3, 1)
+    assert np.mean(local["single_draw_scores"]) == pytest.approx(branch["single_draw"]["score"])
+    assert np.mean(local["derandomized_scores"]) == pytest.approx(branch["derandomized"]["score"])

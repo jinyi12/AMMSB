@@ -12,16 +12,19 @@ if str(_REPO_ROOT) not in sys.path:
 
 from scripts.fae.tran_evaluation.conditional_support import (
     AdaptiveReferenceConfig,
+    CHATTERJEE_CONDITIONAL_EVAL_MODE,
     DEFAULT_CONDITIONAL_EVAL_MODE,
     build_full_H_schedule,
     build_local_reference_samples,
     build_local_reference_spec,
+    build_uniform_sampling_specs_from_neighbors,
     fit_whitened_pca_metric,
     format_h_slug,
     knn_gaussian_weights,
     make_pair_label,
     normalise_weights,
     sampling_spec_indices,
+    validate_conditional_eval_mode,
 )
 
 
@@ -159,3 +162,23 @@ def test_adaptive_reference_uses_smaller_radius_in_dense_region():
     assert float(dense_spec["radius"]) < float(sparse_spec["radius"])
     assert float(dense_spec["ess"]) >= 4.0
     assert float(sparse_spec["ess"]) >= 4.0
+
+
+def test_validate_conditional_eval_mode_accepts_chatterjee_and_rejects_fixed_knn():
+    assert validate_conditional_eval_mode(None) == DEFAULT_CONDITIONAL_EVAL_MODE
+    assert validate_conditional_eval_mode(CHATTERJEE_CONDITIONAL_EVAL_MODE) == CHATTERJEE_CONDITIONAL_EVAL_MODE
+    with pytest.raises(ValueError, match="conditional_eval_mode must be one of"):
+        validate_conditional_eval_mode("fixed_knn")
+
+
+def test_build_uniform_sampling_specs_from_neighbors_uses_uniform_weights_and_radii():
+    specs = build_uniform_sampling_specs_from_neighbors(
+        np.asarray([[2, 4, 6], [1, 3, 5]], dtype=np.int64),
+        neighbor_radii=np.asarray([0.4, 0.9], dtype=np.float32),
+    )
+
+    assert len(specs) == 2
+    np.testing.assert_array_equal(specs[0]["candidate_indices"], np.asarray([2, 4, 6], dtype=np.int64))
+    np.testing.assert_allclose(specs[0]["candidate_weights"], np.asarray([1 / 3, 1 / 3, 1 / 3], dtype=np.float64))
+    assert float(specs[0]["radius"]) == pytest.approx(0.4)
+    assert float(specs[1]["ess"]) == pytest.approx(3.0)

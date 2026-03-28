@@ -15,7 +15,7 @@ from scripts.csp.build_eval_cache import build_eval_cache
 from scripts.csp.plot_latent_trajectories import plot_latent_trajectory_summary
 from scripts.csp.plot_csp_training import plot_training_curve
 from scripts.csp.run_context import resolve_csp_source_context
-from scripts.fae.tran_evaluation.conditional_support import DEFAULT_CONDITIONAL_EVAL_MODE
+from scripts.fae.tran_evaluation.conditional_support import CHATTERJEE_CONDITIONAL_EVAL_MODE
 
 
 def _parse_args() -> argparse.Namespace:
@@ -87,9 +87,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--conditional_realizations", type=int, default=200)
     parser.add_argument("--conditional_n_plot_conditions", type=int, default=5)
     parser.add_argument("--conditional_plot_value_budget", type=int, default=20_000)
-    parser.add_argument("--conditional_ecmmd_k_values", type=str, default="10,20,30")
+    parser.add_argument("--conditional_ecmmd_k_values", type=str, default="20")
     parser.add_argument("--conditional_ecmmd_bootstrap_reps", type=int, default=64)
-    parser.add_argument("--conditional_eval_mode", type=str, default=DEFAULT_CONDITIONAL_EVAL_MODE)
+    parser.add_argument("--conditional_eval_mode", type=str, default=CHATTERJEE_CONDITIONAL_EVAL_MODE)
     parser.add_argument("--conditional_adaptive_metric_dim_cap", type=int, default=24)
     parser.add_argument("--conditional_adaptive_reference_bootstrap_reps", type=int, default=64)
     parser.add_argument("--conditional_adaptive_ess_min", type=int, default=32)
@@ -274,7 +274,7 @@ def main() -> None:
     print(f"  n_gt_neighbors  : {n_gt_neighbors}", flush=True)
     print(f"  conditional_n   : {args.conditional_realizations}", flush=True)
     print(f"  conditional_k   : {args.conditional_k_neighbors}", flush=True)
-    print(f"  conditional_mode: {getattr(args, 'conditional_eval_mode', DEFAULT_CONDITIONAL_EVAL_MODE)}", flush=True)
+    print(f"  conditional_mode: {getattr(args, 'conditional_eval_mode', CHATTERJEE_CONDITIONAL_EVAL_MODE)}", flush=True)
     print(f"  conditional_plot_conditions: {args.conditional_n_plot_conditions}", flush=True)
     print(f"  conditional_plot_budget    : {args.conditional_plot_value_budget}", flush=True)
     print(f"  sample_idx      : {args.sample_idx}", flush=True)
@@ -338,7 +338,7 @@ def main() -> None:
             plot_value_budget=args.conditional_plot_value_budget,
             ecmmd_k_values=args.conditional_ecmmd_k_values,
             ecmmd_bootstrap_reps=args.conditional_ecmmd_bootstrap_reps,
-            conditional_eval_mode=getattr(args, "conditional_eval_mode", DEFAULT_CONDITIONAL_EVAL_MODE),
+            conditional_eval_mode=getattr(args, "conditional_eval_mode", CHATTERJEE_CONDITIONAL_EVAL_MODE),
             adaptive_metric_dim_cap=int(getattr(args, "conditional_adaptive_metric_dim_cap", 24)),
             adaptive_reference_bootstrap_reps=int(
                 getattr(args, "conditional_adaptive_reference_bootstrap_reps", 64)
@@ -418,7 +418,7 @@ def main() -> None:
         "conditional_k_neighbors": int(args.conditional_k_neighbors),
         "conditional_n_test_samples": int(args.conditional_n_test_samples),
         "conditional_realizations": int(args.conditional_realizations),
-        "conditional_eval_mode": str(getattr(args, "conditional_eval_mode", DEFAULT_CONDITIONAL_EVAL_MODE)),
+        "conditional_eval_mode": str(getattr(args, "conditional_eval_mode", CHATTERJEE_CONDITIONAL_EVAL_MODE)),
         "conditional_n_plot_conditions": int(args.conditional_n_plot_conditions),
         "conditional_plot_value_budget": int(args.conditional_plot_value_budget),
         "conditional_ecmmd_k_values": str(args.conditional_ecmmd_k_values),

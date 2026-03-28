@@ -113,6 +113,8 @@ from scripts.fae.tran_evaluation.run_support import (  # noqa: E402
 from scripts.fae.tran_evaluation.report import (  # noqa: E402
     plot_coarse_consistency_breakdown,
     plot_coarse_consistency_condition_distributions,
+    plot_coarse_consistency_global_qualitative,
+    plot_coarse_consistency_interval_qualitative,
     plot_detail_bands,
     plot_direct_field_correlation,
     plot_direct_field_pdfs,
@@ -953,6 +955,7 @@ def main() -> None:
     print("  Excluded from evaluation: raw microscale index 0 and any held-out dataset indices")
 
     coarse_results: dict[str, Any] | None = None
+    coarse_qualitative_results: dict[str, Any] | None = None
     first_order = {}
     second_order = {}
     spectral = {}
@@ -975,6 +978,10 @@ def main() -> None:
             "conditioned_global_return": None,
             "cache_global_return": None,
             "path_self_consistency": None,
+        }
+        coarse_qualitative_results = {
+            "conditioned_interval": {},
+            "conditioned_global_return": None,
         }
 
         coarse_runtime = None
@@ -1022,6 +1029,7 @@ def main() -> None:
                     relative_eps=args.coarse_relative_epsilon,
                 )
                 coarse_results["conditioned_interval"] = conditioned_interval["intervals"]
+                coarse_qualitative_results["conditioned_interval"] = conditioned_interval["qualitative_examples"]
                 coarse_results["conditioned_interval_metadata"] = {
                     "n_conditions": conditioned_interval["n_conditions"],
                     "n_realizations_per_condition": conditioned_interval["n_realizations_per_condition"],
@@ -1063,13 +1071,14 @@ def main() -> None:
                     drift_clip_norm=args.drift_clip_norm,
                     relative_eps=args.coarse_relative_epsilon,
                 )
-                coarse_results["conditioned_global_return"] = conditioned_global
+                coarse_results["conditioned_global_return"] = conditioned_global["summary"]
+                coarse_qualitative_results["conditioned_global_return"] = conditioned_global["qualitative_examples"]
                 print(
                     "  End-to-end conditioned global coarse return: "
-                    f"C_rel={conditioned_global['total_rel']['mean']:.6f}  "
-                    f"B_rel={conditioned_global['bias_rel']['mean']:.6f}  "
-                    f"S_rel={conditioned_global['spread_rel']['mean']:.6f}  "
-                    f"stable={conditioned_global['stable_relative_total']:.6f}"
+                    f"C_rel={conditioned_global['summary']['total_rel']['mean']:.6f}  "
+                    f"B_rel={conditioned_global['summary']['bias_rel']['mean']:.6f}  "
+                    f"S_rel={conditioned_global['summary']['spread_rel']['mean']:.6f}  "
+                    f"stable={conditioned_global['summary']['stable_relative_total']:.6f}"
                 )
 
         if args.report_cache_global_return:
@@ -1582,6 +1591,18 @@ def main() -> None:
             if coarse_results is not None:
                 plot_coarse_consistency_breakdown(coarse_results, out_dir)
                 plot_coarse_consistency_condition_distributions(coarse_results, out_dir)
+                if coarse_qualitative_results is not None:
+                    plot_coarse_consistency_global_qualitative(
+                        coarse_qualitative_results,
+                        resolution,
+                        out_dir,
+                    )
+                    plot_coarse_consistency_interval_qualitative(
+                        coarse_results,
+                        coarse_qualitative_results,
+                        resolution,
+                        out_dir,
+                    )
             # Fig 2: Sample realisations vs GT at gen's native scale (NOT raw micro).
             plot_sample_realizations(
                 gen["realizations_phys"], gt_micro_sample, resolution, out_dir,

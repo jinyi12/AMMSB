@@ -5,8 +5,10 @@ This script evaluates conditional generation quality only in latent space.
 For each consecutive MSBM scale pair ``(s, s-1)`` it:
 
 1. Uses coarse latent test samples ``z_s`` as query conditions.
-2. Builds a corpus-smoothed empirical latent conditional from aligned corpus
-   latents ``(z_s, z_{s-1})``.
+2. Uses the aligned fine latent at each evaluation vertex together with a
+   standardized condition-space Chatterjee kNN graph to measure conditional-law
+   mismatch, and retains graph-induced empirical-conditionals as support
+   diagnostics.
 3. Generates latent samples at the finer scale ``z_{s-1}`` with the backward
    MSBM policy.
 4. Computes latent conditional Wasserstein-1 and Wasserstein-2 distances.
@@ -44,14 +46,16 @@ if str(REPO_ROOT) not in sys.path:
 
 from scripts.fae.tran_evaluation.conditional_support import (
     AdaptiveReferenceConfig,
+    CHATTERJEE_CONDITIONAL_EVAL_MODE,
     DEFAULT_CONDITIONAL_EVAL_MODE,
-    LEGACY_CONDITIONAL_EVAL_MODE,
     build_full_H_schedule,
     build_local_reference_samples,
     build_local_reference_spec,
+    build_uniform_sampling_specs_from_neighbors,
     fit_whitened_pca_metric,
     make_pair_label,
     pack_reference_support_arrays,
+    sample_weighted_rows,
     sampling_spec_ess,
     sampling_spec_eig_rse,
     sampling_spec_indices,
@@ -64,6 +68,7 @@ from scripts.fae.tran_evaluation.conditional_support import (
 )
 from scripts.fae.tran_evaluation.conditional_metrics import (
     add_bootstrap_ecmmd_calibration as _add_bootstrap_ecmmd_calibration,
+    compute_chatterjee_local_scores,
     compute_ecmmd_metrics as _compute_ecmmd_metrics,
     metric_summary as _metric_summary,
     parse_positive_int_list_arg as _parse_int_list_arg,
@@ -99,8 +104,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--conditional_eval_mode",
         type=str,
-        default=DEFAULT_CONDITIONAL_EVAL_MODE,
-        choices=[LEGACY_CONDITIONAL_EVAL_MODE, DEFAULT_CONDITIONAL_EVAL_MODE],
+        default=CHATTERJEE_CONDITIONAL_EVAL_MODE,
+        choices=[CHATTERJEE_CONDITIONAL_EVAL_MODE, DEFAULT_CONDITIONAL_EVAL_MODE],
+        help="Use chatterjee_knn as the canonical conditional-law evaluation; adaptive_radius remains available for legacy comparison.",
     )
     parser.add_argument("--k_neighbors", type=int, default=200)
     parser.add_argument("--n_test_samples", type=int, default=50, help="Number of test conditions for latent W1/W2.")
@@ -113,7 +119,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--ecmmd_k_values",
         type=str,
-        default="10,20,30",
+        default="20",
         help="Comma-separated K values for latent-space ECMMD.",
     )
     parser.add_argument(
@@ -146,7 +152,7 @@ def _parse_args() -> argparse.Namespace:
 
 
 def _resolve_conditional_eval_mode(args: argparse.Namespace) -> str:
-    return validate_conditional_eval_mode(getattr(args, "conditional_eval_mode", DEFAULT_CONDITIONAL_EVAL_MODE))
+    return validate_conditional_eval_mode(getattr(args, "conditional_eval_mode", CHATTERJEE_CONDITIONAL_EVAL_MODE))
 
 
 def _build_adaptive_reference_config(args: argparse.Namespace) -> AdaptiveReferenceConfig:
@@ -267,36 +273,98 @@ def _evaluate_scale_pair(
         )
         ecmmd_generated.append(z_gen.cpu().numpy().astype(np.float32))
 
-    ecmmd_reference, ecmmd_sampling_specs = build_local_reference_samples(
-        conditions=ecmmd_conditions,
-        corpus_conditions=corpus_z_coarse,
-        corpus_targets=corpus_z_fine,
-        corpus_condition_indices=corpus_eval_indices,
-        k_neighbors=k_neighbors,
-        n_realizations=n_realizations,
-        rng=rng,
-        conditional_eval_mode=conditional_eval_mode,
-        condition_metric=condition_metric,
-        corpus_conditions_transformed=corpus_z_coarse_metric,
-        adaptive_config=adaptive_config,
-    )
-    reference_support, reference_weights, reference_indices, reference_counts = pack_reference_support_arrays(
-        corpus_z_fine,
-        ecmmd_sampling_specs,
-    )
-    adaptive_radii = np.asarray([sampling_spec_radius(spec) for spec in ecmmd_sampling_specs], dtype=np.float32)
-    reference_ess = np.asarray([sampling_spec_ess(spec) for spec in ecmmd_sampling_specs], dtype=np.float32)
-    reference_mean_rse = np.asarray([sampling_spec_mean_rse(spec) for spec in ecmmd_sampling_specs], dtype=np.float32)
-    reference_eig_rse = np.stack([sampling_spec_eig_rse(spec) for spec in ecmmd_sampling_specs], axis=0).astype(
-        np.float32
+    ecmmd_observed_reference = corpus_z_fine[corpus_eval_indices].astype(np.float32)
+    visualization_k_requested = (
+        int(ecmmd_k_values[0])
+        if ecmmd_k_values
+        else int(max(1, min(int(k_neighbors), int(max(1, ecmmd_conditions.shape[0] - 1)))))
     )
     graph_condition_vectors = (
         transform_condition_vectors(ecmmd_conditions, condition_metric)
         if conditional_eval_mode == DEFAULT_CONDITIONAL_EVAL_MODE and condition_metric is not None
         else None
     )
-    ecmmd_real_samples = reference_support if conditional_eval_mode == DEFAULT_CONDITIONAL_EVAL_MODE else ecmmd_reference
-    ecmmd_reference_weights = reference_weights if conditional_eval_mode == DEFAULT_CONDITIONAL_EVAL_MODE else None
+
+    if conditional_eval_mode == CHATTERJEE_CONDITIONAL_EVAL_MODE:
+        chatterjee_payload = compute_chatterjee_local_scores(
+            ecmmd_conditions,
+            ecmmd_observed_reference,
+            np.stack(ecmmd_generated, axis=0),
+            visualization_k_requested,
+        )
+        ecmmd_sampling_specs = build_uniform_sampling_specs_from_neighbors(
+            np.asarray(chatterjee_payload["neighbor_indices"], dtype=np.int64),
+            neighbor_radii=np.asarray(chatterjee_payload["neighbor_radii"], dtype=np.float64),
+            mode=CHATTERJEE_CONDITIONAL_EVAL_MODE,
+        )
+        ecmmd_reference = np.stack(
+            [
+                sample_weighted_rows(
+                    ecmmd_observed_reference,
+                    sampling_spec_indices(spec),
+                    sampling_spec_weights(spec),
+                    int(n_realizations),
+                    np.random.default_rng(int(base_seed) + 200_000 + int(row)),
+                )
+                for row, spec in enumerate(ecmmd_sampling_specs)
+            ],
+            axis=0,
+        ).astype(np.float32)
+        reference_support, reference_weights, reference_indices, reference_counts = pack_reference_support_arrays(
+            ecmmd_observed_reference,
+            ecmmd_sampling_specs,
+        )
+        adaptive_radii = np.asarray([sampling_spec_radius(spec) for spec in ecmmd_sampling_specs], dtype=np.float32)
+        reference_ess = np.asarray([sampling_spec_ess(spec) for spec in ecmmd_sampling_specs], dtype=np.float32)
+        reference_mean_rse = np.asarray(
+            [sampling_spec_mean_rse(spec) for spec in ecmmd_sampling_specs],
+            dtype=np.float32,
+        )
+        reference_eig_rse = np.stack(
+            [sampling_spec_eig_rse(spec) for spec in ecmmd_sampling_specs],
+            axis=0,
+        ).astype(np.float32)
+        local_scores = np.asarray(chatterjee_payload["derandomized_scores"], dtype=np.float32)
+        neighborhood_indices = np.asarray(chatterjee_payload["neighbor_indices"], dtype=np.int64)
+        neighborhood_radii = np.asarray(chatterjee_payload["neighbor_radii"], dtype=np.float32)
+        neighborhood_distances = np.asarray(chatterjee_payload["neighbor_distances"], dtype=np.float32)
+        ecmmd_real_samples = ecmmd_observed_reference
+        ecmmd_reference_weights = None
+    else:
+        ecmmd_reference, ecmmd_sampling_specs = build_local_reference_samples(
+            conditions=ecmmd_conditions,
+            corpus_conditions=corpus_z_coarse,
+            corpus_targets=corpus_z_fine,
+            corpus_condition_indices=corpus_eval_indices,
+            k_neighbors=k_neighbors,
+            n_realizations=n_realizations,
+            rng=rng,
+            conditional_eval_mode=conditional_eval_mode,
+            condition_metric=condition_metric,
+            corpus_conditions_transformed=corpus_z_coarse_metric,
+            adaptive_config=adaptive_config,
+        )
+        reference_support, reference_weights, reference_indices, reference_counts = pack_reference_support_arrays(
+            corpus_z_fine,
+            ecmmd_sampling_specs,
+        )
+        adaptive_radii = np.asarray([sampling_spec_radius(spec) for spec in ecmmd_sampling_specs], dtype=np.float32)
+        reference_ess = np.asarray([sampling_spec_ess(spec) for spec in ecmmd_sampling_specs], dtype=np.float32)
+        reference_mean_rse = np.asarray(
+            [sampling_spec_mean_rse(spec) for spec in ecmmd_sampling_specs],
+            dtype=np.float32,
+        )
+        reference_eig_rse = np.stack(
+            [sampling_spec_eig_rse(spec) for spec in ecmmd_sampling_specs],
+            axis=0,
+        ).astype(np.float32)
+        local_scores = np.full((ecmmd_conditions.shape[0],), np.nan, dtype=np.float32)
+        neighborhood_indices = np.full((ecmmd_conditions.shape[0], 1), -1, dtype=np.int64)
+        neighborhood_radii = adaptive_radii.astype(np.float32)
+        neighborhood_distances = np.full((ecmmd_conditions.shape[0], 1), np.nan, dtype=np.float32)
+        ecmmd_real_samples = reference_support
+        ecmmd_reference_weights = reference_weights
+
     latent_ecmmd = _compute_ecmmd_metrics(
         ecmmd_conditions,
         ecmmd_real_samples,
@@ -311,7 +379,7 @@ def _evaluate_scale_pair(
         latent_ecmmd,
         conditions=ecmmd_conditions,
         reference_samples=ecmmd_real_samples,
-        corpus_targets=corpus_z_fine,
+        corpus_targets=ecmmd_observed_reference if conditional_eval_mode == CHATTERJEE_CONDITIONAL_EVAL_MODE else corpus_z_fine,
         sampling_specs=ecmmd_sampling_specs,
         k_values=ecmmd_k_values,
         n_bootstrap=ecmmd_bootstrap_reps,
@@ -324,6 +392,9 @@ def _evaluate_scale_pair(
     )
     latent_ecmmd["reference_mode"] = conditional_eval_mode
     latent_ecmmd["reference_diagnostics"] = summarize_reference_sampling_specs(ecmmd_sampling_specs)
+    latent_ecmmd["visualization_k_requested"] = int(visualization_k_requested)
+    if conditional_eval_mode == CHATTERJEE_CONDITIONAL_EVAL_MODE:
+        latent_ecmmd["visualization_k_effective"] = int(chatterjee_payload["k_effective"])
     if conditional_eval_mode == DEFAULT_CONDITIONAL_EVAL_MODE and condition_metric is not None:
         latent_ecmmd["condition_metric"] = {
             "retained_dim": int(condition_metric.retained_dim),
@@ -337,8 +408,13 @@ def _evaluate_scale_pair(
         "latent_w2_null_values": np.asarray(latent_w2_null_values, dtype=np.float64),
         "latent_ecmmd_conditions": ecmmd_conditions.astype(np.float32),
         "latent_ecmmd_reference": ecmmd_reference.astype(np.float32),
+        "latent_ecmmd_observed_reference": ecmmd_observed_reference.astype(np.float32),
         "latent_ecmmd_generated": np.stack(ecmmd_generated, axis=0).astype(np.float32),
         "latent_ecmmd": latent_ecmmd,
+        "latent_ecmmd_local_scores": local_scores.astype(np.float32),
+        "latent_ecmmd_neighbor_indices": neighborhood_indices.astype(np.int64),
+        "latent_ecmmd_neighbor_radii": neighborhood_radii.astype(np.float32),
+        "latent_ecmmd_neighbor_distances": neighborhood_distances.astype(np.float32),
         "latent_ecmmd_reference_support_indices": reference_indices.astype(np.int64),
         "latent_ecmmd_reference_support_weights": reference_weights.astype(np.float32),
         "latent_ecmmd_reference_support_counts": reference_counts.astype(np.int64),
@@ -449,15 +525,15 @@ def main() -> None:
     adaptive_config = _build_adaptive_reference_config(args)
     ecmmd_k_values = _parse_int_list_arg(args.ecmmd_k_values)
     ecmmd_k_values_raw = str(getattr(args, "ecmmd_k_values", "")).strip()
-    if conditional_eval_mode == LEGACY_CONDITIONAL_EVAL_MODE and not ecmmd_k_values:
+    if conditional_eval_mode == CHATTERJEE_CONDITIONAL_EVAL_MODE and not ecmmd_k_values:
         raise ValueError("--ecmmd_k_values must contain at least one positive integer.")
     if (
         conditional_eval_mode == DEFAULT_CONDITIONAL_EVAL_MODE
         and ecmmd_k_values
-        and ecmmd_k_values_raw not in {"", "10,20,30"}
+        and ecmmd_k_values_raw not in {"", "20", "10,20,30"}
     ):
         warnings.warn(
-            "adaptive_radius ignores legacy --ecmmd_k_values and uses an adaptive radius graph instead.",
+            "adaptive_radius ignores --ecmmd_k_values and uses an adaptive radius graph instead.",
             stacklevel=2,
         )
 
@@ -520,7 +596,11 @@ def main() -> None:
     results_ecmmd_latent_all: dict[str, dict[str, object]] = {}
     results_ecmmd_conditions_all: dict[str, np.ndarray] = {}
     results_ecmmd_reference_all: dict[str, np.ndarray] = {}
+    results_ecmmd_observed_reference_all: dict[str, np.ndarray] = {}
     results_ecmmd_generated_all: dict[str, np.ndarray] = {}
+    results_ecmmd_neighbor_indices_all: dict[str, np.ndarray] = {}
+    results_ecmmd_neighbor_radii_all: dict[str, np.ndarray] = {}
+    results_ecmmd_neighbor_distances_all: dict[str, np.ndarray] = {}
     results_ecmmd_reference_support_indices_all: dict[str, np.ndarray] = {}
     results_ecmmd_reference_support_weights_all: dict[str, np.ndarray] = {}
     results_ecmmd_reference_support_counts_all: dict[str, np.ndarray] = {}
@@ -528,6 +608,7 @@ def main() -> None:
     results_ecmmd_reference_ess_all: dict[str, np.ndarray] = {}
     results_ecmmd_reference_mean_rse_all: dict[str, np.ndarray] = {}
     results_ecmmd_reference_eig_rse_all: dict[str, np.ndarray] = {}
+    results_ecmmd_local_scores_all: dict[str, np.ndarray] = {}
     pair_metadata_all: dict[str, dict[str, object]] = {}
     pair_labels: list[str] = []
 
@@ -595,7 +676,23 @@ def main() -> None:
         results_ecmmd_latent_all[pair_label] = latent_ecmmd
         results_ecmmd_conditions_all[pair_label] = np.asarray(pair_result["latent_ecmmd_conditions"], dtype=np.float32)
         results_ecmmd_reference_all[pair_label] = np.asarray(pair_result["latent_ecmmd_reference"], dtype=np.float32)
+        results_ecmmd_observed_reference_all[pair_label] = np.asarray(
+            pair_result["latent_ecmmd_observed_reference"],
+            dtype=np.float32,
+        )
         results_ecmmd_generated_all[pair_label] = np.asarray(pair_result["latent_ecmmd_generated"], dtype=np.float32)
+        results_ecmmd_neighbor_indices_all[pair_label] = np.asarray(
+            pair_result["latent_ecmmd_neighbor_indices"],
+            dtype=np.int64,
+        )
+        results_ecmmd_neighbor_radii_all[pair_label] = np.asarray(
+            pair_result["latent_ecmmd_neighbor_radii"],
+            dtype=np.float32,
+        )
+        results_ecmmd_neighbor_distances_all[pair_label] = np.asarray(
+            pair_result["latent_ecmmd_neighbor_distances"],
+            dtype=np.float32,
+        )
         results_ecmmd_reference_support_indices_all[pair_label] = np.asarray(
             pair_result["latent_ecmmd_reference_support_indices"], dtype=np.int64
         )
@@ -616,6 +713,10 @@ def main() -> None:
         )
         results_ecmmd_reference_eig_rse_all[pair_label] = np.asarray(
             pair_result["latent_ecmmd_reference_eig_rse"], dtype=np.float32
+        )
+        results_ecmmd_local_scores_all[pair_label] = np.asarray(
+            pair_result["latent_ecmmd_local_scores"],
+            dtype=np.float32,
         )
 
         print(f"\n  Summary for {pair_label}:")
@@ -722,8 +823,24 @@ def main() -> None:
             results_ecmmd_reference_all[pair_label],
             dtype=np.float32,
         )
+        npz_dict[f"latent_ecmmd_observed_reference_{pair_label}"] = np.asarray(
+            results_ecmmd_observed_reference_all[pair_label],
+            dtype=np.float32,
+        )
         npz_dict[f"latent_ecmmd_generated_{pair_label}"] = np.asarray(
             results_ecmmd_generated_all[pair_label],
+            dtype=np.float32,
+        )
+        npz_dict[f"latent_ecmmd_neighbor_indices_{pair_label}"] = np.asarray(
+            results_ecmmd_neighbor_indices_all[pair_label],
+            dtype=np.int64,
+        )
+        npz_dict[f"latent_ecmmd_neighbor_radii_{pair_label}"] = np.asarray(
+            results_ecmmd_neighbor_radii_all[pair_label],
+            dtype=np.float32,
+        )
+        npz_dict[f"latent_ecmmd_neighbor_distances_{pair_label}"] = np.asarray(
+            results_ecmmd_neighbor_distances_all[pair_label],
             dtype=np.float32,
         )
         npz_dict[f"latent_ecmmd_reference_support_indices_{pair_label}"] = np.asarray(
@@ -752,6 +869,10 @@ def main() -> None:
         )
         npz_dict[f"latent_ecmmd_reference_eig_rse_{pair_label}"] = np.asarray(
             results_ecmmd_reference_eig_rse_all[pair_label],
+            dtype=np.float32,
+        )
+        npz_dict[f"latent_ecmmd_local_scores_{pair_label}"] = np.asarray(
+            results_ecmmd_local_scores_all[pair_label],
             dtype=np.float32,
         )
 

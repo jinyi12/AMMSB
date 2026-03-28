@@ -55,7 +55,8 @@ TRACK_ORDER = {
 LOSS_ORDER = {
     "l2": 0,
     "ntk_scaled": 1,
-    "denoiser": 2,
+    "ntk_prior_balanced": 2,
+    "denoiser": 3,
 }
 
 
@@ -291,7 +292,7 @@ def _compute_effect_tables(
             summaries,
             decoder_type="film",
             optimizer=optimizer,
-            loss_type="ntk_scaled",
+            loss_type="ntk_prior_balanced",
             scale=effect_scale_scope,
             prior_flag=1,
             track=effect_baseline_scope,

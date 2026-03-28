@@ -697,7 +697,7 @@ def test_token_csp_conditional_main_writes_ecmmd_dashboard_artifacts(monkeypatch
             n_realizations=6,
             n_plot_conditions=5,
             plot_value_budget=64,
-            ecmmd_k_values="10,20,30",
+            ecmmd_k_values="20",
             ecmmd_bootstrap_reps=0,
             H_meso_list="1.0,1.25,1.5,2.0,2.5,3.0",
             H_macro=6.0,
@@ -709,7 +709,8 @@ def test_token_csp_conditional_main_writes_ecmmd_dashboard_artifacts(monkeypatch
     evaluate_csp_token_dit_conditional_module.main()
 
     manifest = json.loads((output_dir / "conditional_latent_manifest.json").read_text())
-    assert manifest["conditional_eval_mode"] == "adaptive_radius"
+    assert manifest["conditional_eval_mode"] == "chatterjee_knn"
+    assert manifest["conditional_pdf_figures"] == {}
     with np.load(output_dir / "conditional_latent_results.npz", allow_pickle=True) as data:
         pair_labels = [str(item) for item in data["pair_labels"].tolist()]
         assert set(manifest["conditional_ecmmd_figures"].keys()) == set(pair_labels)
@@ -719,7 +720,10 @@ def test_token_csp_conditional_main_writes_ecmmd_dashboard_artifacts(monkeypatch
             assert Path(figure_entry["detail"]["png"]).exists()
             assert f"latent_ecmmd_conditions_{pair_label}" in data.files
             assert f"latent_ecmmd_reference_{pair_label}" in data.files
+            assert f"latent_ecmmd_observed_reference_{pair_label}" in data.files
             assert f"latent_ecmmd_generated_{pair_label}" in data.files
+            assert f"latent_ecmmd_neighbor_indices_{pair_label}" in data.files
+            assert f"latent_ecmmd_neighbor_radii_{pair_label}" in data.files
             assert f"latent_ecmmd_reference_support_indices_{pair_label}" in data.files
             assert f"latent_ecmmd_reference_support_weights_{pair_label}" in data.files
             assert f"latent_ecmmd_reference_radius_{pair_label}" in data.files

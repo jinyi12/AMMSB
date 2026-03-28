@@ -16,6 +16,7 @@ from mmsfm.fae.fae_latent_utils import (
 )
 from scripts.fae.tran_evaluation.coarse_consistency import (
     evaluate_interval_coarse_consistency,
+    select_conditioned_qualitative_examples,
     summarize_conditioned_residuals,
 )
 from scripts.fae.tran_evaluation.conditional_support import make_pair_label
@@ -581,6 +582,7 @@ def evaluate_conditioned_interval_coarse_consistency_for_runtime(
 
     test_sample_indices = _select_condition_indices(runtime.latent_test, n_conditions=n_conditions, seed=seed)
     intervals: dict[str, Any] = {}
+    qualitative_examples: dict[str, Any] = {}
     t_count = int(runtime.latent_test.shape[0])
     for pair_idx in range(t_count - 1):
         tidx_fine = int(runtime.time_indices[pair_idx])
@@ -618,6 +620,16 @@ def evaluate_conditioned_interval_coarse_consistency_for_runtime(
             coarse_scale_idx=pair_idx + 1,
             relative_eps=relative_eps,
         )
+        qualitative = select_conditioned_qualitative_examples(
+            generated_fields,
+            condition_fields,
+            ladder=ladder,
+            coarse_scale_idx=pair_idx + 1,
+            relative_eps=relative_eps,
+        )
+        qualitative["test_sample_indices"] = test_sample_indices[
+            np.asarray(qualitative["condition_indices"], dtype=np.int64)
+        ].astype(np.int64)
         summary["pair_metadata"] = {
             "pair_label": pair_label,
             "display_label": display_label,
@@ -631,12 +643,14 @@ def evaluate_conditioned_interval_coarse_consistency_for_runtime(
             "provider": runtime.provider,
         }
         intervals[pair_label] = summary
+        qualitative_examples[pair_label] = qualitative
 
     return {
         "n_conditions": int(test_sample_indices.shape[0]),
         "n_realizations_per_condition": int(n_realizations),
         "test_sample_indices": test_sample_indices.astype(np.int64),
         "intervals": intervals,
+        "qualitative_examples": qualitative_examples,
     }
 
 
@@ -684,6 +698,15 @@ def evaluate_conditioned_global_coarse_return_for_runtime(
         coarse_targets,
         relative_eps=relative_eps,
     )
+    qualitative = select_conditioned_qualitative_examples(
+        finest_fields.reshape(rollout_knots.shape[0], rollout_knots.shape[1], -1),
+        coarse_targets,
+        filtered_fields=recoarsened,
+        relative_eps=relative_eps,
+    )
+    qualitative["test_sample_indices"] = test_sample_indices[
+        np.asarray(qualitative["condition_indices"], dtype=np.int64)
+    ].astype(np.int64)
     summary["n_conditions"] = int(test_sample_indices.shape[0])
     summary["n_realizations_per_condition"] = int(n_realizations)
     summary["test_sample_indices"] = test_sample_indices.astype(np.int64).tolist()
@@ -695,4 +718,7 @@ def evaluate_conditioned_global_coarse_return_for_runtime(
         "H_fine": float(full_h_schedule[fine_tidx]),
         "provider": runtime.provider,
     }
-    return summary
+    return {
+        "summary": summary,
+        "qualitative_examples": qualitative,
+    }

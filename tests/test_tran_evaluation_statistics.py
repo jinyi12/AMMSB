@@ -16,6 +16,7 @@ from scripts.fae.tran_evaluation.coarse_consistency import (
     evaluate_cache_global_coarse_return,
     evaluate_interval_coarse_consistency,
     evaluate_path_self_consistency,
+    select_conditioned_qualitative_examples,
     summarize_conditioned_residuals,
 )
 from scripts.fae.tran_evaluation.first_order import (
@@ -240,6 +241,48 @@ def test_interval_coarse_consistency_filters_generated_fields_before_scoring():
     np.testing.assert_allclose(summary["per_condition"]["total_sq"], np.array([2.0, 2.0], dtype=np.float32))
     np.testing.assert_allclose(summary["per_condition"]["bias_sq"], np.array([1.0, 1.0], dtype=np.float32))
     np.testing.assert_allclose(summary["per_condition"]["spread_sq"], np.array([1.0, 1.0], dtype=np.float32))
+
+
+def test_select_conditioned_qualitative_examples_picks_best_median_and_worst_draws():
+    generated = np.array(
+        [
+            [[1.0, 0.0], [2.0, 0.0], [4.0, 0.0]],
+            [[0.0, 1.0], [0.0, 3.0], [0.0, 5.0]],
+        ],
+        dtype=np.float32,
+    )
+    conditions = np.array(
+        [
+            [1.0, 0.0],
+            [0.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
+
+    qualitative = select_conditioned_qualitative_examples(
+        generated,
+        conditions,
+        filtered_fields=generated,
+        relative_eps=0.0,
+    )
+
+    assert qualitative["selection_labels"] == ["sample_1", "sample_2", "sample_3"]
+    np.testing.assert_array_equal(qualitative["condition_indices"], np.array([1, 1, 1], dtype=np.int64))
+    np.testing.assert_array_equal(qualitative["realization_indices"], np.array([0, 2, 1], dtype=np.int64))
+    np.testing.assert_allclose(qualitative["scores"], np.array([0.0, 16.0, 4.0], dtype=np.float32))
+    assert qualitative["selected_condition_diversity"] == 8.0
+    np.testing.assert_allclose(
+        qualitative["generated_fields"],
+        np.array([[0.0, 1.0], [0.0, 5.0], [0.0, 3.0]], dtype=np.float32),
+    )
+    np.testing.assert_allclose(
+        qualitative["coarsened_fields"],
+        np.array([[0.0, 1.0], [0.0, 5.0], [0.0, 3.0]], dtype=np.float32),
+    )
+    np.testing.assert_allclose(
+        qualitative["condition_fields"],
+        np.array([[0.0, 1.0], [0.0, 1.0], [0.0, 1.0]], dtype=np.float32),
+    )
 
 
 def test_cache_global_coarse_return_filters_fine_fields_before_grouped_scoring():

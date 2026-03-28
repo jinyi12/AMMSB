@@ -19,15 +19,14 @@ C_FILL = EASTERN_HUES[0]
 C_ACCENT = EASTERN_HUES[3]
 C_GRID = "#D8D2CA"
 C_TEXT = "#2A2621"
-CMAP_SCORE = "cividis"
-CMAP_WITNESS = "RdBu_r"
+CMAP_SCORE = "coolwarm"
 FONT_LABEL = 8
 FONT_TICK = 7
 FONT_TITLE = 8
 FONT_LEGEND = 7
-FIG_WIDTH = 7.0
-DETAIL_FIG_WIDTH = 9.4
-DETAIL_ROW_HEIGHT = 1.85
+FIG_WIDTH = 6.2
+OVERVIEW_FIG_HEIGHT = 3.9
+DETAIL_BLOCK_HEIGHT = 2.55
 
 
 def _save_fig(fig: plt.Figure, output_stem: Path, *, png_dpi: int = 180) -> dict[str, str]:
@@ -350,11 +349,19 @@ def select_representative_conditions(
     return np.asarray(selected[:target], dtype=np.int64), roles[:target]
 
 
-def _plot_density_axis(ax: plt.Axes, reference: np.ndarray, generated: np.ndarray, *, xlabel: str) -> None:
+def _plot_density_axis(
+    ax: plt.Axes,
+    reference: np.ndarray,
+    generated: np.ndarray,
+    *,
+    xlabel: str,
+    reference_label: str = "Empirical conditional",
+    generated_label: str = "Generated",
+) -> None:
     x, ref_y, gen_y = _density_curve(reference, generated)
-    ax.plot(x, ref_y, color=C_OBS, linewidth=1.4, label="Reference")
+    ax.plot(x, ref_y, color=C_OBS, linewidth=1.4, label=reference_label)
     ax.fill_between(x, ref_y, alpha=0.14, color=C_OBS)
-    ax.plot(x, gen_y, color=C_GEN, linewidth=1.4, label="Generated")
+    ax.plot(x, gen_y, color=C_GEN, linewidth=1.4, label=generated_label)
     ax.fill_between(x, gen_y, alpha=0.14, color=C_GEN)
     ax.set_xlabel(xlabel, fontsize=FONT_LABEL)
     ax.set_ylabel("Density", fontsize=FONT_LABEL)
@@ -362,6 +369,29 @@ def _plot_density_axis(ax: plt.Axes, reference: np.ndarray, generated: np.ndarra
     ax.tick_params(axis="both", labelsize=FONT_TICK)
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
+
+
+def _primary_ecmmd_branch(latent_ecmmd: dict[str, object]) -> dict[str, object] | None:
+    if (
+        isinstance(latent_ecmmd, dict)
+        and str(latent_ecmmd.get("graph_mode")) == "adaptive_radius"
+        and isinstance(latent_ecmmd.get("adaptive_radius"), dict)
+    ):
+        return {"label": "adaptive", "metrics": latent_ecmmd["adaptive_radius"].get("derandomized", {})}
+
+    k_values = latent_ecmmd.get("k_values", {}) if isinstance(latent_ecmmd, dict) else {}
+    if not isinstance(k_values, dict) or not k_values:
+        return None
+    preferred = latent_ecmmd.get("visualization_k_requested") if isinstance(latent_ecmmd, dict) else None
+    if preferred is not None and str(int(preferred)) in k_values:
+        key = str(int(preferred))
+    else:
+        key = sorted(k_values.keys(), key=lambda item: int(item))[0]
+    metrics = k_values[key]
+    return {
+        "label": f"k={int(metrics.get('k_effective', int(key)))}",
+        "metrics": metrics.get("derandomized", {}),
+    }
 
 
 def _plot_overview(
@@ -373,47 +403,53 @@ def _plot_overview(
     latent_ecmmd: dict[str, object],
     output_stem: Path,
 ) -> dict[str, str]:
-    fig, axes = plt.subplots(1, 3, figsize=(FIG_WIDTH, 2.8), gridspec_kw={"width_ratios": [0.9, 1.25, 0.95]})
-    score_norm = Normalize(
-        vmin=0.0,
-        vmax=max(float(np.max(local_scores)) if local_scores.size else 0.0, 1e-12),
-    )
+    fig = plt.figure(figsize=(FIG_WIDTH, OVERVIEW_FIG_HEIGHT))
+    grid = fig.add_gridspec(2, 2, height_ratios=[1.45, 1.0], wspace=0.34, hspace=0.34)
+    ax_scatter = fig.add_subplot(grid[0, :])
+    ax_dist = fig.add_subplot(grid[1, 0])
+    ax_metric = fig.add_subplot(grid[1, 1])
+
+    score_arr = np.asarray(local_scores, dtype=np.float64).reshape(-1)
+    vmin = float(np.min(score_arr)) if score_arr.size else -1.0
+    vmax = float(np.max(score_arr)) if score_arr.size else 1.0
+    if vmin < 0.0 < vmax:
+        score_norm = TwoSlopeNorm(vmin=vmin, vcenter=0.0, vmax=vmax)
+    else:
+        score_norm = Normalize(vmin=vmin, vmax=max(vmax, vmin + 1e-12))
     cmap = plt.get_cmap(CMAP_SCORE)
 
-    ax = axes[0]
-    if local_scores.size >= 2:
-        violin = ax.violinplot(local_scores, positions=[0.0], widths=0.72, showmeans=False, showextrema=False)
+    if score_arr.size >= 2:
+        violin = ax_dist.violinplot(score_arr, positions=[0.0], widths=0.72, showmeans=False, showextrema=False)
         for body in violin["bodies"]:
             body.set_facecolor(C_FILL)
             body.set_edgecolor("none")
             body.set_alpha(0.25)
     jitter_rng = np.random.default_rng(0)
-    x_jitter = jitter_rng.uniform(-0.10, 0.10, size=local_scores.shape[0]) if local_scores.size else np.asarray([])
-    point_colors = cmap(score_norm(local_scores)) if local_scores.size else None
-    ax.scatter(x_jitter, local_scores, s=16, c=point_colors, alpha=0.9, linewidths=0.0)
+    x_jitter = jitter_rng.uniform(-0.10, 0.10, size=score_arr.shape[0]) if score_arr.size else np.asarray([])
+    point_colors = cmap(score_norm(score_arr)) if score_arr.size else None
+    ax_dist.scatter(x_jitter, score_arr, s=16, c=point_colors, alpha=0.9, linewidths=0.0)
     if selected_rows.size > 0:
-        ax.scatter(
+        ax_dist.scatter(
             x_jitter[selected_rows],
-            local_scores[selected_rows],
+            score_arr[selected_rows],
             s=42,
             facecolors="none",
             edgecolors="black",
             linewidths=0.8,
         )
-    ax.set_xlim(-0.35, 0.35)
-    ax.set_xticks([0.0])
-    ax.set_xticklabels(["conditions"], fontsize=FONT_TICK)
-    ax.set_ylabel(r"Local MMD$^2$", fontsize=FONT_LABEL)
-    ax.grid(alpha=0.18, color=C_GRID, linewidth=0.6)
-    ax.tick_params(axis="y", labelsize=FONT_TICK)
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
+    ax_dist.set_xlim(-0.35, 0.35)
+    ax_dist.set_xticks([0.0])
+    ax_dist.set_xticklabels(["queries"], fontsize=FONT_TICK)
+    ax_dist.set_ylabel("Local score", fontsize=FONT_LABEL)
+    ax_dist.grid(alpha=0.18, color=C_GRID, linewidth=0.6)
+    ax_dist.tick_params(axis="y", labelsize=FONT_TICK)
+    ax_dist.spines["top"].set_visible(False)
+    ax_dist.spines["right"].set_visible(False)
 
-    ax = axes[1]
-    scatter = ax.scatter(
+    scatter = ax_scatter.scatter(
         condition_pca[:, 0],
         condition_pca[:, 1],
-        c=local_scores,
+        c=score_arr,
         cmap=CMAP_SCORE,
         norm=score_norm,
         s=24,
@@ -422,7 +458,7 @@ def _plot_overview(
         linewidths=0.35,
     )
     if selected_rows.size > 0:
-        ax.scatter(
+        ax_scatter.scatter(
             condition_pca[selected_rows, 0],
             condition_pca[selected_rows, 1],
             s=74,
@@ -431,7 +467,7 @@ def _plot_overview(
             linewidths=0.85,
         )
         for row, role in zip(selected_rows.tolist(), selected_roles, strict=True):
-            ax.text(
+            ax_scatter.text(
                 float(condition_pca[row, 0]),
                 float(condition_pca[row, 1]),
                 role[0].upper(),
@@ -440,61 +476,44 @@ def _plot_overview(
                 ha="center",
                 va="center",
             )
-    ax.set_xlabel("Condition PC1", fontsize=FONT_LABEL)
-    ax.set_ylabel("Condition PC2", fontsize=FONT_LABEL)
-    ax.grid(alpha=0.18, color=C_GRID, linewidth=0.6)
-    ax.tick_params(axis="both", labelsize=FONT_TICK)
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
-    cbar = fig.colorbar(scatter, ax=ax, pad=0.02)
-    cbar.set_label(r"Local MMD$^2$", fontsize=FONT_LABEL)
+    ax_scatter.set_xlabel("Condition PC1", fontsize=FONT_LABEL)
+    ax_scatter.set_ylabel("Condition PC2", fontsize=FONT_LABEL)
+    ax_scatter.grid(alpha=0.18, color=C_GRID, linewidth=0.6)
+    ax_scatter.tick_params(axis="both", labelsize=FONT_TICK)
+    ax_scatter.spines["top"].set_visible(False)
+    ax_scatter.spines["right"].set_visible(False)
+    cbar = fig.colorbar(scatter, ax=ax_scatter, pad=0.02)
+    cbar.set_label("Local score", fontsize=FONT_LABEL)
     cbar.ax.tick_params(labelsize=FONT_TICK)
 
-    ax = axes[2]
-    k_values = latent_ecmmd.get("k_values", {}) if isinstance(latent_ecmmd, dict) else {}
-    if (
-        isinstance(latent_ecmmd, dict)
-        and str(latent_ecmmd.get("graph_mode")) == "adaptive_radius"
-        and isinstance(latent_ecmmd.get("adaptive_radius"), dict)
-    ):
-        adaptive = latent_ecmmd["adaptive_radius"]
-        multi = adaptive.get("derandomized", {})
+    primary = _primary_ecmmd_branch(latent_ecmmd)
+    if primary is None:
+        ax_metric.text(0.5, 0.5, "ECMMD unavailable", transform=ax_metric.transAxes, ha="center", va="center", fontsize=FONT_TICK)
+        ax_metric.set_xticks([])
+        ax_metric.set_yticks([])
+    else:
+        multi = primary["metrics"]
         score = float(multi.get("score", np.nan))
-        ax.scatter([0.0], [score], color=C_ACCENT, s=28, zorder=3)
-        ax.hlines(score, -0.25, 0.25, color=C_ACCENT, linewidth=1.2, alpha=0.9)
+        ax_metric.scatter([0.0], [score], color=C_ACCENT, s=32, zorder=3)
+        ax_metric.hlines(score, -0.22, 0.22, color=C_ACCENT, linewidth=1.3, alpha=0.9)
         if "bootstrap_ci_lower" in multi and "bootstrap_ci_upper" in multi:
-            ax.vlines(
+            ax_metric.vlines(
                 0.0,
                 float(multi["bootstrap_ci_lower"]),
                 float(multi["bootstrap_ci_upper"]),
                 color=C_ACCENT,
                 linewidth=1.0,
             )
-        ax.set_xlim(-0.5, 0.5)
-        ax.set_xticks([0.0])
-        ax.set_xticklabels(["adaptive"])
-        ax.set_xlabel("Graph", fontsize=FONT_LABEL)
-    elif isinstance(k_values, dict) and k_values:
-        ks = []
-        scores = []
-        for k_key, k_metrics in sorted(k_values.items(), key=lambda item: int(item[0])):
-            ks.append(int(k_metrics.get("k_effective", int(k_key))))
-            derand = k_metrics.get("derandomized", {})
-            scores.append(float(derand.get("score", np.nan)))
-        ax.plot(ks, scores, color=C_ACCENT, linewidth=1.5, marker="o", markersize=4)
-        ax.scatter(ks, scores, color=C_ACCENT, s=18, zorder=3)
-        ax.set_xticks(ks)
-        ax.set_xlabel(r"$k$", fontsize=FONT_LABEL)
-    else:
-        ax.text(0.5, 0.5, "ECMMD unavailable", transform=ax.transAxes, ha="center", va="center", fontsize=FONT_TICK)
-        ax.set_xlabel(r"$k$", fontsize=FONT_LABEL)
-    ax.set_ylabel("ECMMD effect size", fontsize=FONT_LABEL)
-    ax.grid(alpha=0.18, color=C_GRID, linewidth=0.6)
-    ax.tick_params(axis="both", labelsize=FONT_TICK)
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
+        ax_metric.set_xlim(-0.45, 0.45)
+        ax_metric.set_xticks([0.0])
+        ax_metric.set_xticklabels([str(primary["label"])], fontsize=FONT_TICK)
+        ax_metric.set_ylabel("ECMMD effect size", fontsize=FONT_LABEL)
+        ax_metric.grid(alpha=0.18, color=C_GRID, linewidth=0.6)
+        ax_metric.tick_params(axis="y", labelsize=FONT_TICK)
+    ax_metric.spines["top"].set_visible(False)
+    ax_metric.spines["right"].set_visible(False)
 
-    fig.tight_layout()
+    fig.subplots_adjust(left=0.09, right=0.97, bottom=0.11, top=0.96)
     return _save_fig(fig, output_stem.with_name(output_stem.name + "_overview"))
 
 
@@ -504,9 +523,11 @@ def _plot_details(
     selected_rows: np.ndarray,
     selected_roles: list[str],
     condition_indices: np.ndarray,
-    reference_samples: np.ndarray,
+    condition_pca: np.ndarray,
+    neighborhood_indices: np.ndarray,
+    neighborhood_radii: np.ndarray,
+    observed_reference: np.ndarray,
     generated_samples: np.ndarray,
-    bandwidth: float,
     output_stem: Path,
 ) -> dict[str, str]:
     if selected_rows.size == 0:
@@ -515,66 +536,98 @@ def _plot_details(
         ax.axis("off")
         return _save_fig(fig, output_stem.with_name(output_stem.name + "_detail"))
 
-    row_payloads: list[dict[str, Any]] = []
-    witness_max = 1e-12
-    for row in selected_rows.tolist():
-        ref = np.asarray(reference_samples[row], dtype=np.float64)
-        gen = np.asarray(generated_samples[row], dtype=np.float64)
-        ref2, gen2, xs, ys, witness = witness_slice_on_pca_plane(ref, gen, bandwidth=bandwidth)
-        witness_max = max(witness_max, float(np.max(np.abs(witness))))
-        row_payloads.append(
-            {
-                "row": int(row),
-                "ref2": ref2,
-                "gen2": gen2,
-                "xs": xs,
-                "ys": ys,
-                "witness": witness,
-            }
+    cond_pca_arr = np.asarray(condition_pca, dtype=np.float64)
+    obs_arr = np.asarray(observed_reference, dtype=np.float64)
+    gen_arr = np.asarray(generated_samples, dtype=np.float64)
+    neighbor_idx_arr = np.asarray(neighborhood_indices, dtype=np.int64)
+    neighbor_radii_arr = np.asarray(neighborhood_radii, dtype=np.float64).reshape(-1)
+    fig = plt.figure(figsize=(FIG_WIDTH, max(2.7, DETAIL_BLOCK_HEIGHT * len(selected_rows))))
+    outer = fig.add_gridspec(len(selected_rows), 1, hspace=0.42)
+
+    all_x = cond_pca_arr[:, 0]
+    all_y = cond_pca_arr[:, 1]
+    x_pad_global = 0.08 * max(float(np.max(all_x) - np.min(all_x)), 1e-6)
+    y_pad_global = 0.08 * max(float(np.max(all_y) - np.min(all_y)), 1e-6)
+
+    for row_pos, (row_idx, role) in enumerate(zip(selected_rows.tolist(), selected_roles, strict=True)):
+        inner = outer[row_pos].subgridspec(2, 2, wspace=0.34, hspace=0.34)
+        ax_cond = fig.add_subplot(inner[0, 0])
+        ax_pca = fig.add_subplot(inner[0, 1])
+        ax_pc1 = fig.add_subplot(inner[1, 0])
+        ax_pc2 = fig.add_subplot(inner[1, 1])
+
+        support_idx = neighbor_idx_arr[row_idx]
+        support_idx = support_idx[support_idx >= 0]
+        edge_rows = np.concatenate(
+            [
+                np.asarray([row_idx], dtype=np.int64),
+                np.asarray(support_idx, dtype=np.int64),
+            ],
+            axis=0,
         )
+        edge_rows = np.unique(edge_rows.astype(np.int64))
+        support_ref = np.asarray(obs_arr[edge_rows], dtype=np.float64)
+        edge_gen = np.asarray(gen_arr[edge_rows], dtype=np.float64).reshape(-1, gen_arr.shape[-1])
+        query_obs = np.asarray(obs_arr[row_idx : row_idx + 1], dtype=np.float64)
+        query_gen_mean = np.asarray(gen_arr[row_idx], dtype=np.float64).mean(axis=0, keepdims=True)
+        pooled = np.concatenate([support_ref, edge_gen], axis=0)
+        center, basis = _pca_basis(pooled)
+        ref2 = _project(support_ref, center, basis)
+        gen2 = _project(edge_gen, center, basis)
+        query_obs2 = _project(query_obs, center, basis)
+        query_gen_mean2 = _project(query_gen_mean, center, basis)
 
-    fig, axes = plt.subplots(
-        len(row_payloads),
-        5,
-        figsize=(DETAIL_FIG_WIDTH, max(2.5, DETAIL_ROW_HEIGHT * len(row_payloads))),
-        squeeze=False,
-        gridspec_kw={"width_ratios": [1.05, 1.05, 0.9, 0.9, 0.075]},
-    )
-    witness_norm = TwoSlopeNorm(vmin=-witness_max, vcenter=0.0, vmax=witness_max)
-
-    for row_pos, (payload, role) in enumerate(zip(row_payloads, selected_roles, strict=True)):
-        row_idx = int(payload["row"])
-        ref2 = np.asarray(payload["ref2"], dtype=np.float64)
-        gen2 = np.asarray(payload["gen2"], dtype=np.float64)
-        xs = np.asarray(payload["xs"], dtype=np.float64)
-        ys = np.asarray(payload["ys"], dtype=np.float64)
-        witness = np.asarray(payload["witness"], dtype=np.float64)
-        all_proj = np.concatenate([ref2, gen2], axis=0)
-        x_min = float(np.min(all_proj[:, 0]))
-        x_max = float(np.max(all_proj[:, 0]))
-        y_min = float(np.min(all_proj[:, 1]))
-        y_max = float(np.max(all_proj[:, 1]))
-        x_pad = 0.08 * max(x_max - x_min, 1e-6)
-        y_pad = 0.08 * max(y_max - y_min, 1e-6)
-
-        ax0, ax1, ax2, ax3, cax = axes[row_pos]
-        ax0.scatter(ref2[:, 0], ref2[:, 1], s=10, alpha=0.55, color=C_OBS, linewidths=0.0, label="Reference")
-        ax0.scatter(gen2[:, 0], gen2[:, 1], s=10, alpha=0.55, color=C_GEN, linewidths=0.0, label="Generated")
-        ax0.set_xlim(x_min - x_pad, x_max + x_pad)
-        ax0.set_ylim(y_min - y_pad, y_max + y_pad)
-        ax0.set_xlabel("PC1", fontsize=FONT_LABEL)
-        ax0.set_ylabel("PC2", fontsize=FONT_LABEL)
-        ax0.grid(alpha=0.18, color=C_GRID, linewidth=0.6)
-        ax0.tick_params(axis="both", labelsize=FONT_TICK)
-        ax0.spines["top"].set_visible(False)
-        ax0.spines["right"].set_visible(False)
+        ax_cond.scatter(all_x, all_y, s=14, color="#BEB5AA", alpha=0.55, linewidths=0.0)
+        for nbr_idx in support_idx.tolist():
+            ax_cond.plot(
+                [cond_pca_arr[row_idx, 0], cond_pca_arr[int(nbr_idx), 0]],
+                [cond_pca_arr[row_idx, 1], cond_pca_arr[int(nbr_idx), 1]],
+                color=C_GRID,
+                alpha=0.48,
+                linewidth=0.65,
+                zorder=1,
+            )
+        ax_cond.scatter(
+            cond_pca_arr[edge_rows, 0],
+            cond_pca_arr[edge_rows, 1],
+            s=28,
+            color=C_FILL,
+            alpha=0.92,
+            linewidths=0.0,
+            label="Edge star",
+        )
+        ax_cond.scatter(
+            cond_pca_arr[row_idx, 0],
+            cond_pca_arr[row_idx, 1],
+            s=66,
+            facecolors="none",
+            edgecolors="black",
+            linewidths=1.0,
+            label="Query",
+        )
+        ax_cond.scatter(
+            cond_pca_arr[row_idx, 0],
+            cond_pca_arr[row_idx, 1],
+            s=16,
+            color="black",
+            linewidths=0.0,
+        )
+        ax_cond.set_xlim(float(np.min(all_x) - x_pad_global), float(np.max(all_x) + x_pad_global))
+        ax_cond.set_ylim(float(np.min(all_y) - y_pad_global), float(np.max(all_y) + y_pad_global))
+        ax_cond.set_xlabel("Condition PC1", fontsize=FONT_LABEL)
+        ax_cond.set_ylabel("Condition PC2", fontsize=FONT_LABEL)
+        ax_cond.grid(alpha=0.18, color=C_GRID, linewidth=0.6)
+        ax_cond.tick_params(axis="both", labelsize=FONT_TICK)
+        ax_cond.spines["top"].set_visible(False)
+        ax_cond.spines["right"].set_visible(False)
         if row_pos == 0:
-            ax0.legend(loc="upper right", frameon=False, fontsize=FONT_LEGEND)
-        ax0.text(
+            ax_cond.legend(loc="upper right", frameon=False, fontsize=FONT_LEGEND)
+        ax_cond.text(
             0.02,
             0.98,
-            f"{role}\nidx={int(condition_indices[row_idx])}\nMMD$^2$={float(local_scores[row_idx]):.2e}",
-            transform=ax0.transAxes,
+            f"{role}\nidx={int(condition_indices[row_idx])}\nscore={float(local_scores[row_idx]):.2e}\n"
+            f"k={int(support_idx.shape[0])}\nedge nodes={int(edge_rows.shape[0])}\nr={float(neighbor_radii_arr[row_idx]):.2f}",
+            transform=ax_cond.transAxes,
             ha="left",
             va="top",
             fontsize=FONT_TICK,
@@ -582,32 +635,55 @@ def _plot_details(
             bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.92, "pad": 1.8},
         )
 
-        im = ax1.imshow(
-            witness,
-            origin="lower",
-            aspect="auto",
-            extent=[xs[0], xs[-1], ys[0], ys[-1]],
-            cmap=CMAP_WITNESS,
-            norm=witness_norm,
+        ax_pca.scatter(ref2[:, 0], ref2[:, 1], s=28, alpha=0.82, color=C_OBS, linewidths=0.0, label="Observed edge nodes")
+        ax_pca.scatter(gen2[:, 0], gen2[:, 1], s=9, alpha=0.42, color=C_GEN, linewidths=0.0, label="Generated edge draws")
+        ax_pca.scatter(
+            query_obs2[:, 0],
+            query_obs2[:, 1],
+            s=52,
+            facecolors="none",
+            edgecolors=C_OBS,
+            linewidths=1.0,
+            zorder=4,
         )
-        ax1.scatter(ref2[:, 0], ref2[:, 1], s=3, alpha=0.20, color=C_OBS, linewidths=0.0)
-        ax1.scatter(gen2[:, 0], gen2[:, 1], s=3, alpha=0.20, color=C_GEN, linewidths=0.0)
-        ax1.set_xlabel("PC1", fontsize=FONT_LABEL)
-        ax1.set_ylabel("PC2", fontsize=FONT_LABEL)
-        ax1.tick_params(axis="both", labelsize=FONT_TICK)
-        ax1.spines["top"].set_visible(False)
-        ax1.spines["right"].set_visible(False)
-
-        _plot_density_axis(ax2, ref2[:, 0], gen2[:, 0], xlabel="PC1")
-        _plot_density_axis(ax3, ref2[:, 1], gen2[:, 1], xlabel="PC2")
+        ax_pca.scatter(
+            query_gen_mean2[:, 0],
+            query_gen_mean2[:, 1],
+            s=44,
+            facecolors="none",
+            edgecolors=C_GEN,
+            linewidths=1.0,
+            zorder=4,
+        )
+        ax_pca.set_xlabel("Fine PC1", fontsize=FONT_LABEL)
+        ax_pca.set_ylabel("Fine PC2", fontsize=FONT_LABEL)
+        ax_pca.grid(alpha=0.18, color=C_GRID, linewidth=0.6)
+        ax_pca.tick_params(axis="both", labelsize=FONT_TICK)
+        ax_pca.spines["top"].set_visible(False)
+        ax_pca.spines["right"].set_visible(False)
         if row_pos == 0:
-            ax2.legend(loc="upper right", frameon=False, fontsize=FONT_LEGEND)
-        cbar = fig.colorbar(im, cax=cax)
-        if row_pos == 0:
-            cbar.set_label("Witness", fontsize=FONT_LABEL)
-        cbar.ax.tick_params(labelsize=FONT_TICK)
+            ax_pca.legend(loc="upper right", frameon=False, fontsize=FONT_LEGEND)
 
-    fig.subplots_adjust(left=0.07, right=0.97, bottom=0.08, top=0.98, wspace=0.32, hspace=0.32)
+        _plot_density_axis(
+            ax_pc1,
+            ref2[:, 0],
+            gen2[:, 0],
+            xlabel="Fine PC1",
+            reference_label="Observed edge nodes",
+            generated_label="Generated edge draws",
+        )
+        _plot_density_axis(
+            ax_pc2,
+            ref2[:, 1],
+            gen2[:, 1],
+            xlabel="Fine PC2",
+            reference_label="Observed edge nodes",
+            generated_label="Generated edge draws",
+        )
+        if row_pos == 0:
+            ax_pc1.legend(loc="upper right", frameon=False, fontsize=FONT_LEGEND)
+
+    fig.subplots_adjust(left=0.09, right=0.98, bottom=0.06, top=0.98)
     return _save_fig(fig, output_stem.with_name(output_stem.name + "_detail"))
 
 
@@ -616,8 +692,11 @@ def plot_conditioned_ecmmd_dashboard(
     pair_label: str,
     display_label: str,
     conditions: np.ndarray,
-    reference_samples: np.ndarray,
+    observed_reference: np.ndarray,
     generated_samples: np.ndarray,
+    local_scores: np.ndarray,
+    neighborhood_indices: np.ndarray,
+    neighborhood_radii: np.ndarray,
     latent_ecmmd: dict[str, object],
     output_stem: Path,
     n_plot_conditions: int = 5,
@@ -628,27 +707,39 @@ def plot_conditioned_ecmmd_dashboard(
     format_for_paper()
 
     cond = np.asarray(conditions, dtype=np.float64)
-    ref = np.asarray(reference_samples, dtype=np.float64)
+    obs = np.asarray(observed_reference, dtype=np.float64)
     gen = np.asarray(generated_samples, dtype=np.float64)
+    local_score_arr = np.asarray(local_scores, dtype=np.float64).reshape(-1)
+    neighbor_idx_arr = np.asarray(neighborhood_indices, dtype=np.int64)
+    neighbor_radii_arr = np.asarray(neighborhood_radii, dtype=np.float64).reshape(-1)
     if cond.ndim != 2:
         raise ValueError(f"conditions must have shape [M, D], got {cond.shape}.")
-    if ref.shape != gen.shape or ref.ndim != 3:
-        raise ValueError(f"reference_samples and generated_samples must match [M, R, D], got {ref.shape} and {gen.shape}.")
-    if ref.shape[0] != cond.shape[0]:
+    if obs.ndim != 2 or obs.shape[0] != cond.shape[0]:
         raise ValueError(
-            "conditions, reference_samples, and generated_samples must agree in their first dimension, "
-            f"got {cond.shape[0]}, {ref.shape[0]}, and {gen.shape[0]}."
+            "observed_reference must have shape [M, D] aligned with conditions, "
+            f"got {obs.shape} and {cond.shape}."
+        )
+    if gen.ndim != 3 or gen.shape[0] != cond.shape[0]:
+        raise ValueError(
+            "generated_samples must have shape [M, R, D] aligned with conditions, "
+            f"got {gen.shape} and {cond.shape}."
+        )
+    if local_score_arr.shape[0] != cond.shape[0]:
+        raise ValueError(f"local_scores must align with conditions, got {local_score_arr.shape[0]} and {cond.shape[0]}.")
+    if neighbor_idx_arr.ndim != 2 or neighbor_idx_arr.shape[0] != cond.shape[0]:
+        raise ValueError(
+            "neighborhood_indices must have shape [M, k] aligned with conditions, "
+            f"got {neighbor_idx_arr.shape} and {cond.shape}."
+        )
+    if neighbor_radii_arr.shape[0] != cond.shape[0]:
+        raise ValueError(
+            f"neighborhood_radii must align with conditions, got {neighbor_radii_arr.shape[0]} and {cond.shape[0]}."
         )
 
-    local_scores, bandwidth = local_mmd_scores(
-        ref,
-        gen,
-        bandwidth=float(latent_ecmmd["bandwidth"]) if "bandwidth" in latent_ecmmd else None,
-    )
     cond_center, cond_basis = _pca_basis(_standardize_columns(cond))
     condition_pca = _project(_standardize_columns(cond), cond_center, cond_basis)
     selected_rows, selected_roles = select_representative_conditions(
-        local_scores=local_scores,
+        local_scores=local_score_arr,
         condition_pca=condition_pca,
         n_show=int(n_plot_conditions),
         seed=int(seed),
@@ -664,7 +755,7 @@ def plot_conditioned_ecmmd_dashboard(
             )
 
     overview_paths = _plot_overview(
-        local_scores=local_scores,
+        local_scores=local_score_arr,
         condition_pca=condition_pca,
         selected_rows=selected_rows,
         selected_roles=selected_roles,
@@ -672,19 +763,21 @@ def plot_conditioned_ecmmd_dashboard(
         output_stem=output_stem,
     )
     detail_paths = _plot_details(
-        local_scores=local_scores,
+        local_scores=local_score_arr,
         selected_rows=selected_rows,
         selected_roles=selected_roles,
         condition_indices=condition_index_arr,
-        reference_samples=ref,
+        condition_pca=condition_pca,
+        neighborhood_indices=neighbor_idx_arr,
+        neighborhood_radii=neighbor_radii_arr,
+        observed_reference=obs,
         generated_samples=gen,
-        bandwidth=bandwidth,
         output_stem=output_stem,
     )
 
     return {
-        "bandwidth_used": float(bandwidth),
-        "local_scores": local_scores.astype(np.float32),
+        "bandwidth_used": float(latent_ecmmd["bandwidth"]) if "bandwidth" in latent_ecmmd else float("nan"),
+        "local_scores": local_score_arr.astype(np.float32),
         "selected_condition_rows": selected_rows.astype(np.int64),
         "selected_condition_roles": list(selected_roles),
         "overview_figure": overview_paths,

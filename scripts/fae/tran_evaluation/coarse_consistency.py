@@ -308,6 +308,100 @@ def evaluate_interval_coarse_consistency(
     return summary
 
 
+def select_conditioned_qualitative_examples(
+    generated_fields: NDArray[np.floating],
+    condition_fields: NDArray[np.floating],
+    *,
+    relative_eps: float = 1e-8,
+    filtered_fields: NDArray[np.floating] | None = None,
+    ladder: FilterLadder | None = None,
+    coarse_scale_idx: int | None = None,
+) -> dict[str, Any]:
+    generated = _validate_generated_fields(generated_fields)
+    cond = _validate_condition_fields(condition_fields)
+    if generated.shape[0] != cond.shape[0] or generated.shape[2:] != cond.shape[1:]:
+        raise ValueError(
+            "generated_fields and condition_fields must have shapes (M, L, ...) and (M, ...); "
+            f"got {generated.shape} and {cond.shape}."
+        )
+
+    if filtered_fields is None:
+        if ladder is None or coarse_scale_idx is None:
+            raise ValueError("Need ladder and coarse_scale_idx when filtered_fields is not provided.")
+        filtered = ladder.filter_at_scale(
+            generated.reshape(generated.shape[0] * generated.shape[1], -1),
+            int(coarse_scale_idx),
+        ).reshape(generated.shape)
+    else:
+        filtered = _validate_generated_fields(filtered_fields)
+        if filtered.shape != generated.shape:
+            raise ValueError(
+                "filtered_fields must match generated_fields exactly, "
+                f"got {filtered.shape} and {generated.shape}."
+            )
+
+    residual = filtered - cond[:, None, ...]
+    per_realization_sq = _sum_field_squares(residual, start_axis=2)
+    target_sq = _sum_field_squares(cond, start_axis=1)
+    per_realization_rel = per_realization_sq / np.maximum(target_sq[:, None], float(relative_eps))
+    if per_realization_rel.size == 0:
+        raise ValueError("Need at least one conditioned realization for qualitative selection.")
+
+    flat_generated = generated.reshape(generated.shape[0], generated.shape[1], -1)
+    condition_diversity = np.zeros(generated.shape[0], dtype=np.float64)
+    for condition_idx in range(generated.shape[0]):
+        draws = flat_generated[condition_idx]
+        if draws.shape[0] <= 1:
+            continue
+        sq_norm = np.sum(np.square(draws, dtype=np.float64), axis=1, dtype=np.float64)
+        pairwise = np.maximum(
+            sq_norm[:, None] + sq_norm[None, :] - 2.0 * (draws @ draws.T),
+            0.0,
+        )
+        upper = pairwise[np.triu_indices(pairwise.shape[0], k=1)]
+        condition_diversity[condition_idx] = float(np.mean(upper)) if upper.size else 0.0
+
+    selected_condition_index = int(np.argmax(condition_diversity))
+    selected_draws = flat_generated[selected_condition_index]
+    selected_scores = per_realization_rel[selected_condition_index]
+
+    if selected_draws.shape[0] == 1:
+        realization_indices = np.zeros(3, dtype=np.int64)
+    else:
+        mean_draw = np.mean(selected_draws, axis=0, dtype=np.float64)
+        dist_to_mean = np.sum(np.square(selected_draws - mean_draw[None, :]), axis=1, dtype=np.float64)
+        first = int(np.argmax(dist_to_mean))
+
+        sq_norm = np.sum(np.square(selected_draws, dtype=np.float64), axis=1, dtype=np.float64)
+        pairwise = np.maximum(
+            sq_norm[:, None] + sq_norm[None, :] - 2.0 * (selected_draws @ selected_draws.T),
+            0.0,
+        )
+        second = int(np.argmax(pairwise[first]))
+        if selected_draws.shape[0] <= 2:
+            third = second
+        else:
+            min_dist = np.minimum(pairwise[first], pairwise[second])
+            min_dist[[first, second]] = -np.inf
+            third = int(np.argmax(min_dist))
+        realization_indices = np.asarray([first, second, third], dtype=np.int64)
+
+    condition_indices = np.full(realization_indices.shape, selected_condition_index, dtype=np.int64)
+
+    return {
+        "score_name": "total_rel",
+        "score_label": "relative coarse defect",
+        "selection_labels": ["sample_1", "sample_2", "sample_3"],
+        "scores": selected_scores[realization_indices].astype(np.float32),
+        "selected_condition_diversity": float(condition_diversity[selected_condition_index]),
+        "condition_indices": condition_indices,
+        "realization_indices": realization_indices,
+        "generated_fields": generated[condition_indices, realization_indices].astype(np.float32),
+        "coarsened_fields": filtered[condition_indices, realization_indices].astype(np.float32),
+        "condition_fields": cond[condition_indices].astype(np.float32),
+    }
+
+
 def evaluate_cache_global_coarse_return(
     finest_fields: NDArray[np.floating],
     coarse_targets: NDArray[np.floating],

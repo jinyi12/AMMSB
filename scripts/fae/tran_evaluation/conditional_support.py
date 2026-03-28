@@ -8,9 +8,10 @@ from scipy.spatial.distance import cdist
 from scipy.stats import wasserstein_distance as _w1_1d
 
 
-ConditionEvalMode = Literal["fixed_knn", "adaptive_radius"]
+ConditionEvalMode = Literal["chatterjee_knn", "adaptive_radius"]
 DEFAULT_CONDITIONAL_EVAL_MODE: ConditionEvalMode = "adaptive_radius"
-LEGACY_CONDITIONAL_EVAL_MODE: ConditionEvalMode = "fixed_knn"
+CHATTERJEE_CONDITIONAL_EVAL_MODE: ConditionEvalMode = "chatterjee_knn"
+LEGACY_CONDITIONAL_EVAL_MODE: ConditionEvalMode = CHATTERJEE_CONDITIONAL_EVAL_MODE
 
 
 @dataclass(frozen=True)
@@ -35,10 +36,10 @@ class AdaptiveReferenceConfig:
 
 def validate_conditional_eval_mode(condition_mode: str | None) -> ConditionEvalMode:
     mode = str(DEFAULT_CONDITIONAL_EVAL_MODE if condition_mode in (None, "") else condition_mode)
-    if mode not in {LEGACY_CONDITIONAL_EVAL_MODE, DEFAULT_CONDITIONAL_EVAL_MODE}:
+    if mode not in {CHATTERJEE_CONDITIONAL_EVAL_MODE, DEFAULT_CONDITIONAL_EVAL_MODE}:
         raise ValueError(
             f"conditional_eval_mode must be one of "
-            f"{(LEGACY_CONDITIONAL_EVAL_MODE, DEFAULT_CONDITIONAL_EVAL_MODE)}, got {condition_mode!r}."
+            f"{(CHATTERJEE_CONDITIONAL_EVAL_MODE, DEFAULT_CONDITIONAL_EVAL_MODE)}, got {condition_mode!r}."
         )
     return cast(ConditionEvalMode, mode)
 
@@ -376,7 +377,7 @@ def build_local_reference_spec(
     corpus_conditions: np.ndarray,
     corpus_targets: np.ndarray | None = None,
     exclude_index: int | None = None,
-    conditional_eval_mode: str = LEGACY_CONDITIONAL_EVAL_MODE,
+    conditional_eval_mode: str = CHATTERJEE_CONDITIONAL_EVAL_MODE,
     k_neighbors: int = 200,
     condition_metric: ConditionMetric | None = None,
     corpus_conditions_transformed: np.ndarray | None = None,
@@ -394,7 +395,7 @@ def build_local_reference_spec(
             f"query and corpus_conditions must agree on feature dimension, got {query_arr.shape} and {corpus.shape}."
         )
 
-    if mode == LEGACY_CONDITIONAL_EVAL_MODE:
+    if mode == CHATTERJEE_CONDITIONAL_EVAL_MODE:
         knn_idx, knn_weights = knn_gaussian_weights(
             query_arr,
             corpus,
@@ -403,7 +404,7 @@ def build_local_reference_spec(
         )
         radius = float(np.max(np.linalg.norm(corpus[knn_idx] - query_arr[None, :], axis=1))) if knn_idx.size else float("nan")
         return {
-            "mode": LEGACY_CONDITIONAL_EVAL_MODE,
+            "mode": CHATTERJEE_CONDITIONAL_EVAL_MODE,
             "candidate_indices": np.asarray(knn_idx, dtype=np.int64),
             "candidate_weights": np.asarray(knn_weights, dtype=np.float64),
             "radius": radius,
@@ -543,7 +544,7 @@ def build_local_reference_samples(
     k_neighbors: int,
     n_realizations: int,
     rng: np.random.Generator,
-    conditional_eval_mode: str = LEGACY_CONDITIONAL_EVAL_MODE,
+    conditional_eval_mode: str = CHATTERJEE_CONDITIONAL_EVAL_MODE,
     condition_metric: ConditionMetric | None = None,
     corpus_conditions_transformed: np.ndarray | None = None,
     adaptive_config: AdaptiveReferenceConfig | None = None,
@@ -581,6 +582,46 @@ def build_local_reference_samples(
         )
 
     return np.stack(ref_samples, axis=0), sampling_specs
+
+
+def build_uniform_sampling_specs_from_neighbors(
+    neighbor_indices: np.ndarray,
+    *,
+    neighbor_radii: np.ndarray | None = None,
+    mode: str = CHATTERJEE_CONDITIONAL_EVAL_MODE,
+    metric_retained_dim: int = 0,
+    metric_explained_variance: float = 1.0,
+) -> list[dict[str, object]]:
+    neighbor_idx_arr = np.asarray(neighbor_indices, dtype=np.int64)
+    if neighbor_idx_arr.ndim != 2:
+        raise ValueError(f"neighbor_indices must have shape (n_eval, k), got {neighbor_idx_arr.shape}.")
+    radii_arr = None if neighbor_radii is None else np.asarray(neighbor_radii, dtype=np.float64).reshape(-1)
+    if radii_arr is not None and radii_arr.shape[0] != neighbor_idx_arr.shape[0]:
+        raise ValueError(
+            f"neighbor_radii must have length {neighbor_idx_arr.shape[0]}, got {radii_arr.shape[0]}."
+        )
+
+    specs: list[dict[str, object]] = []
+    for row in range(neighbor_idx_arr.shape[0]):
+        candidate_indices = np.asarray(neighbor_idx_arr[row], dtype=np.int64)
+        candidate_weights = np.ones((candidate_indices.shape[0],), dtype=np.float64)
+        candidate_weights = normalise_weights(candidate_weights, candidate_indices.shape[0])
+        specs.append(
+            {
+                "mode": str(mode),
+                "candidate_indices": candidate_indices,
+                "candidate_weights": candidate_weights,
+                "radius": float("nan") if radii_arr is None else float(radii_arr[row]),
+                "ess": float(candidate_indices.shape[0]),
+                "support_size": int(candidate_indices.shape[0]),
+                "metric_retained_dim": int(metric_retained_dim),
+                "metric_explained_variance": float(metric_explained_variance),
+                "mean_rse": float("nan"),
+                "eig_rse": np.asarray([np.nan, np.nan], dtype=np.float64),
+                "passed_stability": True,
+            }
+        )
+    return specs
 
 
 def pack_reference_support_arrays(

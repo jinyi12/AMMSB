@@ -37,8 +37,8 @@ def test_effect_tables_compute_metric_improvements_with_sign_conventions():
             "hessian_frob_p99_mean_over_time": 80.0,
         },
         {
-            "matrix_cell_id": "film|adam|ntk_scaled|multi_1248|prior1",
-            "decoder_type": "film", "optimizer": "adam", "loss_type": "ntk_scaled",
+            "matrix_cell_id": "film|adam|ntk_prior_balanced|multi_1248|prior1",
+            "decoder_type": "film", "optimizer": "adam", "loss_type": "ntk_prior_balanced",
             "scale": "multi_1248", "prior_flag": 1, "track": "deterministic_primary",
             "trace_g_mean_over_time": 12.5,
             "effective_rank_mean_over_time": 4.2,

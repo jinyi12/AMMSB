@@ -292,14 +292,31 @@ def test_plot_latent_trajectory_summary_records_condition_level_conditional_pane
 
     conditional_dir = run_dir / "eval" / "conditional" / "latent"
     conditional_dir.mkdir(parents=True)
+    (conditional_dir / "conditional_latent_manifest.json").write_text(
+        json.dumps({"corpus_latents_path": str(latents_path)})
+    )
     np.savez_compressed(
         conditional_dir / "conditional_latent_results.npz",
         pair_labels=np.asarray(["pair_H3_to_H1", "pair_H4_to_H3"], dtype=object),
+        corpus_eval_indices=np.asarray([0, 1, 2, 3], dtype=np.int64),
+        time_indices=np.asarray([1, 3, 4], dtype=np.int64),
         test_sample_indices=np.asarray([0, 1, 2, 3], dtype=np.int64),
         latent_w2_pair_H3_to_H1=np.asarray([0.10, 0.80, 0.50, 0.20], dtype=np.float32),
         latent_w2_pair_H4_to_H3=np.asarray([0.40, 0.20, 0.90, 0.70], dtype=np.float32),
         latent_ecmmd_generated_pair_H3_to_H1=np.zeros((2, 5, 3), dtype=np.float32),
         latent_ecmmd_generated_pair_H4_to_H3=np.zeros((2, 5, 3), dtype=np.float32),
+        latent_ecmmd_neighbor_indices_pair_H3_to_H1=np.asarray(
+            [[1, 2, 3], [0, 2, 3], [1, 0, 3], [2, 1, 0]],
+            dtype=np.int64,
+        ),
+        latent_ecmmd_neighbor_indices_pair_H4_to_H3=np.asarray(
+            [[1, 2, 3], [0, 2, 3], [1, 0, 3], [2, 1, 0]],
+            dtype=np.int64,
+        ),
+        latent_ecmmd_selected_rows_pair_H3_to_H1=np.asarray([1, 2], dtype=np.int64),
+        latent_ecmmd_selected_rows_pair_H4_to_H3=np.asarray([2, 3], dtype=np.int64),
+        latent_ecmmd_selected_roles_pair_H3_to_H1=np.asarray(["best", "worst"], dtype=object),
+        latent_ecmmd_selected_roles_pair_H4_to_H3=np.asarray(["best", "worst"], dtype=object),
     )
 
     fake_runtime = SimpleNamespace(
@@ -345,6 +362,13 @@ def test_plot_latent_trajectory_summary_records_condition_level_conditional_pane
     assert first_condition["n_generated_trajectories"] == 5
     assert first_condition["n_reference_trajectories"] == 5
     assert len(first_condition["reference_neighbor_indices"]) == 3
+    ecmmd_manifest = summary["ecmmd_conditional_trajectory_manifest"]
+    assert Path(ecmmd_manifest["figure_paths"]["png"]).exists()
+    assert Path(ecmmd_manifest["figure_paths"]["pdf"]).exists()
+    first_ecmmd = ecmmd_manifest["pairs"][0]["selected_conditions"][0]
+    assert first_ecmmd["condition_row"] == 1
+    assert first_ecmmd["reference_mean_mode"] == "uniform_edge_mean_path"
+    assert len(first_ecmmd["edge_condition_rows"]) == 4
 
 
 def test_plot_latent_trajectory_summary_finds_conditional_results_next_to_cache(monkeypatch, tmp_path):
@@ -385,12 +409,23 @@ def test_plot_latent_trajectory_summary_finds_conditional_results_next_to_cache(
 
     conditional_dir = eval_dir / "conditional" / "latent"
     conditional_dir.mkdir(parents=True)
+    (conditional_dir / "conditional_latent_manifest.json").write_text(
+        json.dumps({"corpus_latents_path": str(latents_path)})
+    )
     np.savez_compressed(
         conditional_dir / "conditional_latent_results.npz",
         pair_labels=np.asarray(["pair_H3_to_H1"], dtype=object),
+        corpus_eval_indices=np.asarray([0, 1, 2, 3], dtype=np.int64),
+        time_indices=np.asarray([1, 3, 4], dtype=np.int64),
         test_sample_indices=np.asarray([0, 1, 2, 3], dtype=np.int64),
         latent_w2_pair_H3_to_H1=np.asarray([0.25, 0.75, 0.45, 0.15], dtype=np.float32),
         latent_ecmmd_generated_pair_H3_to_H1=np.zeros((2, 4, 3), dtype=np.float32),
+        latent_ecmmd_neighbor_indices_pair_H3_to_H1=np.asarray(
+            [[1, 2, 3], [0, 2, 3], [1, 0, 3], [2, 1, 0]],
+            dtype=np.int64,
+        ),
+        latent_ecmmd_selected_rows_pair_H3_to_H1=np.asarray([1], dtype=np.int64),
+        latent_ecmmd_selected_roles_pair_H3_to_H1=np.asarray(["best"], dtype=object),
     )
 
     fake_runtime = SimpleNamespace(
@@ -431,6 +466,9 @@ def test_plot_latent_trajectory_summary_finds_conditional_results_next_to_cache(
     assert Path(conditional_manifest["figure_paths"]["png"]).exists()
     assert len(conditional_manifest["pairs"]) == 1
     assert conditional_manifest["pairs"][0]["selected_conditions"][0]["test_index"] == 1
+    ecmmd_manifest = summary["ecmmd_conditional_trajectory_manifest"]
+    assert Path(ecmmd_manifest["figure_paths"]["png"]).exists()
+    assert ecmmd_manifest["pairs"][0]["selected_conditions"][0]["condition_index"] == 1
 
 
 def test_build_latent_archive_from_fae_supports_transformer_token_autoencoder(tmp_path):
@@ -909,7 +947,7 @@ def test_csp_conditional_main_writes_ecmmd_dashboard_artifacts(monkeypatch, tmp_
             n_realizations=6,
             n_plot_conditions=5,
             plot_value_budget=64,
-            ecmmd_k_values="10,20,30",
+            ecmmd_k_values="20",
             ecmmd_bootstrap_reps=0,
             H_meso_list="1.0,1.25,1.5,2.0,2.5,3.0",
             H_macro=6.0,
@@ -921,7 +959,8 @@ def test_csp_conditional_main_writes_ecmmd_dashboard_artifacts(monkeypatch, tmp_
     evaluate_csp_conditional_module.main()
 
     manifest = json.loads((output_dir / "conditional_latent_manifest.json").read_text())
-    assert manifest["conditional_eval_mode"] == "adaptive_radius"
+    assert manifest["conditional_eval_mode"] == "chatterjee_knn"
+    assert manifest["conditional_pdf_figures"] == {}
     with np.load(output_dir / "conditional_latent_results.npz", allow_pickle=True) as data:
         pair_labels = [str(item) for item in data["pair_labels"].tolist()]
         assert set(manifest["conditional_ecmmd_figures"].keys()) == set(pair_labels)
@@ -931,7 +970,10 @@ def test_csp_conditional_main_writes_ecmmd_dashboard_artifacts(monkeypatch, tmp_
             assert Path(figure_entry["detail"]["png"]).exists()
             assert f"latent_ecmmd_conditions_{pair_label}" in data.files
             assert f"latent_ecmmd_reference_{pair_label}" in data.files
+            assert f"latent_ecmmd_observed_reference_{pair_label}" in data.files
             assert f"latent_ecmmd_generated_{pair_label}" in data.files
+            assert f"latent_ecmmd_neighbor_indices_{pair_label}" in data.files
+            assert f"latent_ecmmd_neighbor_radii_{pair_label}" in data.files
             assert f"latent_ecmmd_reference_support_indices_{pair_label}" in data.files
             assert f"latent_ecmmd_reference_support_weights_{pair_label}" in data.files
             assert f"latent_ecmmd_reference_radius_{pair_label}" in data.files

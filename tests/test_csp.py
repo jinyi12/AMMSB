@@ -681,21 +681,29 @@ def test_plot_conditioned_ecmmd_dashboard_writes_figures_and_selects_roles(tmp_p
         axis=1,
     ).astype(np.float32)
 
-    reference_samples = []
+    observed_reference = []
     generated_samples = []
     for idx in range(n_conditions):
-        base = rng.normal(scale=0.35, size=(n_realizations, latent_dim)).astype(np.float32)
-        reference_samples.append(base)
+        base = rng.normal(scale=0.35, size=(n_realizations, latent_dim)).astype(np.float32) + conditions[idx][None, :]
+        observed_reference.append(base[0])
         generated_shift = np.asarray([0.12 * idx, 0.0, 0.0, 0.0], dtype=np.float32)
         generated_samples.append(base + generated_shift[None, :])
-    reference_arr = np.stack(reference_samples, axis=0)
+    observed_reference_arr = np.stack(observed_reference, axis=0)
     generated_arr = np.stack(generated_samples, axis=0)
+    local_scores = np.linspace(-0.2, 0.5, n_conditions, dtype=np.float32)
+    neighborhood_indices = np.stack(
+        [
+            np.asarray([(idx + 1) % n_conditions, (idx + 2) % n_conditions, (idx + 3) % n_conditions], dtype=np.int64)
+            for idx in range(n_conditions)
+        ],
+        axis=0,
+    )
+    neighborhood_radii = np.linspace(0.4, 1.1, n_conditions, dtype=np.float32)
     latent_ecmmd = {
         "bandwidth": 0.8,
+        "visualization_k_requested": 3,
         "k_values": {
-            "10": {"k_requested": 10, "k_effective": 7, "derandomized": {"score": 0.11}},
-            "20": {"k_requested": 20, "k_effective": 7, "derandomized": {"score": 0.15}},
-            "30": {"k_requested": 30, "k_effective": 7, "derandomized": {"score": 0.18}},
+            "3": {"k_requested": 3, "k_effective": 3, "derandomized": {"score": 0.11, "bootstrap_ci_lower": 0.05, "bootstrap_ci_upper": 0.17}},
         },
     }
 
@@ -703,8 +711,11 @@ def test_plot_conditioned_ecmmd_dashboard_writes_figures_and_selects_roles(tmp_p
         pair_label="pair_H2_to_H1p5",
         display_label="H=2 -> H=1.5",
         conditions=conditions,
-        reference_samples=reference_arr,
+        observed_reference=observed_reference_arr,
         generated_samples=generated_arr,
+        local_scores=local_scores,
+        neighborhood_indices=neighborhood_indices,
+        neighborhood_radii=neighborhood_radii,
         latent_ecmmd=latent_ecmmd,
         output_stem=tmp_path / "fig_conditional_ecmmd_pair_H2_to_H1p5",
         n_plot_conditions=5,
@@ -715,8 +726,11 @@ def test_plot_conditioned_ecmmd_dashboard_writes_figures_and_selects_roles(tmp_p
         pair_label="pair_H2_to_H1p5",
         display_label="H=2 -> H=1.5",
         conditions=conditions,
-        reference_samples=reference_arr,
+        observed_reference=observed_reference_arr,
         generated_samples=generated_arr,
+        local_scores=local_scores,
+        neighborhood_indices=neighborhood_indices,
+        neighborhood_radii=neighborhood_radii,
         latent_ecmmd=latent_ecmmd,
         output_stem=tmp_path / "fig_conditional_ecmmd_pair_H2_to_H1p5_repeat",
         n_plot_conditions=5,

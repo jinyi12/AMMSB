@@ -101,7 +101,12 @@ def plot_model_metric_bars(summaries: list[dict[str, Any]], out_dir: Path) -> No
 
     def _tick_label(row: dict[str, Any]) -> str:
         loss = str(row.get("loss_type", "")).lower()
-        loss_tag = "NTK" if loss == "ntk_scaled" else loss.upper()
+        if loss == "ntk_scaled":
+            loss_tag = "NTK-Scale"
+        elif loss == "ntk_prior_balanced":
+            loss_tag = "NTK-Bal"
+        else:
+            loss_tag = loss.upper()
         prior = "+P" if int(row.get("prior_flag", 0)) == 1 else ""
         decoder = str(row.get("decoder_type", "film"))
         decoder_tag = "" if decoder == "film" else "Den"

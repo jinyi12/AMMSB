@@ -170,7 +170,9 @@ def _model_label(args_json: dict[str, Any]) -> str:
     use_prior = bool(args_json.get("use_prior", False))
 
     if loss == "ntk_scaled":
-        loss_name = "NTK"
+        loss_name = "NTK-Scale"
+    elif loss == "ntk_prior_balanced":
+        loss_name = "NTK-Bal"
     elif loss == "l2":
         loss_name = "L2"
     else:

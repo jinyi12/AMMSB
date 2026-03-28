@@ -16,7 +16,12 @@ import jax
 
 from csp import bridge_condition_uses_global_state, sample_conditional_batch
 from scripts.csp.latent_archive import load_fae_latent_archive
-from scripts.csp.run_context import load_csp_config, load_csp_sampling_runtime, resolve_repo_path
+from scripts.csp.run_context import (
+    load_corpus_latents,
+    load_csp_config,
+    load_csp_sampling_runtime,
+    resolve_repo_path,
+)
 from scripts.csp.token_latent_archive import load_token_fae_latent_archive
 from scripts.images.field_visualization import EASTERN_HUES, format_for_paper
 from scripts.fae.tran_evaluation.conditional_support import knn_gaussian_weights, sample_weighted_rows
@@ -376,6 +381,17 @@ def _resolve_optional_conditional_results_path(
     return None
 
 
+def _resolve_optional_conditional_manifest_path(
+    conditional_results_path: Path | None,
+) -> Path | None:
+    if conditional_results_path is None:
+        return None
+    candidate = conditional_results_path.parent / "conditional_latent_manifest.json"
+    if candidate.exists():
+        return candidate
+    return None
+
+
 def _load_optional_npz(path: Path | None) -> dict[str, np.ndarray] | None:
     if path is None or not path.exists():
         return None
@@ -399,6 +415,58 @@ def _conditional_realization_count(
         if generated.ndim >= 2 and int(generated.shape[1]) > 0:
             return int(generated.shape[1])
     return 64
+
+
+def _ordered_unique_indices(values: np.ndarray | list[int], *, default: int | None = None) -> np.ndarray:
+    ordered: list[int] = []
+    seen: set[int] = set()
+    for raw in np.asarray(values, dtype=np.int64).reshape(-1).tolist():
+        idx = int(raw)
+        if idx < 0 or idx in seen:
+            continue
+        ordered.append(idx)
+        seen.add(idx)
+    if not ordered and default is not None:
+        ordered.append(int(default))
+    return np.asarray(ordered, dtype=np.int64)
+
+
+def _load_corpus_eval_trajectory_bank(
+    *,
+    conditional_results: dict[str, np.ndarray] | None,
+    conditional_manifest: dict[str, Any] | None,
+    fallback_time_indices: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+    if conditional_results is None or conditional_manifest is None:
+        return None
+    if "corpus_latents_path" not in conditional_manifest or "corpus_eval_indices" not in conditional_results:
+        return None
+
+    time_indices = np.asarray(
+        conditional_results.get("time_indices", fallback_time_indices),
+        dtype=np.int64,
+    ).reshape(-1)
+    if time_indices.size == 0:
+        return None
+
+    corpus_latents_by_tidx, _ = load_corpus_latents(Path(str(conditional_manifest["corpus_latents_path"])), time_indices)
+    stacked = np.stack(
+        [
+            np.asarray(corpus_latents_by_tidx[int(tidx)], dtype=np.float32)
+            for tidx in time_indices.tolist()
+        ],
+        axis=0,
+    )
+    trajectory_bank = np.asarray(stacked.transpose(1, 0, 2), dtype=np.float32)
+    corpus_eval_indices = np.asarray(conditional_results["corpus_eval_indices"], dtype=np.int64).reshape(-1)
+    if corpus_eval_indices.size == 0:
+        return None
+    if int(np.max(corpus_eval_indices)) >= int(trajectory_bank.shape[0]):
+        raise ValueError(
+            "conditional corpus_eval_indices are out of bounds for the recorded corpus latent archive: "
+            f"max index={int(np.max(corpus_eval_indices))}, corpus size={int(trajectory_bank.shape[0])}."
+        )
+    return trajectory_bank[corpus_eval_indices], time_indices, corpus_eval_indices
 
 
 def _sample_generated_conditional_trajectories(
@@ -436,6 +504,48 @@ def _sample_generated_conditional_trajectories(
         interval_offset=int(runtime.archive.zt.shape[0] - 1 - start_level),
     )
     return np.asarray(trajectories, dtype=np.float32)
+
+
+def _sample_generated_edge_mean_trajectories(
+    *,
+    runtime: Any,
+    trajectory_bank: np.ndarray,
+    edge_rows: np.ndarray,
+    start_level: int,
+    n_realizations_per_edge: int,
+    seed: int,
+) -> np.ndarray:
+    edge_idx = _ordered_unique_indices(edge_rows)
+    if edge_idx.size == 0:
+        raise ValueError("Need at least one edge row to sample edge-generated trajectories.")
+    truncated_zt = np.asarray(runtime.archive.zt[: start_level + 1], dtype=np.float32)
+    coarse_states = np.asarray(trajectory_bank[edge_idx, start_level, :], dtype=np.float32)
+    n_reps = max(1, int(n_realizations_per_edge))
+    z_batch = np.repeat(coarse_states, n_reps, axis=0)
+    global_condition_batch = None
+    if bridge_condition_uses_global_state(str(runtime.condition_mode)):
+        global_states = np.asarray(trajectory_bank[edge_idx, -1, :], dtype=np.float32)
+        global_condition_batch = np.repeat(global_states, n_reps, axis=0)
+
+    generated = sample_conditional_batch(
+        runtime.model,
+        z_batch,
+        truncated_zt,
+        runtime.sigma_fn,
+        float(runtime.dt0),
+        jax.random.PRNGKey(int(seed)),
+        condition_mode=str(runtime.condition_mode),
+        global_condition_batch=global_condition_batch,
+        condition_num_intervals=int(runtime.archive.zt.shape[0] - 1),
+        interval_offset=int(runtime.archive.zt.shape[0] - 1 - start_level),
+    )
+    generated_arr = np.asarray(generated, dtype=np.float32)
+    path_len = int(generated_arr.shape[1])
+    generated_arr = np.asarray(
+        generated_arr.reshape(edge_idx.shape[0], n_reps, path_len, generated_arr.shape[-1]),
+        dtype=np.float32,
+    )
+    return np.asarray(generated_arr.mean(axis=1), dtype=np.float32)
 
 
 def _sample_reference_conditional_trajectories(
@@ -515,7 +625,6 @@ def _plot_conditional_trajectory_panels(
     pair_labels = [str(value) for value in pair_labels_raw.tolist()]
     test_sample_indices = np.asarray(conditional_results["test_sample_indices"], dtype=np.int64)
     latent_test = _flatten_reference_split_array(np.asarray(runtime.archive.latent_test, dtype=np.float32))
-    zt_full = np.asarray(runtime.archive.zt, dtype=np.float32)
     pair_specs: list[dict[str, Any]] = []
 
     for pair_idx, pair_label in enumerate(pair_labels):
@@ -542,7 +651,7 @@ def _plot_conditional_trajectory_panels(
                 n_realizations=int(n_realizations),
                 seed=int(seed) + 200_000 + pair_idx * 10_000 + selection_rank * 1_000,
             )
-            reference_np, neighbor_indices, neighbor_weights, reference_mean_latent = _sample_reference_conditional_trajectories(
+            reference_np, neighbor_indices, neighbor_weights, _reference_mean_latent = _sample_reference_conditional_trajectories(
                 latent_test=latent_test,
                 selected_test_index=int(selected_test_index),
                 start_level=int(start_level),
@@ -555,11 +664,6 @@ def _plot_conditional_trajectory_panels(
                     "latent_w2": float(w2_values[int(local_idx)]),
                     "generated_projected": _project_rows(generated_np, mean, components)[:, ::-1, :],
                     "reference_projected": _project_rows(reference_np, mean, components)[:, ::-1, :],
-                    "reference_mean_projected": _project_rows(
-                        np.asarray(reference_mean_latent[None, :, :], dtype=np.float32),
-                        mean,
-                        components,
-                    )[0, ::-1, :],
                     "n_generated_trajectories": int(generated_np.shape[0]),
                     "n_reference_trajectories": int(reference_np.shape[0]),
                     "reference_neighbor_indices": np.asarray(neighbor_indices, dtype=np.int64),
@@ -592,7 +696,7 @@ def _plot_conditional_trajectory_panels(
         n_rows,
         n_cols,
         figsize=(fig_width, fig_height),
-        constrained_layout=True,
+        constrained_layout=False,
         squeeze=False,
     )
     row_label_fontsize = PUB_FONT_LEGEND
@@ -635,9 +739,7 @@ def _plot_conditional_trajectory_panels(
                 marker_alpha=0.09,
                 marker_edgecolor=None,
             )
-            mean_reference = np.asarray(condition_spec["reference_mean_projected"], dtype=np.float32)
             mean_generated = np.mean(condition_spec["generated_projected"], axis=0)
-            ax.plot(mean_reference[:, 0], mean_reference[:, 1], color=C_OBS, linestyle="--", linewidth=1.5, zorder=5)
             ax.plot(mean_generated[:, 0], mean_generated[:, 1], color=C_GEN, linewidth=1.6, zorder=6)
             ax.scatter(
                 mean_generated[:, 0],
@@ -678,11 +780,11 @@ def _plot_conditional_trajectory_panels(
             if clipped_generated > 0 or clipped_reference > 0:
                 ax.text(
                     0.02,
-                    0.02,
+                    0.98,
                     f"clip gen/ref {clipped_generated}/{clipped_reference}",
                     transform=ax.transAxes,
                     ha="left",
-                    va="bottom",
+                    va="top",
                     fontsize=clip_note_fontsize,
                     color=C_TEXT,
                     bbox={"boxstyle": "round,pad=0.14", "facecolor": "white", "alpha": 0.62, "edgecolor": "none"},
@@ -693,18 +795,25 @@ def _plot_conditional_trajectory_panels(
     legend_handles = [
         Line2D([0], [0], color=C_OBS, linestyle="--", linewidth=0.8, alpha=0.40, label="Reference ensemble"),
         Line2D([0], [0], color=C_GEN, linewidth=0.8, alpha=0.40, label="Generated ensemble"),
-        Line2D([0], [0], color=C_OBS, linestyle="--", linewidth=1.5, label="Reference mean"),
         Line2D([0], [0], color=C_GEN, linewidth=1.6, label="Generated mean"),
     ]
     legend = fig.legend(
         handles=legend_handles,
         loc="lower center",
-        ncol=4,
+        ncol=3,
         frameon=False,
-        bbox_to_anchor=(0.5, -0.01),
+        bbox_to_anchor=(0.5, 0.02),
     )
     for text in legend.get_texts():
         text.set_fontsize(legend_fontsize)
+    fig.subplots_adjust(
+        left=0.10,
+        right=0.99,
+        top=0.95,
+        bottom=0.16,
+        wspace=0.12,
+        hspace=0.24,
+    )
 
     png_path = output_dir / "fig_latent_conditional_trajectories.png"
     pdf_path = output_dir / "fig_latent_conditional_trajectories.pdf"
@@ -724,7 +833,308 @@ def _plot_conditional_trajectory_panels(
                         "n_reference_trajectories": int(condition_spec["n_reference_trajectories"]),
                         "reference_neighbor_indices": condition_spec["reference_neighbor_indices"].astype(int).tolist(),
                         "reference_neighbor_weights": condition_spec["reference_neighbor_weights"].astype(float).tolist(),
-                        "reference_mean_mode": "kernel_weighted_neighbor_mean_path",
+                    }
+                    for condition_spec in spec["condition_specs"]
+                ],
+            }
+            for spec in pair_specs
+        ],
+    }
+
+
+def _plot_ecmmd_conditional_trajectory_panels(
+    *,
+    run_dir: Path,
+    output_dir: Path,
+    conditional_results: dict[str, np.ndarray] | None,
+    conditional_manifest: dict[str, Any] | None,
+    mean: np.ndarray,
+    components: np.ndarray,
+    time_indices: np.ndarray,
+    max_conditions_per_pair: int,
+    seed: int,
+) -> dict[str, Any] | None:
+    if conditional_results is None or conditional_manifest is None:
+        return None
+    if "pair_labels" not in conditional_results:
+        return None
+
+    corpus_payload = _load_corpus_eval_trajectory_bank(
+        conditional_results=conditional_results,
+        conditional_manifest=conditional_manifest,
+        fallback_time_indices=time_indices,
+    )
+    if corpus_payload is None:
+        return None
+    corpus_eval_trajectory_bank, corpus_time_indices, corpus_eval_indices = corpus_payload
+
+    runtime = load_csp_sampling_runtime(run_dir)
+    if runtime.model_type != "conditional_bridge" or runtime.condition_mode is None:
+        return None
+
+    pair_labels = [str(value) for value in conditional_results["pair_labels"].tolist()]
+    pair_specs: list[dict[str, Any]] = []
+
+    for pair_idx, pair_label in enumerate(pair_labels):
+        selected_rows_key = f"latent_ecmmd_selected_rows_{pair_label}"
+        selected_roles_key = f"latent_ecmmd_selected_roles_{pair_label}"
+        neighbor_key = f"latent_ecmmd_neighbor_indices_{pair_label}"
+        generated_key = f"latent_ecmmd_generated_{pair_label}"
+        if selected_rows_key not in conditional_results or neighbor_key not in conditional_results:
+            continue
+
+        selected_rows = np.asarray(conditional_results[selected_rows_key], dtype=np.int64).reshape(-1)
+        if selected_rows.size == 0:
+            continue
+        selected_rows = selected_rows[: int(max_conditions_per_pair)]
+        selected_roles = (
+            [str(value) for value in np.asarray(conditional_results[selected_roles_key]).tolist()[: selected_rows.size]]
+            if selected_roles_key in conditional_results
+            else [f"selected_{idx}" for idx in range(selected_rows.size)]
+        )
+        neighbor_indices = np.asarray(conditional_results[neighbor_key], dtype=np.int64)
+        n_generated_total = _conditional_realization_count(conditional_results, pair_label) if generated_key in conditional_results else 1
+        n_generated_per_edge = max(1, min(4, int(n_generated_total)))
+        start_level = pair_idx + 1
+        if start_level >= int(corpus_eval_trajectory_bank.shape[1]):
+            continue
+
+        condition_specs: list[dict[str, Any]] = []
+        for selection_rank, (selected_row, role) in enumerate(zip(selected_rows.tolist(), selected_roles, strict=True)):
+            edge_rows = _ordered_unique_indices(
+                np.concatenate(
+                    [
+                        np.asarray([int(selected_row)], dtype=np.int64),
+                        np.asarray(neighbor_indices[int(selected_row)], dtype=np.int64),
+                    ],
+                    axis=0,
+                ),
+                default=int(selected_row),
+            )
+            if edge_rows.size == 0:
+                continue
+            reference_np = np.asarray(
+                corpus_eval_trajectory_bank[edge_rows, : start_level + 1, :],
+                dtype=np.float32,
+            )
+            generated_edge_mean_np = _sample_generated_edge_mean_trajectories(
+                runtime=runtime,
+                trajectory_bank=corpus_eval_trajectory_bank,
+                edge_rows=edge_rows,
+                start_level=int(start_level),
+                n_realizations_per_edge=int(n_generated_per_edge),
+                seed=int(seed) + 600_000 + pair_idx * 10_000 + selection_rank * 1_000,
+            )
+            edge_query_pos = int(np.where(edge_rows == int(selected_row))[0][0]) if np.any(edge_rows == int(selected_row)) else 0
+            reference_mean_latent = np.asarray(reference_np.mean(axis=0), dtype=np.float32)
+            condition_specs.append(
+                {
+                    "condition_row": int(selected_row),
+                    "condition_index": int(corpus_eval_indices[int(selected_row)]),
+                    "role": str(role),
+                    "edge_rows": edge_rows.astype(np.int64),
+                    "edge_indices": corpus_eval_indices[edge_rows].astype(np.int64),
+                    "reference_projected": _project_rows(reference_np, mean, components)[:, ::-1, :],
+                    "generated_edge_projected": _project_rows(generated_edge_mean_np, mean, components)[:, ::-1, :],
+                    "reference_mean_projected": _project_rows(
+                        np.asarray(reference_mean_latent[None, :, :], dtype=np.float32),
+                        mean,
+                        components,
+                    )[0, ::-1, :],
+                    "query_generated_projected": _project_rows(
+                        np.asarray(generated_edge_mean_np[edge_query_pos : edge_query_pos + 1], dtype=np.float32),
+                        mean,
+                        components,
+                    )[0, ::-1, :],
+                    "n_reference_trajectories": int(reference_np.shape[0]),
+                    "n_generated_edge_trajectories": int(generated_edge_mean_np.shape[0]),
+                    "generated_realizations_per_edge": int(n_generated_per_edge),
+                }
+            )
+
+        if not condition_specs:
+            continue
+        pair_specs.append(
+            {
+                "pair_label": pair_label,
+                "selected_rows": selected_rows.astype(np.int64),
+                "selected_roles": list(selected_roles),
+                "condition_specs": condition_specs,
+                "time_indices_coarse_to_fine": corpus_time_indices[: start_level + 1][::-1].astype(np.int64),
+            }
+        )
+
+    if not pair_specs:
+        return None
+
+    format_for_paper()
+
+    knot_colors = plt.cm.cividis(np.linspace(0.12, 0.88, len(np.asarray(time_indices).reshape(-1))))
+    n_rows = len(pair_specs)
+    n_cols = max(len(spec["condition_specs"]) for spec in pair_specs)
+    fig_width = min(PUB_FIG_WIDTH, max(4.8, 2.05 * n_cols))
+    fig_height = max(1.9, 1.55 * n_rows + 0.45)
+    fig, axes = plt.subplots(
+        n_rows,
+        n_cols,
+        figsize=(fig_width, fig_height),
+        constrained_layout=False,
+        squeeze=False,
+    )
+    row_label_fontsize = PUB_FONT_LEGEND
+    panel_title_fontsize = PUB_FONT_LABEL - 0.1
+    axis_label_fontsize = PUB_FONT_LABEL
+    legend_fontsize = PUB_FONT_LEGEND
+    clip_note_fontsize = PUB_FONT_LEGEND - 0.3
+
+    for row, spec in enumerate(pair_specs):
+        row_label = _format_pair_label(str(spec["pair_label"]))
+        for col, condition_spec in enumerate(spec["condition_specs"]):
+            ax = axes[row, col]
+            path_len = int(condition_spec["reference_projected"].shape[1])
+            colors_local = knot_colors[-path_len:]
+            bounds = _robust_xy_bounds(
+                [condition_spec["generated_edge_projected"], condition_spec["reference_projected"]],
+            )
+            _plot_trajectory_set(
+                ax,
+                condition_spec["reference_projected"],
+                colors_local,
+                line_color=C_OBS,
+                line_alpha=0.10,
+                line_width=0.70,
+                zorder=2,
+                marker_size=7,
+                marker_alpha=0.10,
+                marker_edgecolor=None,
+                line_style="--",
+            )
+            _plot_trajectory_set(
+                ax,
+                condition_spec["generated_edge_projected"],
+                colors_local,
+                line_color=C_GEN,
+                line_alpha=0.12,
+                line_width=0.70,
+                zorder=4,
+                marker_size=7,
+                marker_alpha=0.12,
+                marker_edgecolor=None,
+            )
+            mean_reference = np.asarray(condition_spec["reference_mean_projected"], dtype=np.float32)
+            query_generated = np.asarray(condition_spec["query_generated_projected"], dtype=np.float32)
+            ax.plot(
+                mean_reference[:, 0],
+                mean_reference[:, 1],
+                color=C_OBS,
+                linestyle="--",
+                linewidth=1.6,
+                zorder=6,
+            )
+            ax.plot(
+                query_generated[:, 0],
+                query_generated[:, 1],
+                color=C_GEN,
+                linewidth=1.7,
+                zorder=7,
+            )
+            ax.scatter(
+                query_generated[:, 0],
+                query_generated[:, 1],
+                s=16,
+                color=colors_local,
+                edgecolors=C_TEXT,
+                linewidths=0.35,
+                zorder=8,
+            )
+            ax.set_xlim(bounds[0], bounds[1])
+            ax.set_ylim(bounds[2], bounds[3])
+            if col == 0:
+                ax.text(
+                    -0.22,
+                    0.50,
+                    row_label,
+                    transform=ax.transAxes,
+                    ha="right",
+                    va="center",
+                    rotation=90,
+                    fontsize=row_label_fontsize,
+                    color=C_TEXT,
+                )
+            ax.set_title(
+                f"{condition_spec['role']} | row {int(condition_spec['condition_index'])}",
+                fontsize=panel_title_fontsize,
+                pad=2.0,
+            )
+            if row == n_rows - 1:
+                ax.set_xlabel(_principal_axis_label(1), fontsize=axis_label_fontsize)
+            else:
+                ax.set_xlabel("")
+            ax.set_ylabel("")
+            _style_axis(ax, equal=True, tick_fontsize=PUB_FONT_TICK)
+            clipped_generated = _count_clipped_trajectories(condition_spec["generated_edge_projected"], bounds)
+            clipped_reference = _count_clipped_trajectories(condition_spec["reference_projected"], bounds)
+            if clipped_generated > 0 or clipped_reference > 0:
+                ax.text(
+                    0.02,
+                    0.98,
+                    f"clip gen/ref {clipped_generated}/{clipped_reference}",
+                    transform=ax.transAxes,
+                    ha="left",
+                    va="top",
+                    fontsize=clip_note_fontsize,
+                    color=C_TEXT,
+                    bbox={"boxstyle": "round,pad=0.14", "facecolor": "white", "alpha": 0.62, "edgecolor": "none"},
+                )
+
+        for col in range(len(spec["condition_specs"]), n_cols):
+            axes[row, col].axis("off")
+
+    legend_handles = [
+        Line2D([0], [0], color=C_OBS, linestyle="--", linewidth=0.8, alpha=0.42, label="Observed edge trajectories"),
+        Line2D([0], [0], color=C_GEN, linewidth=0.8, alpha=0.42, label="Edge-generated mean trajectories"),
+        Line2D([0], [0], color=C_OBS, linestyle="--", linewidth=1.6, label="Reference mean"),
+        Line2D([0], [0], color=C_GEN, linewidth=1.7, label="Query generated mean"),
+    ]
+    legend = fig.legend(
+        handles=legend_handles,
+        loc="lower center",
+        ncol=2,
+        frameon=False,
+        bbox_to_anchor=(0.5, 0.02),
+    )
+    for text in legend.get_texts():
+        text.set_fontsize(legend_fontsize)
+    fig.subplots_adjust(
+        left=0.10,
+        right=0.99,
+        top=0.95,
+        bottom=0.18,
+        wspace=0.12,
+        hspace=0.24,
+    )
+
+    png_path = output_dir / "fig_latent_ecmmd_conditional_trajectories.png"
+    pdf_path = output_dir / "fig_latent_ecmmd_conditional_trajectories.pdf"
+    _save_pub_fig(fig, png_path, pdf_path)
+    return {
+        "figure_paths": {"png": str(png_path), "pdf": str(pdf_path)},
+        "pairs": [
+            {
+                "pair_label": spec["pair_label"],
+                "selected_rows": spec["selected_rows"].astype(int).tolist(),
+                "selected_roles": list(spec["selected_roles"]),
+                "selected_conditions": [
+                    {
+                        "condition_row": int(condition_spec["condition_row"]),
+                        "condition_index": int(condition_spec["condition_index"]),
+                        "role": str(condition_spec["role"]),
+                        "n_reference_trajectories": int(condition_spec["n_reference_trajectories"]),
+                        "n_generated_edge_trajectories": int(condition_spec["n_generated_edge_trajectories"]),
+                        "generated_realizations_per_edge": int(condition_spec["generated_realizations_per_edge"]),
+                        "edge_condition_rows": condition_spec["edge_rows"].astype(int).tolist(),
+                        "edge_condition_indices": condition_spec["edge_indices"].astype(int).tolist(),
+                        "reference_mean_mode": "uniform_edge_mean_path",
                     }
                     for condition_spec in spec["condition_specs"]
                 ],
@@ -1129,16 +1539,20 @@ def plot_latent_trajectory_summary(
         "clipping_stage": "decoded_field_log_space",
         "latent_space_clipping": False,
     }
+    conditional_results_path = _resolve_optional_conditional_results_path(
+        run_dir=run_dir,
+        cache_dir=cache_dir,
+        output_dir=output_dir,
+    )
+    conditional_results = _load_optional_npz(conditional_results_path)
+    conditional_manifest_json = _load_optional_json(
+        _resolve_optional_conditional_manifest_path(conditional_results_path)
+    )
+
     conditional_manifest = _plot_conditional_trajectory_panels(
         run_dir=run_dir,
         output_dir=output_dir,
-        conditional_results=_load_optional_npz(
-            _resolve_optional_conditional_results_path(
-                run_dir=run_dir,
-                cache_dir=cache_dir,
-                output_dir=output_dir,
-            )
-        ),
+        conditional_results=conditional_results,
         mean=mean,
         components=components,
         time_indices=time_indices,
@@ -1148,6 +1562,20 @@ def plot_latent_trajectory_summary(
     )
     if conditional_manifest is not None:
         summary["conditional_trajectory_manifest"] = conditional_manifest
+
+    ecmmd_conditional_manifest = _plot_ecmmd_conditional_trajectory_panels(
+        run_dir=run_dir,
+        output_dir=output_dir,
+        conditional_results=conditional_results,
+        conditional_manifest=conditional_manifest_json,
+        mean=mean,
+        components=components,
+        time_indices=time_indices,
+        max_conditions_per_pair=int(max_conditions_per_pair),
+        seed=int(seed),
+    )
+    if ecmmd_conditional_manifest is not None:
+        summary["ecmmd_conditional_trajectory_manifest"] = ecmmd_conditional_manifest
 
     failure_manifest = _plot_failure_trajectory_panels(
         cache_dir=cache_dir,
