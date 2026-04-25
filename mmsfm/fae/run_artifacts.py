@@ -32,6 +32,66 @@ def _nested_get(mapping: Mapping[str, Any], *keys: str):
     return current
 
 
+def _resolve_transformer_decoder_core_params(decoder_params: Mapping[str, Any]) -> Mapping[str, Any]:
+    core = _nested_get(decoder_params, "coordinate_decoder", "decoder_core")
+    if isinstance(core, Mapping):
+        return core
+    coordinate_decoder = _nested_get(decoder_params, "coordinate_decoder")
+    if isinstance(coordinate_decoder, Mapping):
+        return coordinate_decoder
+    return {}
+
+
+def _resolve_transformer_prior_info(params: Mapping[str, Any]) -> dict[str, Any]:
+    prior_params_raw = params.get("prior", {})
+    prior_params = prior_params_raw if isinstance(prior_params_raw, Mapping) else {}
+    if not prior_params:
+        return {}
+
+    input_kernel = _nested_get(prior_params, "input_proj", "kernel")
+    final_proj_kernel = _nested_get(prior_params, "final", "proj", "kernel")
+    block_names = sorted(
+        key
+        for key in prior_params.keys()
+        if isinstance(key, str) and key.startswith("block_")
+    )
+    if (
+        input_kernel is None
+        or final_proj_kernel is None
+        or not hasattr(input_kernel, "shape")
+        or not hasattr(final_proj_kernel, "shape")
+        or len(input_kernel.shape) != 2
+        or len(final_proj_kernel.shape) != 2
+        or not block_names
+    ):
+        return {}
+
+    resolved = {
+        "prior_architecture": "transformer_dit",
+        "prior_token_mode": "token_native",
+        "prior_n_layers": int(len(block_names)),
+        "prior_token_dim": int(input_kernel.shape[0]),
+        "prior_hidden_dim": int(input_kernel.shape[-1]),
+        "prior_output_token_dim": int(final_proj_kernel.shape[-1]),
+    }
+
+    time_dense_0 = _nested_get(prior_params, "time_embedder", "dense_0", "kernel")
+    if time_dense_0 is not None and hasattr(time_dense_0, "shape") and len(time_dense_0.shape) == 2:
+        resolved["prior_time_emb_dim"] = int(time_dense_0.shape[0])
+
+    query_kernel = _nested_get(prior_params, block_names[0], "attn", "query", "kernel")
+    if query_kernel is not None and hasattr(query_kernel, "shape") and len(query_kernel.shape) == 3:
+        resolved["prior_num_heads"] = int(query_kernel.shape[1])
+        resolved["prior_head_dim"] = int(query_kernel.shape[2])
+
+    mlp_kernel = _nested_get(prior_params, block_names[0], "mlp", "fc_0", "kernel")
+    if mlp_kernel is not None and hasattr(mlp_kernel, "shape") and len(mlp_kernel.shape) == 2:
+        hidden_dim = max(int(input_kernel.shape[-1]), 1)
+        resolved["prior_mlp_ratio"] = float(mlp_kernel.shape[-1]) / float(hidden_dim)
+
+    return resolved
+
+
 def resolve_live_architecture_info(
     architecture_info: dict[str, Any],
     params: Mapping[str, Any],
@@ -65,14 +125,17 @@ def resolve_live_architecture_info(
         else:
             resolved["transformer_patch_size"] = patch_shape
 
-    memory_kernel = _nested_get(decoder_params, "coordinate_decoder", "memory_proj", "kernel")
+    decoder_core = _resolve_transformer_decoder_core_params(decoder_params)
+
+    memory_kernel = _nested_get(decoder_core, "memory_proj", "kernel")
     if memory_kernel is not None and hasattr(memory_kernel, "shape") and len(memory_kernel.shape) >= 2:
         resolved["transformer_decoder_memory_width"] = int(memory_kernel.shape[-1])
 
-    query_kernel = _nested_get(decoder_params, "coordinate_decoder", "query_proj", "kernel")
+    query_kernel = _nested_get(decoder_core, "query_proj", "kernel")
     if query_kernel is not None and hasattr(query_kernel, "shape") and len(query_kernel.shape) >= 2:
         resolved["transformer_decoder_query_width"] = int(query_kernel.shape[-1])
 
+    resolved.update(_resolve_transformer_prior_info(params))
     return resolved
 
 
@@ -122,6 +185,11 @@ def save_model_artifact(
         "batch_stats": (
             jax.tree.map(np.array, state.batch_stats)
             if state.batch_stats
+            else None
+        ),
+        "aux_state": (
+            jax.tree.map(np.array, state.aux_state)
+            if getattr(state, "aux_state", None) is not None
             else None
         ),
         "architecture": architecture_info,

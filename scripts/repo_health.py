@@ -34,11 +34,6 @@ REQUIRED_FILES = (
     "scripts/refactor_hotspots.py",
     "scripts/repo_health.py",
     ".github/workflows/harness.yml",
-    ".codex/skills/mmsfm-repo-bootstrap/SKILL.md",
-    ".codex/skills/mmsfm-tran-eval/SKILL.md",
-    ".codex/skills/mmsfm-latent-msbm-debug/SKILL.md",
-    ".codex/skills/mmsfm-experiment-registry/SKILL.md",
-    ".codex/skills/mmsfm-structural-refactor/SKILL.md",
 )
 REQUIRED_MAKE_TARGETS = (
     "setup",
@@ -106,7 +101,22 @@ def _parse_args() -> argparse.Namespace:
 
 def check_required_files(repo_root: Path) -> list[str]:
     """Return required harness files that are missing."""
-    return [path for path in REQUIRED_FILES if not (repo_root / path).exists()]
+    required = [*REQUIRED_FILES, *discover_required_skill_files(repo_root)]
+    return [path for path in required if not (repo_root / path).exists()]
+
+
+def discover_required_skill_files(repo_root: Path) -> list[str]:
+    """Return required repo-local skill files for every discovered skill."""
+    skills_root = repo_root / ".codex" / "skills"
+    if not skills_root.exists():
+        return []
+
+    required: list[str] = []
+    for skill_md in sorted(skills_root.glob("*/SKILL.md")):
+        skill_dir = skill_md.parent
+        required.append(skill_md.relative_to(repo_root).as_posix())
+        required.append((skill_dir / "agents" / "openai.yaml").relative_to(repo_root).as_posix())
+    return required
 
 
 def check_make_targets(repo_root: Path) -> list[str]:

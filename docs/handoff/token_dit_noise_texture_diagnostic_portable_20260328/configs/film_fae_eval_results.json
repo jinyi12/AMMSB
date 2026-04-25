@@ -1,0 +1,77 @@
+{
+  "test_mse": 0.07233569157134478,
+  "test_rel_mse": 0.09372704987639428,
+  "collapse_diagnostics": null,
+  "held_out_results": {
+    "0.2857142984867096": {
+      "mse": 0.02534427074715495,
+      "rel_mse": 0.052464086477781176
+    },
+    "0.7142857313156128": {
+      "mse": 0.0016281736607197672,
+      "rel_mse": 0.008239653767945082
+    }
+  },
+  "training_time_results": {
+    "0.1428571492433548": {
+      "mse": 0.07152391597628593,
+      "rel_mse": 0.091523870388594
+    },
+    "0.4285714328289032": {
+      "mse": 0.010086124297231436,
+      "rel_mse": 0.02969802243777586
+    },
+    "0.5714285969734192": {
+      "mse": 0.00284743111114949,
+      "rel_mse": 0.012332471776264432
+    },
+    "0.8571428656578064": {
+      "mse": 0.0011180636356584728,
+      "rel_mse": 0.006159030327498594
+    },
+    "1.0": {
+      "mse": 0.0003094044732279144,
+      "rel_mse": 0.0018930554879291264
+    }
+  },
+  "architecture": {
+    "type": "naive_fae_attention",
+    "encoder_coord_dim": 2,
+    "decoder_coord_dim": 2,
+    "latent_dim": 128,
+    "n_freqs": 64,
+    "fourier_sigma": 1.0,
+    "positional_encoding": "random_fourier_features_multiscale",
+    "encoder_multiscale_sigmas": [
+      1.0,
+      2.0,
+      4.0,
+      8.0
+    ],
+    "decoder_multiscale_sigmas": [
+      1.0,
+      2.0,
+      4.0,
+      8.0
+    ],
+    "decoder_positional_encoding": "random_fourier_features_multiscale",
+    "decoder_type": "film",
+    "decoder_features": [
+      256,
+      256,
+      256
+    ],
+    "encoder_mlp_dim": 256,
+    "encoder_mlp_layers": 3,
+    "pooling_type": "dual_stream_bottleneck",
+    "n_heads": 4,
+    "n_queries": 8,
+    "n_residual_blocks": 3,
+    "function_space_compatible": true,
+    "norm_type": "layernorm"
+  },
+  "wandb_run_id": "vq1adonq",
+  "training_mode": "multi_scale",
+  "loss_type": "ntk_scaled",
+  "optimizer": "muon"
+}

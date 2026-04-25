@@ -22,6 +22,7 @@ python scripts/refactor_hotspots.py
 ## What `repo_health.py` Checks
 
 - required harness files such as `AGENTS.md`, `docs/index.md`, runbooks, Makefile, workflow, and repo-local skills
+- every discovered repo-local skill `SKILL.md` plus its `agents/openai.yaml`
 - primary active docs for architecture, conventions, experiments, Tran evaluation, latent geometry, and publication workflows
 - repo-local skill installation surface via `scripts/install_repo_skills.py` and `make install-skills`
 - required Makefile targets
@@ -31,6 +32,8 @@ python scripts/refactor_hotspots.py
 
 `--strict` is intended for CI. It fails on missing harness files, missing Makefile targets, or broken links.
 
+`repo_health.py` audits the repo skill sources, not the global installed root under `~/.codex/skills/`.
+
 ## What `refactor_hotspots.py` Reports
 
 - large active Python files across `mmsfm/`, `csp/`, `data/`, `scripts/`, and `tests/`
@@ -39,7 +42,7 @@ python scripts/refactor_hotspots.py
 Use it before structural cleanup in active areas, especially:
 
 - `scripts/fae/tran_evaluation/`
-- `scripts/fae/fae_naive/`
+- `mmsfm/fae/`
 - `mmsfm/`
 - `csp/`
 

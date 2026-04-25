@@ -1,33 +1,16 @@
 ---
 name: mmsfm-repo-bootstrap
-description: Use when starting work in the MMSFM repository, choosing setup or validation commands, checking repo health, or orienting within active versus protected areas. Read AGENTS.md, docs/index.md, and docs/runbooks/bootstrap.md first.
+description: Use when starting work in MMSFM, choosing setup or validation commands, or deciding whether work belongs in active code, `csp/`, or compatibility-only surfaces.
 ---
 
 # MMSFM Repo Bootstrap
 
-## Use This Skill When
+Use this skill for repo orientation, validation scope, active-versus-protected boundaries, and routing work between `csp/` and compatibility-only surfaces.
 
-- the task starts with repository setup or orientation
-- the correct validation scope is unclear
-- the repo health or structural state needs checking
-
-## Workflow
-
-1. Read `AGENTS.md`.
-2. Read `docs/index.md` and `docs/runbooks/bootstrap.md`.
-3. Run `make repo-health`.
-4. Choose the narrowest validation command:
-   `make test-tran-eval`, `make test-csp`, `make check`, or `make test`.
-5. For structural cleanup, run `python scripts/refactor_hotspots.py`.
-
-## Boundaries
-
-- Treat `mmsfm/`, `csp/`, `data/`, `scripts/`, `docs/`, and `tests/` as active.
-- Treat `functional_autoencoders/`, `MSBM/`, `spacetime-geometry/`, `archive/`, `results/`, and `wandb/` as protected unless explicitly asked.
-
-## Primary References
-
-- `AGENTS.md`
-- `docs/index.md`
-- `docs/runbooks/bootstrap.md`
-- `docs/runbooks/repo-health.md`
+1. Read `AGENTS.md` and `docs/runbooks/bootstrap.md`.
+2. Run `make repo-health` before broad repo work.
+3. Choose the narrowest matching validation command.
+4. Default new downstream transport work to `csp/`.
+5. Treat `mmsfm/latent_msbm/` as compatibility-only unless the task says otherwise.
+6. Default to straightforward function-first implementations. Do not add classes unless persistent state or a true shared interface requires them.
+7. Do not solve scientific or numerical issues with degradation handling, fallback paths, hacks, heuristics, local stabilizations, or post-processing bandages that are not faithful general algorithms.

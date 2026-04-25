@@ -62,6 +62,8 @@ def build_grid_coords(resolution: int) -> np.ndarray:
 
 
 def main() -> None:
+    default_tran_h_meso_list = "1D,1.25D,1.5D,2D,2.5D,3D,4D"
+
     parser = argparse.ArgumentParser(
         description="Generate raw 2D field data for the FAE pipeline."
     )
@@ -102,7 +104,15 @@ def main() -> None:
     parser.add_argument("--tran_matrix_value", type=float, default=1.0)
     parser.add_argument("--tran_inclusion_value", type=float, default=1000.0)
     parser.add_argument("--tran_H_macro", type=float, default=None)
-    parser.add_argument("--tran_H_meso_list", type=str, default="")
+    parser.add_argument(
+        "--tran_H_meso_list",
+        type=str,
+        default=default_tran_h_meso_list,
+        help=(
+            "Comma-separated mesoscale H values. "
+            f"Default: {default_tran_h_meso_list}"
+        ),
+    )
 
     # Scaling / normalisation
     parser.add_argument(

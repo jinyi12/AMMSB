@@ -81,7 +81,8 @@ def run_transformer_training(
         encoder_point_ratio_by_time = None
         print(
             "  Transformer tokenization: patches "
-            "(full-grid encoder inputs with coordinate-query decoding)"
+            "(full-grid encoder inputs with coordinate-query decoding; "
+            "masking controls decoder query selection only)"
         )
     else:
         print("  Transformer tokenization: points (point-token encoder + coordinate-query decoder)")
@@ -105,10 +106,6 @@ def run_transformer_training(
             encoder_n_points=encoder_n_points,
             decoder_n_points=decoder_n_points,
             masking_strategy=train_masking_strategy,
-            detail_quantile=args.detail_quantile,
-            enc_detail_frac=args.enc_detail_frac,
-            importance_grad_weight=args.importance_grad_weight,
-            importance_power=args.importance_power,
             return_decoder_gradients=return_decoder_gradients,
             encoder_full_grid=encoder_full_grid,
         )
@@ -121,10 +118,6 @@ def run_transformer_training(
             encoder_n_points=encoder_n_points,
             decoder_n_points=decoder_n_points,
             masking_strategy=eval_masking_strategy,
-            detail_quantile=args.detail_quantile,
-            enc_detail_frac=args.enc_detail_frac,
-            importance_grad_weight=args.importance_grad_weight,
-            importance_power=args.importance_power,
             return_decoder_gradients=return_decoder_gradients,
             encoder_full_grid=encoder_full_grid,
         )
@@ -162,10 +155,6 @@ def run_transformer_training(
             encoder_n_points_by_time=encoder_n_points_by_time,
             decoder_n_points_by_time=decoder_n_points_by_time,
             masking_strategy=train_masking_strategy,
-            detail_quantile=args.detail_quantile,
-            enc_detail_frac=args.enc_detail_frac,
-            importance_grad_weight=args.importance_grad_weight,
-            importance_power=args.importance_power,
             held_out_indices=held_out_indices,
             return_decoder_gradients=return_decoder_gradients,
             encoder_full_grid=encoder_full_grid,
@@ -182,10 +171,6 @@ def run_transformer_training(
             encoder_n_points_by_time=encoder_n_points_by_time,
             decoder_n_points_by_time=decoder_n_points_by_time,
             masking_strategy=eval_masking_strategy,
-            detail_quantile=args.detail_quantile,
-            enc_detail_frac=args.enc_detail_frac,
-            importance_grad_weight=args.importance_grad_weight,
-            importance_power=args.importance_power,
             held_out_indices=held_out_indices,
             return_decoder_gradients=return_decoder_gradients,
             encoder_full_grid=encoder_full_grid,

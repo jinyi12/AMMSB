@@ -61,7 +61,7 @@ def _infer_H_by_tidx(
         return float(max(5.0 * float(D_large), float(L_domain)))
 
     # This matches data/generate_large_corpus.py default meso schedule factors.
-    default_meso_factors = [1.0, 1.25, 1.5, 2.0, 2.5, 3.0]
+    default_meso_factors = [1.0, 1.25, 1.5, 2.0, 2.5, 3.0, 4.0]
     n_meso = int(len(times) - 2)
     if n_meso > len(default_meso_factors):
         # Fall back: repeat last factor.

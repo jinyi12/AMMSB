@@ -100,15 +100,22 @@ def sample_decorrelated_values(
     resolution: int,
     min_spacing_pixels: int = 4,
     spacing_multiplier: float = 2.0,
+    observed_correlation_curves: Dict[str, NDArray[np.floating]] | None = None,
 ) -> Dict:
     """Sample decorrelated one-point values using observed correlation lengths.
 
     The observed ensemble determines the spatial spacing, and the same sample
     locations are then applied to both observed and generated fields.
     """
-    from scripts.fae.tran_evaluation.second_order import ensemble_directional_correlation
+    if observed_correlation_curves is None:
+        from scripts.fae.tran_evaluation.second_order import ensemble_directional_correlation
 
-    obs_corr = ensemble_directional_correlation(obs_fields, resolution)
+        obs_corr = ensemble_directional_correlation(obs_fields, resolution)
+    else:
+        obs_corr = {
+            "R_e1_mean": np.asarray(observed_correlation_curves["R_e1_mean"], dtype=np.float64),
+            "R_e2_mean": np.asarray(observed_correlation_curves["R_e2_mean"], dtype=np.float64),
+        }
     spacing_info = decorrelation_spacing_from_curves(
         obs_corr["R_e1_mean"],
         obs_corr["R_e2_mean"],
@@ -248,6 +255,7 @@ def evaluate_first_order_pair(
     gen_fields: NDArray[np.floating],
     resolution: int,
     min_spacing_pixels: int = 4,
+    observed_correlation_curves: Dict[str, NDArray[np.floating]] | None = None,
 ) -> Dict:
     """Run decorrelated first-order evaluation for a single observed/generated pair."""
     sampled = sample_decorrelated_values(
@@ -255,6 +263,7 @@ def evaluate_first_order_pair(
         gen_fields,
         resolution,
         min_spacing_pixels=min_spacing_pixels,
+        observed_correlation_curves=observed_correlation_curves,
     )
     obs_values = sampled["obs_values"]
     gen_values = sampled["gen_values"]

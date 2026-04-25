@@ -26,6 +26,7 @@ from csp import (
     build_conditional_drift_model,
     constant_sigma,
     evaluate_hierarchical_gaussian_benchmark,
+    estimate_monte_carlo_bridge_matching_loss,
     exp_contract_sigma,
     HierarchicalGaussianBenchmarkConfig,
     HierarchicalGaussianPathProblem,
@@ -46,7 +47,7 @@ from csp import (
 from csp.bridge_matching import bridge_target, sample_brownian_bridge
 from scripts.csp.conditional_ecmmd_plots import plot_conditioned_ecmmd_dashboard
 from scripts.csp.conditional_pdf_plots import plot_conditioned_latent_pdfs, pool_scalar_plot_values
-from scripts.csp.evaluate_csp_conditional import sample_csp_conditionals
+from scripts.csp.evaluate_csp_knn_reference import sample_csp_conditionals
 
 
 def _make_model(
@@ -387,6 +388,85 @@ def test_bridge_matching_loss_averages_all_intervals_per_step():
     )(params, jax.random.PRNGKey(221))
 
     assert float(loss) == pytest.approx((1.0**2 + 2.0**2) / 2.0, abs=1e-6)
+
+
+def test_monte_carlo_bridge_matching_loss_is_chunk_invariant():
+    latent_train, _latent_test, zt, _extras, _metadata = make_hierarchical_gaussian_benchmark_splits(
+        train_samples=16,
+        test_samples=8,
+        seed=0,
+        config=HierarchicalGaussianBenchmarkConfig(),
+    )
+    model = _make_conditional_model(
+        latent_dim=int(latent_train.shape[-1]),
+        condition_dim=bridge_condition_dim(
+            int(latent_train.shape[-1]),
+            int(latent_train.shape[0] - 1),
+            "previous_state",
+        ),
+        hidden_dims=(32, 32),
+    )
+    params, static = eqx.partition(model, eqx.is_inexact_array)
+    key = jax.random.PRNGKey(223)
+
+    loss_chunked = estimate_monte_carlo_bridge_matching_loss(
+        static,
+        params,
+        jnp.asarray(latent_train),
+        jnp.asarray(zt),
+        0.05,
+        key=key,
+        mc_passes=6,
+        mc_chunk_size=2,
+        batch_size=8,
+        condition_mode="previous_state",
+    )
+    loss_unchunked = estimate_monte_carlo_bridge_matching_loss(
+        static,
+        params,
+        jnp.asarray(latent_train),
+        jnp.asarray(zt),
+        0.05,
+        key=key,
+        mc_passes=6,
+        mc_chunk_size=6,
+        batch_size=8,
+        condition_mode="previous_state",
+    )
+
+    assert float(loss_chunked) == pytest.approx(float(loss_unchunked), abs=1e-5)
+
+
+def test_monte_carlo_bridge_matching_loss_stays_finite_on_synthetic_latents():
+    latent_data = jnp.asarray(
+        [
+            [[0.1, 0.0], [0.2, 0.1], [0.3, 0.2]],
+            [[0.4, 0.3], [0.5, 0.4], [0.6, 0.5]],
+            [[0.7, 0.6], [0.8, 0.7], [0.9, 0.8]],
+        ],
+        dtype=jnp.float32,
+    )
+    zt = jnp.asarray([0.0, 0.5, 1.0], dtype=jnp.float32)
+    model = _make_conditional_model(
+        latent_dim=2,
+        condition_dim=bridge_condition_dim(2, 2, "previous_state"),
+        hidden_dims=(16, 16),
+    )
+    params, static = eqx.partition(model, eqx.is_inexact_array)
+    loss = estimate_monte_carlo_bridge_matching_loss(
+        static,
+        params,
+        latent_data,
+        zt,
+        0.05,
+        key=jax.random.PRNGKey(224),
+        mc_passes=4,
+        mc_chunk_size=2,
+        batch_size=3,
+        condition_mode="previous_state",
+    )
+    assert jnp.ndim(loss) == 0
+    assert jnp.isfinite(loss)
 
 
 def test_bridge_matching_trains():

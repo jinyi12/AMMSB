@@ -295,6 +295,11 @@ def build_encoder(
             max_grid_size=transformer_grid_size,
             is_variational=False,
         )
+    if encoder_type != "pooling":
+        raise ValueError(
+            f"Unsupported encoder_type={encoder_type!r}. "
+            "Active FAE encoder types are 'pooling' and 'transformer'."
+        )
 
     pooling_fn = get_pooling_fn(
         pooling_type=pooling_type,
@@ -412,20 +417,25 @@ def build_autoencoder(
     Autoencoder, dict : Model and architecture info dict.
     """
     decoder_type = canonicalize_decoder_type(decoder_type, warn=True)
+    if encoder_type == "transformer_vector":
+        raise ValueError(
+            "encoder_type='transformer_vector' has been retired. "
+            "Use encoder_type='transformer' for token-latent transformer FAEs "
+            "or encoder_type='pooling' for vector-latent FAEs."
+        )
+
     uses_transformer_encoder = encoder_type == "transformer"
     uses_transformer_decoder = decoder_type == "transformer"
     if uses_transformer_encoder != uses_transformer_decoder:
         raise ValueError(
-            "The active transformer FAE requires encoder_type='transformer' and "
-            "decoder_type='transformer' together. Mixed vector-latent and "
-            "token-latent components are not supported."
+            "Active transformer FAE variants require a transformer encoder "
+            "('transformer') and decoder_type='transformer' together."
         )
     key, k1, k2 = jax.random.split(key, 3)
     encoder_sigma_bands = parse_multiscale_sigmas_arg(encoder_multiscale_sigmas)
     decoder_sigma_bands = parse_multiscale_sigmas_arg(decoder_multiscale_sigmas)
-    uses_patchified_encoder = (
-        encoder_type == "transformer" and transformer_tokenization == "patches"
-    )
+    uses_patchified_encoder = encoder_type == "transformer" and transformer_tokenization == "patches"
+    latent_representation = "token_sequence" if encoder_type == "transformer" else "vector"
     effective_latent_dim = (
         transformer_num_latents * transformer_emb_dim
         if encoder_type == "transformer"
@@ -507,14 +517,10 @@ def build_autoencoder(
         wire_layers=wire_layers,
         film_norm_type=film_norm_type,
         transformer_emb_dim=transformer_emb_dim,
-        transformer_num_latents=transformer_num_latents,
         transformer_decoder_depth=transformer_decoder_depth,
         transformer_num_heads=n_heads,
         transformer_mlp_ratio=transformer_mlp_ratio,
         transformer_layer_norm_eps=transformer_layer_norm_eps,
-        transformer_tokenization=transformer_tokenization,
-        transformer_patch_size=transformer_patch_size,
-        transformer_grid_size=transformer_grid_size,
     )
 
     # Determine function space compatibility:
@@ -548,9 +554,7 @@ def build_autoencoder(
         "decoder_coord_dim": 2,
         "encoder_type": encoder_type,
         "latent_dim": effective_latent_dim,
-        "latent_representation": (
-            "token_sequence" if encoder_type == "transformer" else "vector"
-        ),
+        "latent_representation": latent_representation,
         "n_freqs": n_freqs,
         "fourier_sigma": fourier_sigma,
         "positional_encoding": encoder_pos_enc_name,
@@ -566,7 +570,9 @@ def build_autoencoder(
         "n_queries": n_queries,
         "n_residual_blocks": n_residual_blocks,
         "transformer_emb_dim": transformer_emb_dim,
-        "transformer_num_latents": transformer_num_latents,
+        "transformer_num_latents": (
+            transformer_num_latents if encoder_type == "transformer" else None
+        ),
         "transformer_encoder_depth": transformer_encoder_depth,
         "transformer_cross_attn_depth": transformer_cross_attn_depth,
         "transformer_decoder_depth": transformer_decoder_depth,

@@ -18,7 +18,7 @@ microscale for tran_inclusion, plus any held-out indices).  The ``zt`` /
 ``time_indices`` arrays in ``fae_latents.npz`` record which dataset indices
 the MSBM *actually* models.  For tran_inclusion with held_out={2,5}:
 
-    time_indices = [1, 3, 4, 6, 7]
+    time_indices = [1, 3, 4, 6, 7, 8]
 
 So the backward SDE's first marginal (after flip) is dataset index 1
 (H=1.0D, first spatially smoothed field), NOT index 0 (raw microscale).
@@ -40,7 +40,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from data.multimarginal_generation import tran_filter_periodic  # noqa: E402
+from data.multimarginal_generation import build_tran_kernel, tran_filter_periodic  # noqa: E402
 from data.transform_utils import (  # noqa: E402
     load_transform_info,
     apply_inverse_transform,
@@ -61,7 +61,7 @@ class FilterLadder:
         Physical filter sizes **including** H=0 for the microscale and the
         macroscale value.  Example for the default settings::
 
-            [0.0, 1.0, 1.25, 1.5, 2.0, 2.5, 3.0, 6.0]
+            [0.0, 1.0, 1.25, 1.5, 2.0, 2.5, 3.0, 4.0, 6.0]
 
     L_domain : float
         Physical domain side length.
@@ -73,9 +73,79 @@ class FilterLadder:
     L_domain: float
     resolution: int
     pixel_size: float = field(init=False)
+    _kernel_fft_cache: dict[float, NDArray[np.complex128]] = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+    )
 
     def __post_init__(self) -> None:
         self.pixel_size = self.L_domain / self.resolution
+
+    def _flatten_fields(
+        self,
+        fields_phys: NDArray[np.floating],
+    ) -> NDArray[np.floating]:
+        values = np.asarray(fields_phys)
+        if values.ndim == 3:
+            return values.reshape(values.shape[0], -1)
+        if values.ndim == 2:
+            return values
+        raise ValueError(
+            "Expected fields with shape (N, res^2) or (N, res, res), "
+            f"got {values.shape}."
+        )
+
+    def _image_batch(
+        self,
+        fields_phys: NDArray[np.floating],
+    ) -> NDArray[np.float64]:
+        flat = self._flatten_fields(fields_phys)
+        return np.asarray(flat, dtype=np.float64).reshape(flat.shape[0], self.resolution, self.resolution)
+
+    def _kernel_fft_at_H(self, H: float) -> NDArray[np.complex128]:
+        h_value = float(H)
+        if h_value <= 1e-9:
+            return np.ones((self.resolution, self.resolution), dtype=np.complex128)
+        if h_value in self._kernel_fft_cache:
+            return self._kernel_fft_cache[h_value]
+
+        kernel_2d, _half_width_pix = build_tran_kernel(
+            H=h_value,
+            pixel_size=self.pixel_size,
+            device="cpu",
+            dtype=torch.float64,
+            max_half_width_pix=max(1, (self.resolution - 1) // 2),
+        )
+        if kernel_2d is None:
+            fft = np.ones((self.resolution, self.resolution), dtype=np.complex128)
+            self._kernel_fft_cache[h_value] = fft
+            return fft
+
+        kernel_arr = np.asarray(kernel_2d.cpu().numpy(), dtype=np.float64)
+        kernel_grid = np.zeros((self.resolution, self.resolution), dtype=np.float64)
+        center_y = kernel_arr.shape[0] // 2
+        center_x = kernel_arr.shape[1] // 2
+        rows = (np.arange(kernel_arr.shape[0], dtype=np.int64) - center_y) % self.resolution
+        cols = (np.arange(kernel_arr.shape[1], dtype=np.int64) - center_x) % self.resolution
+        kernel_grid[np.ix_(rows, cols)] = kernel_arr
+        fft = np.asarray(np.fft.fft2(kernel_grid), dtype=np.complex128)
+        self._kernel_fft_cache[h_value] = fft
+        return fft
+
+    def filter_at_H(
+        self,
+        fields_phys: NDArray[np.floating],
+        H: float,
+    ) -> NDArray[np.floating]:
+        """Filter *physical-scale* fields with the absolute Tran kernel at ``H``."""
+        if H <= 1e-9:
+            return self._flatten_fields(fields_phys).copy()
+
+        imgs = self._image_batch(fields_phys)
+        t_in = torch.from_numpy(imgs.astype(np.float32)).unsqueeze(1)
+        t_out = tran_filter_periodic(t_in, H=float(H), pixel_size=self.pixel_size)
+        return t_out.squeeze(1).numpy().reshape(imgs.shape[0], -1)
 
     def filter_at_scale(
         self,
@@ -96,22 +166,52 @@ class FilterLadder:
         filtered : array (N, res²)
         """
         H = self.H_schedule[scale_idx]
-        if H <= 1e-9:
-            # Microscale — no filtering.
-            if fields_phys.ndim == 3:
-                return fields_phys.reshape(fields_phys.shape[0], -1)
-            return fields_phys.copy()
+        return self.filter_at_H(fields_phys, float(H))
 
-        # Reshape to (N, 1, res, res) for torch convolution.
-        N = fields_phys.shape[0]
-        if fields_phys.ndim == 2:
-            imgs = fields_phys.reshape(N, self.resolution, self.resolution)
+    def transfer_between_H(
+        self,
+        fields_phys: NDArray[np.floating],
+        *,
+        source_H: float,
+        target_H: float,
+        ridge_lambda: float = 0.0,
+    ) -> NDArray[np.float32]:
+        """Apply the periodic transfer map from ``source_H`` to ``target_H``.
+
+        With ``ridge_lambda == 0`` this is the exact map ``K_target K_source^{-1}``.
+        With ``ridge_lambda > 0`` it uses the Tikhonov-regularized multiplier
+
+            K_target * conj(K_source) / (|K_source|^2 + ridge_lambda)
+
+        which suppresses unstable near-null modes of the source kernel.
+        """
+        source_h = float(source_H)
+        target_h = float(target_H)
+        ridge = float(ridge_lambda)
+        if ridge < 0.0:
+            raise ValueError(f"ridge_lambda must be non-negative, got {ridge_lambda!r}.")
+        if abs(target_h - source_h) <= 1e-12:
+            return np.asarray(self._flatten_fields(fields_phys), dtype=np.float32)
+
+        source_fft = self._kernel_fft_at_H(source_h)
+        target_fft = self._kernel_fft_at_H(target_h)
+        source_abs = np.abs(source_fft)
+        if np.any(source_abs == 0.0):
+            raise ValueError(
+                "The discrete periodic source kernel is singular, so the exact "
+                f"transfer from H={source_h:g} to H={target_h:g} is undefined."
+            )
+
+        if ridge <= 0.0 or source_h <= 1e-9:
+            multiplier = target_fft / source_fft
         else:
-            imgs = fields_phys
-        t_in = torch.from_numpy(imgs.astype(np.float32)).unsqueeze(1)  # (N,1,H,W)
-
-        t_out = tran_filter_periodic(t_in, H=H, pixel_size=self.pixel_size)
-        return t_out.squeeze(1).numpy().reshape(N, -1)
+            multiplier = target_fft * np.conj(source_fft) / (np.square(source_abs) + ridge)
+        imgs = self._image_batch(fields_phys)
+        transferred = np.fft.ifft2(
+            np.fft.fft2(imgs, axes=(-2, -1)) * multiplier[None, :, :],
+            axes=(-2, -1),
+        ).real
+        return np.asarray(transferred.reshape(imgs.shape[0], -1), dtype=np.float32)
 
     def filter_all_scales(
         self,
@@ -191,7 +291,7 @@ def load_time_index_mapping(
 
     Returns ``time_indices`` array where ``time_indices[k]`` is the original
     dataset index corresponding to MSBM knot ``k``.  For tran_inclusion with
-    held_out={2,5} (and t=0 excluded), this is ``[1, 3, 4, 6, 7]``.
+    held_out={2,5} (and t=0 excluded), this is ``[1, 3, 4, 6, 7, 8]``.
     """
     latents_path = Path(run_dir) / "fae_latents.npz"
     if not latents_path.exists():

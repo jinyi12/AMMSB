@@ -41,31 +41,11 @@ class MultiscaleFieldDatasetNaive(Dataset):
         Fraction of samples used for training (split by sample index).
     encoder_point_ratio : float
         Fraction of spatial points given to the encoder (rest go to decoder).
-    masking_strategy : {"random", "detail", "full_grid"}
+    masking_strategy : {"random", "full_grid"}
         How to split points between encoder/decoder.
 
         - "random": uniform random split (baseline).
-        - "detail": bias the split so that most high-detail points (small inclusions /
-          sharp transitions) end up in the decoder set, increasing their weight in the
-          reconstruction loss. A small fraction of detail points are still given to the
-          encoder to disambiguate inclusion location.
         - "full_grid": no split; both encoder and decoder receive all grid points.
-    detail_quantile : float
-        Quantile in [0, 1] that defines the "detail" set based on an importance score.
-        Higher means fewer (more extreme) points are considered detail.
-    enc_detail_frac : float
-        Fraction of encoder points forced to come from the detail set under
-        ``masking_strategy="detail"``.
-    importance_grad_weight : float
-        Weight in [0, 1] mixing value deviation vs. gradient magnitude when computing
-        the importance score. 0 uses only amplitude; 1 uses only gradients.
-    importance_power : float
-        Exponent (>= 0) controlling how sharply sampling focuses on high/low-importance
-        points under ``masking_strategy="detail"``.
-
-        - Larger values make the encoder more likely to pick very smooth points
-          (low importance) and keep very detailed points in the decoder set.
-        - A value of 0 makes the sampling uniform within each pool.
     held_out_indices : list[int] or None
         Time-step indices to exclude entirely (for held-out evaluation).
         When ``None``, the ``held_out_indices`` stored in the npz are used.
@@ -88,11 +68,7 @@ class MultiscaleFieldDatasetNaive(Dataset):
         decoder_n_points: Optional[int] = None,
         encoder_n_points_by_time: Optional[Sequence[int]] = None,
         decoder_n_points_by_time: Optional[Sequence[int]] = None,
-        masking_strategy: Literal["random", "detail", "full_grid"] = "random",
-        detail_quantile: float = 0.85,
-        enc_detail_frac: float = 0.05,
-        importance_grad_weight: float = 0.5,
-        importance_power: float = 1.0,
+        masking_strategy: Literal["random", "full_grid"] = "random",
         held_out_indices: Optional[list[int]] = None,
         return_decoder_gradients: bool = False,
         encoder_full_grid: bool = False,
@@ -161,10 +137,11 @@ class MultiscaleFieldDatasetNaive(Dataset):
         # --- Masking ---
         self.encoder_point_ratio = encoder_point_ratio
         self.masking_strategy = masking_strategy
-        self.detail_quantile = float(detail_quantile)
-        self.enc_detail_frac = float(enc_detail_frac)
-        self.importance_grad_weight = float(importance_grad_weight)
-        self.importance_power = float(importance_power)
+        if self.masking_strategy not in {"random", "full_grid"}:
+            raise ValueError(
+                "masking_strategy must be 'random' or 'full_grid'. "
+                f"Got {self.masking_strategy!r}."
+            )
 
         self.encoder_n_points = int(encoder_n_points) if encoder_n_points is not None else None
         self.decoder_n_points = int(decoder_n_points) if decoder_n_points is not None else None
@@ -193,7 +170,7 @@ class MultiscaleFieldDatasetNaive(Dataset):
         self._idx_grid: Optional[np.ndarray] = None
         self._dx: Optional[float] = None
         self._dy: Optional[float] = None
-        if masking_strategy != "random" or self.return_decoder_gradients:
+        if self.return_decoder_gradients:
             self._prepare_grid_mapping()
 
     def _resolve_time_schedule(
@@ -305,19 +282,16 @@ class MultiscaleFieldDatasetNaive(Dataset):
     def _prepare_grid_mapping(self) -> None:
         """Precompute a mapping from 2D grid indices to flat point indices.
 
-        This lets us compute gradient-based importance scores even if the flattened
+        This lets us compute periodic decoder-target gradients even if the flattened
         ordering of ``grid_coords`` is not guaranteed to be row-major.
         """
         n_pts = self.grid_coords.shape[0]
         if self.resolution * self.resolution != n_pts:
-            # Unexpected; fall back to random masking.
-            self.masking_strategy = "random"
             return
 
         xs = np.unique(self.grid_coords[:, 0])
         ys = np.unique(self.grid_coords[:, 1])
         if xs.shape[0] != self.resolution or ys.shape[0] != self.resolution:
-            self.masking_strategy = "random"
             return
 
         xs = np.sort(xs)
@@ -334,7 +308,6 @@ class MultiscaleFieldDatasetNaive(Dataset):
             or (iy < 0).any()
             or (iy >= self.resolution).any()
         ):
-            self.masking_strategy = "random"
             return
 
         idx_grid = np.empty((self.resolution, self.resolution), dtype=np.int32)
@@ -344,155 +317,16 @@ class MultiscaleFieldDatasetNaive(Dataset):
         self._dx = dx
         self._dy = dy
 
-    def _importance_scores(self, u_full: np.ndarray) -> Optional[np.ndarray]:
-        """Compute a per-point importance score for detail-aware masking.
-
-        Returns
-        -------
-        scores : np.ndarray of shape [n_pts]
-            Larger means more "detail" (likely inclusion boundaries / extrema).
-        """
-        if self._idx_grid is None or self._dx is None or self._dy is None:
-            return None
-
-        u_flat = u_full[:, 0].astype(np.float32, copy=False)
-        u_grid = u_flat[self._idx_grid]  # [res, res]
-
-        # Amplitude-based importance (captures inclusion interiors / extrema).
-        amp = np.abs(u_grid - float(np.mean(u_grid))).astype(np.float32, copy=False)
-
-        # Gradient-based importance (captures inclusion boundaries).
-        du_dy, du_dx = np.gradient(u_grid, self._dy, self._dx, edge_order=1)
-        grad = np.sqrt(du_dx**2 + du_dy**2).astype(np.float32, copy=False)
-
-        w = float(np.clip(self.importance_grad_weight, 0.0, 1.0))
-        score_grid = (1.0 - w) * amp + w * grad
-
-        # Normalize to [0, 1] robustly, then sharpen/flatten with a power.
-        s_min = float(np.min(score_grid))
-        s_max = float(np.max(score_grid))
-        if not np.isfinite(s_min) or not np.isfinite(s_max) or (s_max - s_min) < 1e-12:
-            return None
-        score_grid = (score_grid - s_min) / (s_max - s_min)
-
-        scores = np.empty((u_flat.shape[0],), dtype=np.float32)
-        scores[self._idx_grid.reshape(-1)] = score_grid.reshape(-1).astype(np.float32, copy=False)
-        return scores
-
-    @staticmethod
-    def _weighted_choice_without_replacement(
-        idx: np.ndarray,
-        weights: np.ndarray,
-        k: int,
-    ) -> np.ndarray:
-        """Sample k indices without replacement using nonnegative weights."""
-        if k <= 0:
-            return np.empty((0,), dtype=np.int32)
-        if idx.size <= k:
-            out = idx.astype(np.int32, copy=False)
-            np.random.shuffle(out)
-            return out
-
-        w = weights.astype(np.float64, copy=False)
-        w = np.clip(w, 0.0, None)
-        total = float(np.sum(w))
-        if not np.isfinite(total) or total <= 0.0:
-            return np.random.choice(idx, size=k, replace=False).astype(np.int32, copy=False)
-
-        p = w / total
-        return np.random.choice(idx, size=k, replace=False, p=p).astype(np.int32, copy=False)
-
-    def _split_indices(
-        self,
-        u_full: np.ndarray,
-        *,
-        n_enc: Optional[int] = None,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """Split points into encoder/decoder sets according to the configured strategy."""
-        n_pts = self.grid_coords.shape[0]
-        if n_enc is None:
-            n_enc = int(n_pts * self.encoder_point_ratio)
-        n_enc = int(np.clip(n_enc, 1, n_pts - 1))
-
-        if self.masking_strategy == "random":
-            perm = np.random.permutation(n_pts)
-            enc_indices = perm[:n_enc]
-            dec_indices = perm[n_enc:]
-            return enc_indices, dec_indices
-
-        scores = self._importance_scores(u_full)
-        if scores is None:
-            perm = np.random.permutation(n_pts)
-            enc_indices = perm[:n_enc]
-            dec_indices = perm[n_enc:]
-            return enc_indices, dec_indices
-
-        p = float(max(self.importance_power, 0.0))
-        eps = 1e-6
-
-        q = float(np.clip(self.detail_quantile, 0.0, 1.0))
-        thr = float(np.quantile(scores, q))
-        detail_idx = np.flatnonzero(scores >= thr)
-        smooth_idx = np.flatnonzero(scores < thr)
-
-        # Force only a small fraction of encoder points to come from detail.
-        enc_detail_frac = float(np.clip(self.enc_detail_frac, 0.0, 1.0))
-        n_enc_detail = int(round(n_enc * enc_detail_frac))
-        n_enc_detail = int(np.clip(n_enc_detail, 0, n_enc))
-
-        # Guard against pathological quantiles that produce empty bins.
-        if detail_idx.size == 0 or smooth_idx.size == 0:
-            perm = np.random.permutation(n_pts)
-            enc_indices = perm[:n_enc]
-            dec_indices = perm[n_enc:]
-            return enc_indices, dec_indices
-
-        n_enc_detail = min(n_enc_detail, int(detail_idx.size))
-        n_enc_smooth = n_enc - n_enc_detail
-        if n_enc_smooth > smooth_idx.size:
-            # Not enough smooth points; fall back to uniform.
-            perm = np.random.permutation(n_pts)
-            enc_indices = perm[:n_enc]
-            dec_indices = perm[n_enc:]
-            return enc_indices, dec_indices
-
-        # Weighted sampling: importance_power now controls sharpness.
-        # - For encoder "detail anchors": bias toward the highest-importance points.
-        # - For encoder "smooth context": bias toward the lowest-importance points.
-        if n_enc_detail > 0:
-            w_detail = (scores[detail_idx] + eps) ** p
-            enc_detail = self._weighted_choice_without_replacement(detail_idx, w_detail, n_enc_detail)
-        else:
-            enc_detail = np.empty((0,), dtype=np.int32)
-
-        w_smooth = ((1.0 - scores[smooth_idx]) + eps) ** p
-        enc_smooth = self._weighted_choice_without_replacement(smooth_idx, w_smooth, n_enc_smooth)
-        enc_indices = np.concatenate([enc_detail, enc_smooth]).astype(np.int32, copy=False)
-        np.random.shuffle(enc_indices)
-
-        enc_mask = np.zeros((n_pts,), dtype=bool)
-        enc_mask[enc_indices] = True
-        dec_indices = np.flatnonzero(~enc_mask).astype(np.int32, copy=False)
-        np.random.shuffle(dec_indices)
-        return enc_indices, dec_indices
-
     def _sample_decoder_indices(
         self,
         *,
         remaining: np.ndarray,
-        scores: Optional[np.ndarray],
         n_dec: int,
     ) -> np.ndarray:
         if remaining.size <= n_dec:
             out = remaining.astype(np.int32, copy=False)
             np.random.shuffle(out)
             return out
-
-        if self.masking_strategy == "detail" and scores is not None:
-            eps = 1e-6
-            p = float(max(self.importance_power, 0.0))
-            weights = (scores[remaining] + eps) ** p
-            return self._weighted_choice_without_replacement(remaining, weights, n_dec)
 
         return np.random.choice(remaining, size=n_dec, replace=False).astype(np.int32, copy=False)
 
@@ -544,10 +378,8 @@ class MultiscaleFieldDatasetNaive(Dataset):
             if self.masking_strategy == "full_grid":
                 dec_indices = self.full_grid_indices
             else:
-                scores = self._importance_scores(u_full) if self.masking_strategy == "detail" else None
                 dec_indices = self._sample_decoder_indices(
                     remaining=self.full_grid_indices.astype(np.int32, copy=False),
-                    scores=scores,
                     n_dec=self._get_decoder_budget_with_full_grid_encoder(time_idx),
                 )
         else:
@@ -557,22 +389,15 @@ class MultiscaleFieldDatasetNaive(Dataset):
                 perm = np.random.permutation(self.grid_coords.shape[0])
                 enc_indices = perm[:n_enc].astype(np.int32, copy=False)
                 remaining = perm[n_enc:].astype(np.int32, copy=False)
-                dec_indices = remaining[:n_dec].astype(np.int32, copy=False)
+                dec_indices = self._sample_decoder_indices(
+                    remaining=remaining,
+                    n_dec=n_dec,
+                )
             elif self.masking_strategy == "full_grid":
                 enc_indices = self.full_grid_indices
                 dec_indices = self.full_grid_indices
             else:
-                enc_indices, _ = self._split_indices(u_full, n_enc=n_enc)
-                remaining_mask = np.ones((self.grid_coords.shape[0],), dtype=bool)
-                remaining_mask[enc_indices] = False
-                remaining = np.flatnonzero(remaining_mask).astype(np.int32, copy=False)
-
-                scores = self._importance_scores(u_full) if self.masking_strategy == "detail" else None
-                dec_indices = self._sample_decoder_indices(
-                    remaining=remaining,
-                    scores=scores,
-                    n_dec=n_dec,
-                )
+                raise ValueError(f"Unknown masking_strategy: {self.masking_strategy}")
 
         # Encoder: values and 2D coords (x, y) - NO TIME
         u_enc = u_full[enc_indices]  # [n_enc, 1]

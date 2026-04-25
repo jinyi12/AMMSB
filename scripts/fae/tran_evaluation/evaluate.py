@@ -46,7 +46,7 @@ TIME INDEX MAPPING (critical)
 The MSBM training excludes certain dataset time indices.  For the
 tran_inclusion dataset with held_out={2,5} and t=0 excluded:
 
-    time_indices = [1, 3, 4, 6, 7]
+    time_indices = [1, 3, 4, 6, 7, 8]
 
 The backward SDE's first marginal (after flip) is dataset index 1
 (H=1.0D, first spatially smoothed field), NOT index 0 (raw microscale).
@@ -64,9 +64,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any, Optional
+
+if "--nogpu" in sys.argv:
+    os.environ.setdefault("JAX_PLATFORM_NAME", "cpu")
+    os.environ.setdefault("JAX_PLATFORMS", "cpu")
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
 import numpy as np
 
@@ -90,6 +96,16 @@ from scripts.fae.tran_evaluation.coarse_consistency_runtime import (  # noqa: E4
     evaluate_conditioned_interval_coarse_consistency_for_runtime,
     load_coarse_consistency_runtime,
     split_ground_truth_fields_for_run,
+)
+from scripts.fae.tran_evaluation.coarse_consistency_eval import (  # noqa: E402
+    build_coarse_eval_scope as _build_shared_coarse_eval_scope,
+    build_coarse_only_summary as _build_shared_coarse_only_summary,
+)
+from scripts.fae.tran_evaluation.eval_cache_store import (  # noqa: E402
+    build_generated_cache_manifest,
+    load_generated_cache_from_store,
+    refresh_generated_cache_export_from_store,
+    save_generated_cache_store,
 )
 from scripts.fae.tran_evaluation.detail_fields import (  # noqa: E402
     build_generated_detail_fields,
@@ -115,18 +131,8 @@ from scripts.fae.tran_evaluation.report import (  # noqa: E402
     plot_coarse_consistency_condition_distributions,
     plot_coarse_consistency_global_qualitative,
     plot_coarse_consistency_interval_qualitative,
-    plot_detail_bands,
-    plot_direct_field_correlation,
     plot_direct_field_pdfs,
-    plot_directional_correlation,
-    plot_diversity,
-    plot_J_bars,
-    plot_pdfs,
-    plot_psd,
-    plot_qq,
     plot_sample_realizations,
-    plot_trajectory_correlation,
-    plot_trajectory_correlation_superposed,
     plot_trajectory_fields,
     plot_trajectory_pdfs,
     plot_trajectory_psd,
@@ -136,6 +142,32 @@ from scripts.fae.tran_evaluation.report import (  # noqa: E402
 )
 from scripts.images.field_visualization import format_for_paper  # noqa: E402
 from scripts.utils import get_device  # noqa: E402
+
+
+def _generated_cache_manifest_for_run(
+    *,
+    run_dir: Path,
+    dataset_path: Path,
+    generated_data_path: Path,
+    time_indices: np.ndarray,
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    return build_generated_cache_manifest(
+        fingerprint={
+            "run_dir": str(run_dir),
+            "dataset_path": str(dataset_path),
+            "generated_data_path": str(generated_data_path),
+            "n_realizations": int(args.n_realizations),
+            "sample_idx": int(args.sample_idx),
+            "trajectory_seed_mode": str(args.trajectory_seed_mode),
+            "seed": int(args.seed),
+            "use_ema": bool(args.use_ema),
+            "drift_clip_norm": None if args.drift_clip_norm is None else float(args.drift_clip_norm),
+            "decode_mode": str(args.decode_mode),
+            "time_indices": np.asarray(time_indices, dtype=np.int64),
+        }
+    )
+
 
 def _save_generated_data_cache(path: Path, gen: dict[str, Any]) -> None:
     """Persist generated evaluation data for later plot-only reruns."""
@@ -216,6 +248,10 @@ def _npz_safe_key(label: str) -> str:
     while "__" in safe:
         safe = safe.replace("__", "_")
     return safe.strip("_")
+
+
+def _build_coarse_only_summary(coarse_results: dict[str, Any] | None) -> str:
+    return _build_shared_coarse_only_summary(coarse_results)
 
 
 def _build_global_coarse_targets(
@@ -300,7 +336,7 @@ def _parse_args() -> argparse.Namespace:
     # --- Physics / geometry ---
     p.add_argument("--L_domain", type=float, default=6.0)
     p.add_argument(
-        "--H_meso_list", type=str, default="1.0,1.25,1.5,2.0,2.5,3.0",
+        "--H_meso_list", type=str, default="1.0,1.25,1.5,2.0,2.5,3.0,4.0",
         help="Comma-separated mesoscale filter sizes (physical units).",
     )
     p.add_argument("--H_macro", type=float, default=6.0)
@@ -407,10 +443,39 @@ def _parse_args() -> argparse.Namespace:
         help="Stabilizer used in relative coarse-consistency metrics.",
     )
     p.add_argument(
+        "--coarse_transfer_ridge_lambda",
+        type=float,
+        default=1e-8,
+        help=(
+            "Tikhonov ridge for the H_source -> H_target spectral transfer used in coarse consistency. "
+            "Set to 0 for the exact inverse-kernel map."
+        ),
+    )
+    p.add_argument(
         "--coarse_decode_batch_size",
         type=int,
-        default=256,
-        help="Batch size for FAE decoding during conditioned coarse evaluation.",
+        default=64,
+        help="Batch size for FAE decoding during conditioned coarse evaluation. Keep this modest for GPU-backed transformer decoders.",
+    )
+    p.add_argument(
+        "--coarse_sampling_device",
+        type=str,
+        default="auto",
+        choices=["auto", "gpu", "cpu"],
+        help="Token-native coarse-consistency sampling device policy. Ignored by non-token runtimes.",
+    )
+    p.add_argument(
+        "--coarse_decode_device",
+        type=str,
+        default="auto",
+        choices=["auto", "gpu", "cpu"],
+        help="Token-native coarse-consistency decode device policy. Ignored by non-token runtimes.",
+    )
+    p.add_argument(
+        "--coarse_decode_point_batch_size",
+        type=int,
+        default=None,
+        help="Optional token-native decode point-chunk size used during coarse consistency.",
     )
 
     # --- Options ---
@@ -425,6 +490,16 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Only compute/save native knot-time trajectory statistics and figures. "
              "Skips Phases 1-6 and latent-geometry diagnostics.",
+    )
+    p.add_argument(
+        "--coarse_only",
+        action="store_true",
+        help="Only compute/save Phase 1 coarse-consistency diagnostics. Skips Phases 2-7b.",
+    )
+    p.add_argument(
+        "--skip_coarse_consistency",
+        action="store_true",
+        help="Skip Phase 1 coarse-consistency diagnostics and run the remaining Tran phases only.",
     )
     p.add_argument(
         "--no_latent_geometry",
@@ -507,8 +582,16 @@ def _parse_args() -> argparse.Namespace:
         p.error("--conditioned_global_realizations must be > 0.")
     if args.coarse_decode_batch_size <= 0:
         p.error("--coarse_decode_batch_size must be > 0.")
+    if args.coarse_decode_point_batch_size is not None and args.coarse_decode_point_batch_size <= 0:
+        p.error("--coarse_decode_point_batch_size must be > 0 when provided.")
     if args.coarse_relative_epsilon < 0.0:
         p.error("--coarse_relative_epsilon must be >= 0.")
+    if args.coarse_transfer_ridge_lambda < 0.0:
+        p.error("--coarse_transfer_ridge_lambda must be >= 0.")
+    if args.trajectory_only and args.coarse_only:
+        p.error("--trajectory_only and --coarse_only are mutually exclusive.")
+    if args.coarse_only and args.skip_coarse_consistency:
+        p.error("--coarse_only cannot be combined with --skip_coarse_consistency.")
 
     return args
 
@@ -707,49 +790,13 @@ def _build_eval_scope(
     L_domain: float,
     resolution: int,
 ) -> tuple[list[float], dict[int, np.ndarray], "FilterLadder"]:
-    """Build the evaluation-scope ladder and GT fields.
-
-    The generator outputs at dataset indices actually present in the MSBM
-    training set, encoded by ``modeled_dataset_indices``. The evaluation
-    must therefore follow those indices instead of assuming that all
-    intermediate dataset scales are available.
-
-    Returns
-    -------
-    eval_H_schedule : list[float]
-        ``[0.0, H(modeled_1), H(modeled_2), ..., H(modeled_last)]`` where
-        H=0 acts as "identity / no filtering" for the generated field at the
-        first modeled scale.
-    eval_gt_fields : dict[int, ndarray (N, res^2)]
-        GT fields remapped so that key 0 = the first modeled scale,
-        key 1 = the next modeled scale, etc.
-    eval_ladder : FilterLadder
-        Ladder configured with ``eval_H_schedule``.
-    """
-    if not modeled_dataset_indices:
-        raise ValueError("modeled_dataset_indices must contain at least one dataset index.")
-
-    modeled_dataset_indices = [int(idx) for idx in modeled_dataset_indices]
-    if modeled_dataset_indices[0] == 0:
-        raise ValueError(
-            "modeled_dataset_indices should exclude raw microscale index 0 for Tran evaluation."
-        )
-
-    # H=0 (identity) corresponds to the generator's native scale.
-    eval_H_schedule = [0.0] + [full_H_schedule[idx] for idx in modeled_dataset_indices[1:]]
-
-    eval_gt_fields = {
-        new_idx: gt_fields_by_index[old_idx]
-        for new_idx, old_idx in enumerate(modeled_dataset_indices)
-    }
-
-    eval_ladder = FilterLadder(
-        H_schedule=eval_H_schedule,
-        L_domain=L_domain,
-        resolution=resolution,
+    return _build_shared_coarse_eval_scope(
+        full_H_schedule,
+        gt_fields_by_index,
+        modeled_dataset_indices,
+        L_domain,
+        resolution,
     )
-
-    return eval_H_schedule, eval_gt_fields, eval_ladder
 
 
 # ============================================================================
@@ -823,11 +870,35 @@ def main() -> None:
         # Load time_indices for correct GT alignment.
         time_indices = load_time_index_mapping(run_dir)
         print(f"MSBM time_indices (dataset indices): {time_indices.tolist()}")
+        generated_cache_manifest = _generated_cache_manifest_for_run(
+            run_dir=run_dir.expanduser().resolve(),
+            dataset_path=ds_path.expanduser().resolve(),
+            generated_data_path=generated_data_path.expanduser().resolve(),
+            time_indices=time_indices,
+            args=args,
+        )
 
-        if args.reuse_generated_data and generated_data_path.exists():
-            print(f"\n--- Reusing cached generated data: {generated_data_path} ---")
-            gen = _load_generated_data_cache(generated_data_path)
+        if args.reuse_generated_data:
+            gen = load_generated_cache_from_store(
+                export_path=generated_data_path.expanduser().resolve(),
+                manifest=generated_cache_manifest,
+            )
+            if gen is not None:
+                if not generated_data_path.exists():
+                    refresh_generated_cache_export_from_store(
+                        export_path=generated_data_path.expanduser().resolve(),
+                        manifest=generated_cache_manifest,
+                    )
+                print(f"\n--- Reusing generated data cache: {generated_data_path} ---")
+            elif generated_data_path.exists():
+                print(f"\n--- Reusing cached generated data: {generated_data_path} ---")
+                gen = _load_generated_data_cache(generated_data_path)
+            else:
+                gen = None
         else:
+            gen = None
+
+        if gen is None:
             print(f"\n--- Generating {args.n_realizations} backward realisations ---")
             from scripts.fae.tran_evaluation.generate import (  # noqa: E402
                 generate_backward_realizations,
@@ -837,7 +908,6 @@ def main() -> None:
             if args.nogpu:
                 import torch
                 device = torch.device("cpu")
-
             gen = generate_backward_realizations(
                 run_dir=run_dir,
                 dataset_npz_path=ds_path,
@@ -850,7 +920,11 @@ def main() -> None:
                 device=device,
                 decode_mode=args.decode_mode,
             )
-            _save_generated_data_cache(generated_data_path, gen)
+            save_generated_cache_store(
+                export_path=generated_data_path.expanduser().resolve(),
+                gen=gen,
+                manifest=generated_cache_manifest,
+            )
             print(f"Saved generated data cache to {generated_data_path}")
 
     else:
@@ -875,6 +949,17 @@ def main() -> None:
     if args.trajectory_only:
         args.no_latent_geometry = True
         print("Trajectory-only mode enabled: skipping Phases 1-6 and latent geometry.")
+    if args.coarse_only:
+        args.no_latent_geometry = True
+        print("Coarse-only mode enabled: skipping Phases 2-7b.")
+    if args.skip_coarse_consistency:
+        print("Skip-coarse-consistency mode enabled: skipping Phase 1.")
+
+    run_coarse_phase = not args.trajectory_only and not args.skip_coarse_consistency
+    run_detail_phases = not args.trajectory_only and not args.coarse_only
+    run_trajectory_phase = not args.coarse_only
+    run_latent_geometry = not args.no_latent_geometry and not args.trajectory_only and not args.coarse_only
+    coarse_phase_out_dir = out_dir if args.coarse_only else out_dir / "coarse_consistency"
 
     if time_indices is None:
         print("WARNING: time_indices not available; "
@@ -965,7 +1050,7 @@ def main() -> None:
     obs_ensemble_details = {}
     gen_details = {}
 
-    if not args.trajectory_only:
+    if run_coarse_phase:
         # ---------------------------------------------------------------
         # Phase 1: Sequential coarse consistency
         # ---------------------------------------------------------------
@@ -995,6 +1080,9 @@ def main() -> None:
                 decode_mode=args.decode_mode,
                 decode_batch_size=args.coarse_decode_batch_size,
                 use_ema=args.use_ema,
+                coarse_sampling_device=args.coarse_sampling_device,
+                coarse_decode_device=args.coarse_decode_device,
+                coarse_decode_point_batch_size=args.coarse_decode_point_batch_size,
             )
             _train_fields_by_tidx, test_fields_by_tidx = split_ground_truth_fields_for_run(
                 gt["fields_by_index"],
@@ -1022,11 +1110,13 @@ def main() -> None:
                     test_fields_by_tidx=test_fields_by_tidx,
                     ladder=eval_ladder,
                     full_h_schedule=full_H_schedule,
+                    output_dir=coarse_phase_out_dir,
                     n_conditions=args.coarse_eval_conditions,
                     n_realizations=args.coarse_eval_realizations,
                     seed=args.seed,
                     drift_clip_norm=args.drift_clip_norm,
                     relative_eps=args.coarse_relative_epsilon,
+                    transfer_ridge_lambda=args.coarse_transfer_ridge_lambda,
                 )
                 coarse_results["conditioned_interval"] = conditioned_interval["intervals"]
                 coarse_qualitative_results["conditioned_interval"] = conditioned_interval["qualitative_examples"]
@@ -1065,11 +1155,13 @@ def main() -> None:
                     test_fields_by_tidx=test_fields_by_tidx,
                     ladder=eval_ladder,
                     full_h_schedule=full_H_schedule,
+                    output_dir=coarse_phase_out_dir,
                     n_conditions=args.conditioned_global_conditions,
                     n_realizations=args.conditioned_global_realizations,
                     seed=args.seed + 31_415,
                     drift_clip_norm=args.drift_clip_norm,
                     relative_eps=args.coarse_relative_epsilon,
+                    transfer_ridge_lambda=args.coarse_transfer_ridge_lambda,
                 )
                 coarse_results["conditioned_global_return"] = conditioned_global["summary"]
                 coarse_qualitative_results["conditioned_global_return"] = conditioned_global["qualitative_examples"]
@@ -1096,7 +1188,10 @@ def main() -> None:
                 coarse_targets,
                 group_ids,
                 ladder=eval_ladder,
+                source_h=float(label_H_schedule[0]),
+                target_h=float(full_H_schedule[gt_macro_dataset_idx]),
                 macro_scale_idx=eval_macro_scale_idx,
+                transfer_ridge_lambda=args.coarse_transfer_ridge_lambda,
                 relative_eps=args.coarse_relative_epsilon,
             )
             coarse_results["cache_global_return"] = cache_global
@@ -1112,6 +1207,8 @@ def main() -> None:
             path_results = evaluate_path_self_consistency(
                 gen["trajectory_fields_phys"],
                 ladder=eval_ladder,
+                modeled_h_schedule=[float(item) for item in label_H_schedule],
+                transfer_ridge_lambda=args.coarse_transfer_ridge_lambda,
                 relative_eps=args.coarse_relative_epsilon,
                 group_ids=gen.get("sample_indices"),
             )
@@ -1124,6 +1221,7 @@ def main() -> None:
         else:
             print("  Path self-consistency unavailable: trajectory_fields_phys missing.")
 
+    if run_detail_phases:
         # ---------------------------------------------------------------
         # Phase 2: Detail field decomposition
         # ---------------------------------------------------------------
@@ -1229,12 +1327,15 @@ def main() -> None:
     # ---------------------------------------------------------------
     # Phase 7: Backward SDE trajectory evaluation
     # ---------------------------------------------------------------
-    print("\n--- Phase 7: Backward SDE trajectory field evaluation ---")
+    if run_trajectory_phase:
+        print("\n--- Phase 7: Backward SDE trajectory field evaluation ---")
+    else:
+        print("\n--- Phase 7: Backward SDE trajectory field evaluation (skipped in coarse-only mode) ---")
 
     trajectory_results = {}
     trajectory_fields = gen.get("trajectory_fields_phys")
 
-    if trajectory_fields is not None and time_indices is not None:
+    if run_trajectory_phase and trajectory_fields is not None and time_indices is not None:
         from scripts.fae.tran_evaluation.second_order import (  # noqa: E402
             ensemble_directional_correlation,
             tran_J_mismatch,
@@ -1333,7 +1434,9 @@ def main() -> None:
         )
         print(traj_summary)
     else:
-        if trajectory_fields is None:
+        if not run_trajectory_phase:
+            print("  Coarse-only mode skips trajectory evaluation.")
+        elif trajectory_fields is None:
             print("  Trajectory fields not available (legacy mode or generation "
                   "did not return knot fields). Skipping.")
         else:
@@ -1344,7 +1447,7 @@ def main() -> None:
     # ---------------------------------------------------------------
     latent_geometry_results = None
     latent_geom_time_indices = None
-    if not args.no_latent_geometry and not args.trajectory_only:
+    if run_latent_geometry:
         print("\n--- Phase 7b: Latent geometry robustness ---")
         try:
             latent_geometry_results, latent_geom_time_indices = _compute_latent_geometry_results(
@@ -1358,6 +1461,11 @@ def main() -> None:
 
     if args.trajectory_only:
         print("\n--- Phase 8: Trajectory-only reporting ---")
+    elif args.coarse_only:
+        print("\n--- Phase 8: Coarse-only reporting ---")
+        summary = _build_coarse_only_summary(coarse_results)
+        print(summary)
+        (out_dir / "summary.txt").write_text(summary)
     else:
         print("\n--- Phase 8: Reporting ---")
 
@@ -1376,6 +1484,8 @@ def main() -> None:
             "sample_idx": args.sample_idx,
             "n_realizations": K,
             "trajectory_only": args.trajectory_only,
+            "coarse_only": args.coarse_only,
+            "skip_coarse_consistency": args.skip_coarse_consistency,
             "trajectory_seed_mode": args.trajectory_seed_mode,
             "coarse_eval_mode": args.coarse_eval_mode,
             "coarse_eval_conditions": args.coarse_eval_conditions,
@@ -1383,7 +1493,11 @@ def main() -> None:
             "conditioned_global_conditions": args.conditioned_global_conditions,
             "conditioned_global_realizations": args.conditioned_global_realizations,
             "coarse_relative_epsilon": args.coarse_relative_epsilon,
+            "coarse_transfer_ridge_lambda": args.coarse_transfer_ridge_lambda,
             "coarse_decode_batch_size": args.coarse_decode_batch_size,
+            "coarse_sampling_device": args.coarse_sampling_device,
+            "coarse_decode_device": args.coarse_decode_device,
+            "coarse_decode_point_batch_size": args.coarse_decode_point_batch_size,
             "report_cache_global_return": args.report_cache_global_return,
             "gt_micro_dataset_idx": gt_micro_dataset_idx,
             "gt_macro_dataset_idx": gt_macro_dataset_idx,
@@ -1396,6 +1510,11 @@ def main() -> None:
                 if gen.get("sample_indices") is not None else None
             ),
             "latent_geom_time_indices": latent_geom_time_indices,
+            "coarse_runtime_metadata": (
+                _to_jsonable(coarse_runtime.metadata)
+                if coarse_runtime is not None
+                else None
+            ),
         },
         "coarse_consistency": _to_jsonable(coarse_results),
         "first_order": {},
@@ -1567,6 +1686,10 @@ def main() -> None:
         format_for_paper()
 
         print("\nGenerating figures...")
+        print(
+            "  Detail-band figures and unconditional autocorrelation panels are omitted. "
+            "Use knn_reference/field_metrics for manuscript conditional autocorrelation figures."
+        )
 
         if args.trajectory_only:
             n_figs = 0
@@ -1574,64 +1697,65 @@ def main() -> None:
                 plot_trajectory_pdfs(
                     trajectory_results, time_indices, full_H_schedule, out_dir,
                 )
-                plot_trajectory_correlation(
-                    trajectory_results, time_indices, full_H_schedule,
-                    pixel_size, out_dir,
-                )
-                plot_trajectory_correlation_superposed(
-                    trajectory_results, time_indices, full_H_schedule,
-                    pixel_size, out_dir,
-                )
-                n_figs = 3
-        else:
-            # Filter generated fields at each eval scale for direct comparison.
-            gen_filtered = eval_ladder.filter_all_scales(gen["realizations_phys"])
-
-            # Fig 1-1b: Phase-1 coarse consistency.
+                n_figs = 1
+        elif args.coarse_only:
+            n_figs = 0
             if coarse_results is not None:
-                plot_coarse_consistency_breakdown(coarse_results, out_dir)
-                plot_coarse_consistency_condition_distributions(coarse_results, out_dir)
+                plot_coarse_consistency_breakdown(coarse_results, coarse_phase_out_dir)
+                plot_coarse_consistency_condition_distributions(coarse_results, coarse_phase_out_dir)
+                n_figs = 2
                 if coarse_qualitative_results is not None:
                     plot_coarse_consistency_global_qualitative(
                         coarse_qualitative_results,
                         resolution,
-                        out_dir,
+                        coarse_phase_out_dir,
                     )
                     plot_coarse_consistency_interval_qualitative(
                         coarse_results,
                         coarse_qualitative_results,
                         resolution,
-                        out_dir,
+                        coarse_phase_out_dir,
                     )
-            # Fig 2: Sample realisations vs GT at gen's native scale (NOT raw micro).
+                    n_figs += 2
+        else:
+            n_figs = 0
+            # Filter generated fields at each eval scale for direct comparison.
+            gen_filtered = eval_ladder.filter_all_scales(gen["realizations_phys"])
+
+            # Phase-1 coarse consistency figures.
+            if coarse_results is not None:
+                plot_coarse_consistency_breakdown(coarse_results, coarse_phase_out_dir)
+                plot_coarse_consistency_condition_distributions(coarse_results, coarse_phase_out_dir)
+                n_figs += 2
+                if coarse_qualitative_results is not None:
+                    plot_coarse_consistency_global_qualitative(
+                        coarse_qualitative_results,
+                        resolution,
+                        coarse_phase_out_dir,
+                    )
+                    plot_coarse_consistency_interval_qualitative(
+                        coarse_results,
+                        coarse_qualitative_results,
+                        resolution,
+                        coarse_phase_out_dir,
+                    )
+                    n_figs += 2
+            # Sample realizations vs GT at gen's native scale (not raw micro).
             plot_sample_realizations(
                 gen["realizations_phys"], gt_micro_sample, resolution, out_dir,
             )
-            # Figs 3-9: All use eval-scoped detail bands (raw micro excluded).
-            plot_detail_bands(obs_single_details, gen_details, resolution, out_dir,
-                              H_schedule=label_H_schedule)
-            plot_pdfs(first_order, out_dir,
-                      H_schedule=label_H_schedule)
-            plot_qq(first_order, out_dir, H_schedule=label_H_schedule)
-            plot_directional_correlation(second_order, pixel_size, out_dir,
-                                         H_schedule=label_H_schedule)
-            plot_J_bars(second_order, out_dir, H_schedule=label_H_schedule)
-            plot_psd(spectral, out_dir, H_schedule=label_H_schedule)
-            plot_diversity(diversity, out_dir)
+            n_figs += 1
 
-            # Figs 10-11: Direct-field (non-detail-band) comparisons.
+            # Direct-field unconditional PDFs at each eval scale.
             plot_direct_field_pdfs(
                 eval_gt_ensemble_fields, gen_filtered, label_H_schedule, out_dir,
                 min_spacing_pixels=args.min_spacing_pixels,
             )
-            plot_direct_field_correlation(
-                eval_gt_ensemble_fields, gen_filtered, label_H_schedule,
-                resolution, pixel_size, out_dir,
-            )
+            n_figs += 1
 
-            n_figs = 12
-
-            # Figs 12-17: Backward SDE trajectory field evaluations.
+            # Backward SDE trajectory field figures exclude unconditional
+            # autocorrelation panels; manuscript autocorrelation belongs to the
+            # conditional knn_reference field_metrics stage.
             if trajectory_results:
                 trajectory_fields_vis = gen.get("trajectory_fields_phys_all")
                 if trajectory_fields_vis is None:
@@ -1647,21 +1771,13 @@ def main() -> None:
                 plot_trajectory_pdfs(
                     trajectory_results, time_indices, full_H_schedule, out_dir,
                 )
-                plot_trajectory_correlation(
-                    trajectory_results, time_indices, full_H_schedule,
-                    pixel_size, out_dir,
-                )
-                plot_trajectory_correlation_superposed(
-                    trajectory_results, time_indices, full_H_schedule,
-                    pixel_size, out_dir,
-                )
                 plot_trajectory_psd(
                     trajectory_results, time_indices, full_H_schedule, out_dir,
                 )
                 plot_trajectory_qq(
                     trajectory_results, time_indices, full_H_schedule, out_dir,
                 )
-                n_figs += 6
+                n_figs += 4
 
         print(f"Saved {n_figs} figures to {out_dir}")
 

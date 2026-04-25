@@ -28,12 +28,51 @@ def get_transformer_latent_shape(autoencoder) -> tuple[int, int]:
     )
 
 
+def restore_transformer_latents(autoencoder, z):
+    """Restore flattened transformer latents to token memory.
+
+    Parameters
+    ----------
+    autoencoder:
+        Maintained transformer-token FAE autoencoder.
+    z:
+        Latents with shape ``[batch, n_latents * emb_dim]`` or
+        ``[batch, n_latents, emb_dim]``.
+    """
+    import jax.numpy as jnp
+
+    latent_shape = get_transformer_latent_shape(autoencoder)
+    expected_flat_dim = int(latent_shape[0] * latent_shape[1])
+    z_arr = jnp.asarray(z)
+
+    if z_arr.ndim == 3:
+        if int(z_arr.shape[1]) != latent_shape[0] or int(z_arr.shape[2]) != latent_shape[1]:
+            raise ValueError(
+                "Transformer token latents have unexpected shape "
+                f"{tuple(z_arr.shape)}; expected trailing shape {latent_shape}."
+            )
+        return z_arr
+    if z_arr.ndim == 2:
+        if int(z_arr.shape[-1]) != expected_flat_dim:
+            raise ValueError(
+                f"Expected flattened transformer latents with size {expected_flat_dim}, "
+                f"got shape {tuple(z_arr.shape)}."
+            )
+        return jnp.reshape(z_arr, (z_arr.shape[0], latent_shape[0], latent_shape[1]))
+    raise ValueError(
+        "Transformer downstream decode expects latents with shape "
+        "[batch, n_latents, emb_dim] or [batch, n_latents * emb_dim]."
+    )
+
+
 def make_transformer_fae_apply_fns(
     autoencoder,
     params: dict,
     batch_stats: Optional[dict],
     *,
     latent_format: str = "flattened",
+    decode_device=None,
+    jit_decode: bool = True,
 ):
     """Return numpy-level encode/decode callables for transformer-token checkpoints.
 
@@ -53,12 +92,13 @@ def make_transformer_fae_apply_fns(
             f"for transformer downstream transport. Got {latent_format!r}."
         )
     latent_shape = get_transformer_latent_shape(autoencoder)
-    expected_flat_dim = int(latent_shape[0] * latent_shape[1])
 
     params_enc = params["encoder"]
     params_dec = params["decoder"]
     bs_enc = None if batch_stats is None else batch_stats.get("encoder", None)
     bs_dec = None if batch_stats is None else batch_stats.get("decoder", None)
+    params_dec_bound = params_dec if decode_device is None else jax.device_put(params_dec, decode_device)
+    bs_dec_bound = bs_dec if decode_device is None or bs_dec is None else jax.device_put(bs_dec, decode_device)
 
     def _encoder_variables():
         variables = {"params": params_enc}
@@ -67,9 +107,9 @@ def make_transformer_fae_apply_fns(
         return variables
 
     def _decoder_variables():
-        variables = {"params": params_dec}
-        if bs_dec is not None:
-            variables["batch_stats"] = bs_dec
+        variables = {"params": params_dec_bound}
+        if bs_dec_bound is not None:
+            variables["batch_stats"] = bs_dec_bound
         return variables
 
     def _flatten_latents(z: jnp.ndarray) -> jnp.ndarray:
@@ -79,29 +119,6 @@ def make_transformer_fae_apply_fns(
             )
         return jnp.reshape(z, (z.shape[0], -1))
 
-    def _restore_latents(z: jnp.ndarray) -> jnp.ndarray:
-        if z.ndim == 3:
-            if (
-                int(z.shape[1]) != latent_shape[0]
-                or int(z.shape[2]) != latent_shape[1]
-            ):
-                raise ValueError(
-                    "Transformer token latents have unexpected shape "
-                    f"{tuple(z.shape)}; expected trailing shape {latent_shape}."
-                )
-            return z
-        if z.ndim == 2:
-            if int(z.shape[-1]) != expected_flat_dim:
-                raise ValueError(
-                    f"Expected flattened transformer latents with size {expected_flat_dim}, "
-                    f"got shape {tuple(z.shape)}."
-                )
-            return jnp.reshape(z, (z.shape[0], latent_shape[0], latent_shape[1]))
-        raise ValueError(
-            "Transformer downstream decode expects latents with shape "
-            "[batch, n_latents, emb_dim] or [batch, n_latents * emb_dim]."
-        )
-
     def _encode(u: jnp.ndarray, x: jnp.ndarray):
         z = autoencoder.encoder.apply(_encoder_variables(), u, x, train=False)
         if latent_format == "flattened":
@@ -109,7 +126,7 @@ def make_transformer_fae_apply_fns(
         return z
 
     def _decode(z: jnp.ndarray, x: jnp.ndarray):
-        z_tokens = _restore_latents(z)
+        z_tokens = restore_transformer_latents(autoencoder, z)
         return autoencoder.decoder.apply(
             _decoder_variables(),
             z_tokens,
@@ -118,19 +135,26 @@ def make_transformer_fae_apply_fns(
         )
 
     encode_jit = jax.jit(_encode)
-    decode_jit = jax.jit(_decode)
+    decode_impl = jax.jit(_decode, device=decode_device) if jit_decode else _decode
 
     def encode_np(u_np: np.ndarray, x_np: np.ndarray) -> np.ndarray:
         z = encode_jit(jnp.asarray(u_np), jnp.asarray(x_np))
         return np.asarray(jax.device_get(z), dtype=np.float32)
 
     def decode_np(z_np: np.ndarray, x_np: np.ndarray) -> np.ndarray:
-        u_hat = decode_jit(jnp.asarray(z_np), jnp.asarray(x_np))
+        if decode_device is None:
+            z_arr = jnp.asarray(z_np)
+            x_arr = jnp.asarray(x_np)
+        else:
+            z_arr = jax.device_put(np.asarray(z_np, dtype=np.float32), decode_device)
+            x_arr = jax.device_put(np.asarray(x_np, dtype=np.float32), decode_device)
+        u_hat = decode_impl(z_arr, x_arr)
         return np.asarray(jax.device_get(u_hat), dtype=np.float32)
 
     print(
         "FAE decode mode: standard "
-        f"(transformer downstream latent_format={latent_format}, token shape={latent_shape})"
+        f"(transformer downstream latent_format={latent_format}, token shape={latent_shape}, "
+        f"decode_device={'default' if decode_device is None else decode_device}, jit_decode={bool(jit_decode)})"
     )
     return encode_np, decode_np
 
@@ -139,4 +163,5 @@ __all__ = [
     "get_transformer_latent_shape",
     "is_transformer_token_autoencoder",
     "make_transformer_fae_apply_fns",
+    "restore_transformer_latents",
 ]

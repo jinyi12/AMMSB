@@ -86,38 +86,79 @@ def summarize_conditioned_residuals(
     spread_sq = np.maximum(total_sq - bias_sq, 0.0)
 
     target_sq = _sum_field_squares(targets_arr, start_axis=1)
-    denom = np.maximum(target_sq, float(relative_eps))
+    return summarize_conditionwise_residual_arrays(
+        total_sq=total_sq,
+        bias_sq=bias_sq,
+        spread_sq=spread_sq,
+        target_sq=target_sq,
+        realization_counts=int(residuals_arr.shape[1]),
+        relative_eps=relative_eps,
+    )
 
-    total_rel = total_sq / denom
-    bias_rel = bias_sq / denom
-    spread_rel = spread_sq / denom
 
-    decomposition_error_sq = float(np.max(np.abs(total_sq - (bias_sq + spread_sq))))
-    decomposition_error_rel = float(np.max(np.abs(total_rel - (bias_rel + spread_rel))))
+def summarize_conditionwise_residual_arrays(
+    *,
+    total_sq: NDArray[np.floating],
+    bias_sq: NDArray[np.floating],
+    spread_sq: NDArray[np.floating],
+    target_sq: NDArray[np.floating],
+    realization_counts: int | NDArray[np.integer],
+    relative_eps: float = 1e-8,
+) -> dict[str, Any]:
+    total = np.asarray(total_sq, dtype=np.float64).reshape(-1)
+    bias = np.asarray(bias_sq, dtype=np.float64).reshape(-1)
+    spread = np.asarray(spread_sq, dtype=np.float64).reshape(-1)
+    target = np.asarray(target_sq, dtype=np.float64).reshape(-1)
+    if total.size == 0:
+        raise ValueError("Need at least one conditionwise residual entry.")
+    if not (total.shape == bias.shape == spread.shape == target.shape):
+        raise ValueError(
+            "Conditionwise residual arrays must have the same shape: "
+            f"total={total.shape}, bias={bias.shape}, spread={spread.shape}, target={target.shape}."
+        )
+
+    if np.isscalar(realization_counts):
+        counts = np.full(total.shape, int(realization_counts), dtype=np.int64)
+    else:
+        counts = np.asarray(realization_counts, dtype=np.int64).reshape(-1)
+    if counts.shape != total.shape:
+        raise ValueError(
+            "realization_counts must be scalar or match the condition count, "
+            f"got {counts.shape} for {total.shape}."
+        )
+    unique_counts = np.unique(counts)
+    n_realizations_per_condition: int | None = None
+    if unique_counts.size == 1:
+        n_realizations_per_condition = int(unique_counts[0])
+
+    denom = np.maximum(target, float(relative_eps))
+    total_rel = total / denom
+    bias_rel = bias / denom
+    spread_rel = spread / denom
 
     return {
-        "n_conditions": int(residuals_arr.shape[0]),
-        "n_realizations_per_condition": int(residuals_arr.shape[1]),
-        "total_sq": _metric_summary(total_sq),
+        "n_conditions": int(total.shape[0]),
+        "n_realizations_per_condition": n_realizations_per_condition,
+        "total_sq": _metric_summary(total),
         "total_rel": _metric_summary(total_rel),
-        "bias_sq": _metric_summary(bias_sq),
+        "bias_sq": _metric_summary(bias),
         "bias_rel": _metric_summary(bias_rel),
-        "spread_sq": _metric_summary(spread_sq),
+        "spread_sq": _metric_summary(spread),
         "spread_rel": _metric_summary(spread_rel),
-        "target_sq": _metric_summary(target_sq),
-        "stable_relative_total": float(np.sum(total_sq) / max(float(np.sum(target_sq)), float(relative_eps))),
-        "stable_relative_bias": float(np.sum(bias_sq) / max(float(np.sum(target_sq)), float(relative_eps))),
-        "stable_relative_spread": float(np.sum(spread_sq) / max(float(np.sum(target_sq)), float(relative_eps))),
-        "decomposition_error_sq": float(decomposition_error_sq),
-        "decomposition_error_rel": float(decomposition_error_rel),
+        "target_sq": _metric_summary(target),
+        "stable_relative_total": float(np.sum(total) / max(float(np.sum(target)), float(relative_eps))),
+        "stable_relative_bias": float(np.sum(bias) / max(float(np.sum(target)), float(relative_eps))),
+        "stable_relative_spread": float(np.sum(spread) / max(float(np.sum(target)), float(relative_eps))),
+        "decomposition_error_sq": float(np.max(np.abs(total - (bias + spread)))),
+        "decomposition_error_rel": float(np.max(np.abs(total_rel - (bias_rel + spread_rel)))),
         "per_condition": {
-            "total_sq": total_sq.astype(np.float32),
+            "total_sq": total.astype(np.float32),
             "total_rel": total_rel.astype(np.float32),
-            "bias_sq": bias_sq.astype(np.float32),
+            "bias_sq": bias.astype(np.float32),
             "bias_rel": bias_rel.astype(np.float32),
-            "spread_sq": spread_sq.astype(np.float32),
+            "spread_sq": spread.astype(np.float32),
             "spread_rel": spread_rel.astype(np.float32),
-            "target_sq": target_sq.astype(np.float32),
+            "target_sq": target.astype(np.float32),
         },
     }
 
@@ -131,44 +172,19 @@ def _aggregate_condition_entries(
         raise ValueError("Need at least one conditionwise entry.")
 
     total_sq = np.asarray([entry["total_sq"] for entry in entries], dtype=np.float64)
-    total_rel = np.asarray([entry["total_rel"] for entry in entries], dtype=np.float64)
     bias_sq = np.asarray([entry["bias_sq"] for entry in entries], dtype=np.float64)
-    bias_rel = np.asarray([entry["bias_rel"] for entry in entries], dtype=np.float64)
     spread_sq = np.asarray([entry["spread_sq"] for entry in entries], dtype=np.float64)
-    spread_rel = np.asarray([entry["spread_rel"] for entry in entries], dtype=np.float64)
     target_sq = np.asarray([entry["target_sq"] for entry in entries], dtype=np.float64)
     realization_counts = np.asarray([entry["n_realizations"] for entry in entries], dtype=np.int64)
 
-    unique_counts = np.unique(realization_counts)
-    n_realizations_per_condition: int | None = None
-    if unique_counts.size == 1:
-        n_realizations_per_condition = int(unique_counts[0])
-
-    return {
-        "n_conditions": int(len(entries)),
-        "n_realizations_per_condition": n_realizations_per_condition,
-        "total_sq": _metric_summary(total_sq),
-        "total_rel": _metric_summary(total_rel),
-        "bias_sq": _metric_summary(bias_sq),
-        "bias_rel": _metric_summary(bias_rel),
-        "spread_sq": _metric_summary(spread_sq),
-        "spread_rel": _metric_summary(spread_rel),
-        "target_sq": _metric_summary(target_sq),
-        "stable_relative_total": float(np.sum(total_sq) / max(float(np.sum(target_sq)), float(relative_eps))),
-        "stable_relative_bias": float(np.sum(bias_sq) / max(float(np.sum(target_sq)), float(relative_eps))),
-        "stable_relative_spread": float(np.sum(spread_sq) / max(float(np.sum(target_sq)), float(relative_eps))),
-        "decomposition_error_sq": float(np.max(np.abs(total_sq - (bias_sq + spread_sq)))),
-        "decomposition_error_rel": float(np.max(np.abs(total_rel - (bias_rel + spread_rel)))),
-        "per_condition": {
-            "total_sq": total_sq.astype(np.float32),
-            "total_rel": total_rel.astype(np.float32),
-            "bias_sq": bias_sq.astype(np.float32),
-            "bias_rel": bias_rel.astype(np.float32),
-            "spread_sq": spread_sq.astype(np.float32),
-            "spread_rel": spread_rel.astype(np.float32),
-            "target_sq": target_sq.astype(np.float32),
-        },
-    }
+    return summarize_conditionwise_residual_arrays(
+        total_sq=total_sq,
+        bias_sq=bias_sq,
+        spread_sq=spread_sq,
+        target_sq=target_sq,
+        realization_counts=realization_counts,
+        relative_eps=relative_eps,
+    )
 
 
 def compute_conditionwise_dirac_statistics(
@@ -408,7 +424,10 @@ def evaluate_cache_global_coarse_return(
     group_ids: NDArray[np.integer],
     *,
     ladder: FilterLadder,
+    source_h: float,
+    target_h: float,
     macro_scale_idx: int,
+    transfer_ridge_lambda: float = 1e-8,
     relative_eps: float = 1e-8,
 ) -> dict[str, Any]:
     finest = np.asarray(finest_fields, dtype=np.float64)
@@ -418,7 +437,12 @@ def evaluate_cache_global_coarse_return(
             "finest_fields and coarse_targets must both have shape (N, ...) and match exactly; "
             f"got {finest.shape} and {coarse.shape}."
         )
-    filtered = ladder.filter_at_scale(finest.reshape(finest.shape[0], -1), int(macro_scale_idx))
+    filtered = ladder.transfer_between_H(
+        finest.reshape(finest.shape[0], -1),
+        source_H=float(source_h),
+        target_H=float(target_h),
+        ridge_lambda=float(transfer_ridge_lambda),
+    )
     summary = aggregate_grouped_dirac_statistics(
         filtered,
         coarse.reshape(filtered.shape),
@@ -426,6 +450,14 @@ def evaluate_cache_global_coarse_return(
         relative_eps=relative_eps,
     )
     summary["macro_scale_idx"] = int(macro_scale_idx)
+    summary["source_H"] = float(source_h)
+    summary["target_H"] = float(target_h)
+    summary["transfer_operator"] = (
+        "tran_periodic_tikhonov_transfer"
+        if float(transfer_ridge_lambda) > 0.0
+        else "tran_periodic_spectral_transfer"
+    )
+    summary["ridge_lambda"] = float(transfer_ridge_lambda)
     return summary
 
 
@@ -433,6 +465,8 @@ def evaluate_path_self_consistency(
     trajectory_fields: NDArray[np.floating],
     *,
     ladder: FilterLadder,
+    modeled_h_schedule: list[float] | None = None,
+    transfer_ridge_lambda: float = 1e-8,
     relative_eps: float = 1e-8,
     group_ids: NDArray[np.integer] | None = None,
 ) -> dict[str, Any]:
@@ -449,6 +483,16 @@ def evaluate_path_self_consistency(
                 f"group_ids must have shape ({trajectory.shape[1]},), got {groups.shape}."
             )
 
+    if modeled_h_schedule is None:
+        h_schedule = [float(item) for item in ladder.H_schedule]
+    else:
+        h_schedule = [float(item) for item in modeled_h_schedule]
+    if len(h_schedule) != int(trajectory.shape[0]):
+        raise ValueError(
+            "modeled_h_schedule must align with trajectory_fields along the time axis, "
+            f"got {len(h_schedule)} H values for trajectory shape {trajectory.shape}."
+        )
+
     per_interval: dict[str, dict[str, Any]] = {}
     mean_sq_values: list[float] = []
     mean_rel_values: list[float] = []
@@ -457,7 +501,14 @@ def evaluate_path_self_consistency(
     for pair_idx in range(int(trajectory.shape[0]) - 1):
         fine_fields = trajectory[pair_idx]
         coarse_fields = trajectory[pair_idx + 1]
-        filtered = ladder.filter_at_scale(fine_fields, pair_idx + 1)
+        source_h = float(h_schedule[pair_idx])
+        target_h = float(h_schedule[pair_idx + 1])
+        filtered = ladder.transfer_between_H(
+            fine_fields,
+            source_H=source_h,
+            target_H=target_h,
+            ridge_lambda=float(transfer_ridge_lambda),
+        )
         summary = aggregate_grouped_dirac_statistics(
             filtered,
             coarse_fields,
@@ -470,6 +521,14 @@ def evaluate_path_self_consistency(
             "stable_relative_total": summary["stable_relative_total"],
             "per_group_sq": summary["per_condition"]["total_sq"],
             "per_group_rel": summary["per_condition"]["total_rel"],
+            "source_H": source_h,
+            "target_H": target_h,
+            "transfer_operator": (
+                "tran_periodic_tikhonov_transfer"
+                if float(transfer_ridge_lambda) > 0.0
+                else "tran_periodic_spectral_transfer"
+            ),
+            "ridge_lambda": float(transfer_ridge_lambda),
         }
         mean_sq_values.append(float(summary["total_sq"]["mean"]))
         mean_rel_values.append(float(summary["total_rel"]["mean"]))

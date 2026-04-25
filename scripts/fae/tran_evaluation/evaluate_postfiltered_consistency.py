@@ -115,7 +115,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--nogpu", action="store_true")
     p.add_argument("--decode_mode", type=str, default="standard", choices=["standard"])
     p.add_argument("--L_domain", type=float, default=6.0)
-    p.add_argument("--H_meso_list", type=str, default="1.0,1.25,1.5,2.0,2.5,3.0")
+    p.add_argument("--H_meso_list", type=str, default="1.0,1.25,1.5,2.0,2.5,3.0,4.0")
     p.add_argument("--H_macro", type=float, default=6.0)
     p.add_argument("--min_spacing_pixels", type=int, default=4)
     return p.parse_args()

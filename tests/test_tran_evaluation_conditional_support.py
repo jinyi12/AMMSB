@@ -22,6 +22,7 @@ from scripts.fae.tran_evaluation.conditional_support import (
     format_h_slug,
     knn_gaussian_weights,
     make_pair_label,
+    minimal_adaptive_ess_target,
     normalise_weights,
     sampling_spec_indices,
     validate_conditional_eval_mode,
@@ -169,6 +170,15 @@ def test_validate_conditional_eval_mode_accepts_chatterjee_and_rejects_fixed_knn
     assert validate_conditional_eval_mode(CHATTERJEE_CONDITIONAL_EVAL_MODE) == CHATTERJEE_CONDITIONAL_EVAL_MODE
     with pytest.raises(ValueError, match="conditional_eval_mode must be one of"):
         validate_conditional_eval_mode("fixed_knn")
+
+
+def test_minimal_adaptive_ess_target_uses_sqrt_n_with_simple_clipping():
+    assert minimal_adaptive_ess_target(1) == 8
+    assert minimal_adaptive_ess_target(81) == 9
+    assert minimal_adaptive_ess_target(10_000) == 32
+
+    with pytest.raises(ValueError, match="n_conditions must be positive"):
+        minimal_adaptive_ess_target(0)
 
 
 def test_build_uniform_sampling_specs_from_neighbors_uses_uniform_weights_and_radii():

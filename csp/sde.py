@@ -14,6 +14,23 @@ from ._conditional_bridge import local_interval_time
 SigmaFn = Callable[[jax.Array | float], jax.Array]
 
 
+def interval_save_times(
+    tau_start: jax.Array | float,
+    tau_end: jax.Array | float,
+    dt0: float,
+    *,
+    dtype: jnp.dtype = jnp.float32,
+) -> jax.Array:
+    """Return an explicit per-step save grid that includes both interval endpoints."""
+    tau_start_arr = jnp.asarray(tau_start, dtype=dtype)
+    tau_end_arr = jnp.asarray(tau_end, dtype=dtype)
+    dt0_arr = jnp.maximum(jnp.asarray(dt0, dtype=dtype), jnp.asarray(1e-6, dtype=dtype))
+    interval_length = jnp.maximum(tau_end_arr - tau_start_arr, jnp.asarray(0.0, dtype=dtype))
+    n_steps = jnp.maximum(jnp.asarray(1, dtype=jnp.int32), jnp.ceil(interval_length / dt0_arr).astype(jnp.int32))
+    save_times = tau_start_arr + dt0_arr * jnp.arange(n_steps + 1, dtype=dtype)
+    return save_times.at[-1].set(tau_end_arr)
+
+
 def sinusoidal_embedding(t: jax.Array | float, dim: int, *, dtype: jnp.dtype = jnp.float32) -> jax.Array:
     """Return a sinusoidal embedding for a scalar time input."""
     dim = int(dim)
@@ -535,6 +552,7 @@ def integrate_conditional_interval(
     adjoint: diffrax.AbstractAdjoint | None = None,
     max_steps: int = 4096,
     time_mode: str,
+    save_times: jax.Array | None = None,
 ) -> jax.Array:
     """Integrate a single conditional SDE interval with Euler-Maruyama.
 
@@ -583,8 +601,14 @@ def integrate_conditional_interval(
         dt0=dt0_arr,
         y0=y0_arr,
         args=z_arr,
-        saveat=diffrax.SaveAt(t1=True),
+        saveat=(
+            diffrax.SaveAt(t1=True)
+            if save_times is None
+            else diffrax.SaveAt(ts=jnp.asarray(save_times, dtype=y0_arr.dtype))
+        ),
         adjoint=diffrax.RecursiveCheckpointAdjoint() if adjoint is None else adjoint,
         max_steps=max_steps,
     )
-    return sol.ys[-1]
+    if save_times is None:
+        return sol.ys[-1]
+    return sol.ys

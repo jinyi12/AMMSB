@@ -12,9 +12,9 @@ cd "$REPO_ROOT"
 ENV_NAME="${ENV_NAME:-3MASB}"
 CSP_RUN_DIR="${CSP_RUN_DIR:-results/csp/token_dit/manual_run}"
 PROFILE="${PROFILE:-publication}"  # smoke | light | publication
+RESOURCE_PROFILE="${RESOURCE_PROFILE:-shared_safe}"
 BACKGROUND="${BACKGROUND:-0}"
 NOHUP_LOG="${NOHUP_LOG:-}"
-CONDITIONAL_CORPUS_LATENTS_PATH="${CONDITIONAL_CORPUS_LATENTS_PATH:-data/corpus_latents_ntk_prior.npz}"
 EXTRA_ARGS=()
 
 while [[ $# -gt 0 ]]; do
@@ -46,40 +46,29 @@ while [[ $# -gt 0 ]]; do
       EXTRA_ARGS+=("$1" "$2")
       shift 2
       ;;
-    --conditional_realizations)
+    --conditional_rollout_realizations)
       CONDITIONAL_REALIZATIONS="$2"
       EXTRA_ARGS+=("$1" "$2")
       shift 2
       ;;
-    --conditional_n_test_samples)
+    --conditional_rollout_n_test_samples)
       CONDITIONAL_TEST_SAMPLES="$2"
       EXTRA_ARGS+=("$1" "$2")
       shift 2
       ;;
-    --conditional_k_neighbors)
+    --conditional_rollout_k_neighbors)
       CONDITIONAL_K_NEIGHBORS="$2"
       EXTRA_ARGS+=("$1" "$2")
       shift 2
       ;;
-    --conditional_max_corpus_samples)
-      CONDITIONAL_MAX_CORPUS_SAMPLES="$2"
-      EXTRA_ARGS+=("$1" "$2")
-      shift 2
-      ;;
-    --conditional_n_plot_conditions)
+    --conditional_rollout_n_plot_conditions)
       CONDITIONAL_N_PLOT_CONDITIONS="$2"
       EXTRA_ARGS+=("$1" "$2")
       shift 2
       ;;
-    --conditional_plot_value_budget)
-      CONDITIONAL_PLOT_VALUE_BUDGET="$2"
-      EXTRA_ARGS+=("$1" "$2")
-      shift 2
-      ;;
-    --conditional_corpus_latents_path)
-      CONDITIONAL_CORPUS_LATENTS_PATH="$2"
-      EXTRA_ARGS+=("$1" "$2")
-      shift 2
+    --skip_conditional_rollout_reports)
+      EXTRA_ARGS+=("$1")
+      shift
       ;;
     --coarse_eval_mode)
       COARSE_EVAL_MODE="$2"
@@ -113,6 +102,36 @@ while [[ $# -gt 0 ]]; do
       ;;
     --coarse_decode_batch_size)
       COARSE_DECODE_BATCH_SIZE="$2"
+      EXTRA_ARGS+=("$1" "$2")
+      shift 2
+      ;;
+    --cache_sampling_device)
+      CACHE_SAMPLING_DEVICE="$2"
+      EXTRA_ARGS+=("$1" "$2")
+      shift 2
+      ;;
+    --cache_decode_device)
+      CACHE_DECODE_DEVICE="$2"
+      EXTRA_ARGS+=("$1" "$2")
+      shift 2
+      ;;
+    --cache_decode_point_batch_size)
+      CACHE_DECODE_POINT_BATCH_SIZE="$2"
+      EXTRA_ARGS+=("$1" "$2")
+      shift 2
+      ;;
+    --coarse_sampling_device)
+      COARSE_SAMPLING_DEVICE="$2"
+      EXTRA_ARGS+=("$1" "$2")
+      shift 2
+      ;;
+    --coarse_decode_device)
+      COARSE_DECODE_DEVICE="$2"
+      EXTRA_ARGS+=("$1" "$2")
+      shift 2
+      ;;
+    --coarse_decode_point_batch_size)
+      COARSE_DECODE_POINT_BATCH_SIZE="$2"
       EXTRA_ARGS+=("$1" "$2")
       shift 2
       ;;
@@ -160,6 +179,8 @@ if [[ -z "${CONDA_DEFAULT_ENV:-}" || "${CONDA_DEFAULT_ENV}" != "${ENV_NAME}" ]];
   conda activate "${ENV_NAME}"
 fi
 
+PYTHON_BIN="${PYTHON_BIN:-python}"
+
 if [[ ! -f "${CSP_RUN_DIR}/checkpoints/conditional_bridge_token_dit.eqx" ]]; then
   echo "ERROR: missing token-native CSP checkpoint under ${CSP_RUN_DIR}" >&2
   exit 1
@@ -171,10 +192,8 @@ case "$PROFILE" in
     N_GT_NEIGHBORS="${N_GT_NEIGHBORS:-32}"
     CONDITIONAL_REALIZATIONS="${CONDITIONAL_REALIZATIONS:-8}"
     CONDITIONAL_TEST_SAMPLES="${CONDITIONAL_TEST_SAMPLES:-8}"
-    CONDITIONAL_K_NEIGHBORS="${CONDITIONAL_K_NEIGHBORS:-32}"
-    CONDITIONAL_MAX_CORPUS_SAMPLES="${CONDITIONAL_MAX_CORPUS_SAMPLES:-512}"
+    CONDITIONAL_K_NEIGHBORS="${CONDITIONAL_K_NEIGHBORS:-16}"
     CONDITIONAL_N_PLOT_CONDITIONS="${CONDITIONAL_N_PLOT_CONDITIONS:-0}"
-    CONDITIONAL_PLOT_VALUE_BUDGET="${CONDITIONAL_PLOT_VALUE_BUDGET:-2000}"
     COARSE_EVAL_MODE="${COARSE_EVAL_MODE:-global}"
     COARSE_EVAL_CONDITIONS="${COARSE_EVAL_CONDITIONS:-8}"
     COARSE_EVAL_REALIZATIONS="${COARSE_EVAL_REALIZATIONS:-8}"
@@ -182,6 +201,10 @@ case "$PROFILE" in
     CONDITIONED_GLOBAL_REALIZATIONS="${CONDITIONED_GLOBAL_REALIZATIONS:-8}"
     DECODE_BATCH_SIZE="${DECODE_BATCH_SIZE:-64}"
     COARSE_DECODE_BATCH_SIZE="${COARSE_DECODE_BATCH_SIZE:-128}"
+    CACHE_SAMPLING_DEVICE="${CACHE_SAMPLING_DEVICE:-auto}"
+    CACHE_DECODE_DEVICE="${CACHE_DECODE_DEVICE:-auto}"
+    COARSE_SAMPLING_DEVICE="${COARSE_SAMPLING_DEVICE:-auto}"
+    COARSE_DECODE_DEVICE="${COARSE_DECODE_DEVICE:-auto}"
     OUTPUT_DIR="${OUTPUT_DIR:-${CSP_RUN_DIR}/eval/smoke_n32}"
     ;;
   light)
@@ -189,10 +212,8 @@ case "$PROFILE" in
     N_GT_NEIGHBORS="${N_GT_NEIGHBORS:-128}"
     CONDITIONAL_REALIZATIONS="${CONDITIONAL_REALIZATIONS:-64}"
     CONDITIONAL_TEST_SAMPLES="${CONDITIONAL_TEST_SAMPLES:-16}"
-    CONDITIONAL_K_NEIGHBORS="${CONDITIONAL_K_NEIGHBORS:-64}"
-    CONDITIONAL_MAX_CORPUS_SAMPLES="${CONDITIONAL_MAX_CORPUS_SAMPLES:-2000}"
+    CONDITIONAL_K_NEIGHBORS="${CONDITIONAL_K_NEIGHBORS:-16}"
     CONDITIONAL_N_PLOT_CONDITIONS="${CONDITIONAL_N_PLOT_CONDITIONS:-0}"
-    CONDITIONAL_PLOT_VALUE_BUDGET="${CONDITIONAL_PLOT_VALUE_BUDGET:-4000}"
     COARSE_EVAL_MODE="${COARSE_EVAL_MODE:-global}"
     COARSE_EVAL_CONDITIONS="${COARSE_EVAL_CONDITIONS:-8}"
     COARSE_EVAL_REALIZATIONS="${COARSE_EVAL_REALIZATIONS:-16}"
@@ -200,6 +221,10 @@ case "$PROFILE" in
     CONDITIONED_GLOBAL_REALIZATIONS="${CONDITIONED_GLOBAL_REALIZATIONS:-16}"
     DECODE_BATCH_SIZE="${DECODE_BATCH_SIZE:-64}"
     COARSE_DECODE_BATCH_SIZE="${COARSE_DECODE_BATCH_SIZE:-128}"
+    CACHE_SAMPLING_DEVICE="${CACHE_SAMPLING_DEVICE:-auto}"
+    CACHE_DECODE_DEVICE="${CACHE_DECODE_DEVICE:-auto}"
+    COARSE_SAMPLING_DEVICE="${COARSE_SAMPLING_DEVICE:-auto}"
+    COARSE_DECODE_DEVICE="${COARSE_DECODE_DEVICE:-auto}"
     OUTPUT_DIR="${OUTPUT_DIR:-${CSP_RUN_DIR}/eval/light_n128}"
     ;;
   publication)
@@ -207,17 +232,19 @@ case "$PROFILE" in
     N_GT_NEIGHBORS="${N_GT_NEIGHBORS:-512}"
     CONDITIONAL_REALIZATIONS="${CONDITIONAL_REALIZATIONS:-200}"
     CONDITIONAL_TEST_SAMPLES="${CONDITIONAL_TEST_SAMPLES:-50}"
-    CONDITIONAL_K_NEIGHBORS="${CONDITIONAL_K_NEIGHBORS:-200}"
-    CONDITIONAL_MAX_CORPUS_SAMPLES="${CONDITIONAL_MAX_CORPUS_SAMPLES:-}"
+    CONDITIONAL_K_NEIGHBORS="${CONDITIONAL_K_NEIGHBORS:-16}"
     CONDITIONAL_N_PLOT_CONDITIONS="${CONDITIONAL_N_PLOT_CONDITIONS:-5}"
-    CONDITIONAL_PLOT_VALUE_BUDGET="${CONDITIONAL_PLOT_VALUE_BUDGET:-20000}"
     COARSE_EVAL_MODE="${COARSE_EVAL_MODE:-both}"
     COARSE_EVAL_CONDITIONS="${COARSE_EVAL_CONDITIONS:-16}"
     COARSE_EVAL_REALIZATIONS="${COARSE_EVAL_REALIZATIONS:-32}"
     CONDITIONED_GLOBAL_CONDITIONS="${CONDITIONED_GLOBAL_CONDITIONS:-16}"
     CONDITIONED_GLOBAL_REALIZATIONS="${CONDITIONED_GLOBAL_REALIZATIONS:-32}"
-    DECODE_BATCH_SIZE="${DECODE_BATCH_SIZE:-64}"
-    COARSE_DECODE_BATCH_SIZE="${COARSE_DECODE_BATCH_SIZE:-256}"
+    DECODE_BATCH_SIZE="${DECODE_BATCH_SIZE:-16}"
+    COARSE_DECODE_BATCH_SIZE="${COARSE_DECODE_BATCH_SIZE:-8}"
+    CACHE_SAMPLING_DEVICE="${CACHE_SAMPLING_DEVICE:-auto}"
+    CACHE_DECODE_DEVICE="${CACHE_DECODE_DEVICE:-auto}"
+    COARSE_SAMPLING_DEVICE="${COARSE_SAMPLING_DEVICE:-auto}"
+    COARSE_DECODE_DEVICE="${COARSE_DECODE_DEVICE:-auto}"
     OUTPUT_DIR="${OUTPUT_DIR:-${CSP_RUN_DIR}/eval/n512}"
     ;;
   *)
@@ -232,7 +259,6 @@ COARSE_SELECTION="${COARSE_SELECTION:-random}"
 SEED="${SEED:-0}"
 LOG_DIR="${CSP_RUN_DIR}/eval/logs"
 mkdir -p "${LOG_DIR}"
-PYTHON_BIN="${PYTHON_BIN:-python}"
 
 CMD=(
   "${PYTHON_BIN}" -u scripts/csp/evaluate_csp_token_dit.py
@@ -251,16 +277,34 @@ CMD=(
   --conditioned_global_conditions "${CONDITIONED_GLOBAL_CONDITIONS}"
   --conditioned_global_realizations "${CONDITIONED_GLOBAL_REALIZATIONS}"
   --coarse_decode_batch_size "${COARSE_DECODE_BATCH_SIZE}"
-  --conditional_corpus_latents_path "${CONDITIONAL_CORPUS_LATENTS_PATH}"
-  --conditional_realizations "${CONDITIONAL_REALIZATIONS}"
-  --conditional_n_test_samples "${CONDITIONAL_TEST_SAMPLES}"
-  --conditional_k_neighbors "${CONDITIONAL_K_NEIGHBORS}"
-  --conditional_n_plot_conditions "${CONDITIONAL_N_PLOT_CONDITIONS}"
-  --conditional_plot_value_budget "${CONDITIONAL_PLOT_VALUE_BUDGET}"
+  --cache_sampling_device "${CACHE_SAMPLING_DEVICE}"
+  --cache_decode_device "${CACHE_DECODE_DEVICE}"
+  --coarse_sampling_device "${COARSE_SAMPLING_DEVICE}"
+  --coarse_decode_device "${COARSE_DECODE_DEVICE}"
+  --resource_profile "${RESOURCE_PROFILE}"
+  --conditional_rollout_realizations "${CONDITIONAL_REALIZATIONS}"
+  --conditional_rollout_n_test_samples "${CONDITIONAL_TEST_SAMPLES}"
+  --conditional_rollout_k_neighbors "${CONDITIONAL_K_NEIGHBORS}"
+  --conditional_rollout_n_plot_conditions "${CONDITIONAL_N_PLOT_CONDITIONS}"
 )
 
-if [[ -n "${CONDITIONAL_MAX_CORPUS_SAMPLES}" ]]; then
-  CMD+=(--conditional_max_corpus_samples "${CONDITIONAL_MAX_CORPUS_SAMPLES}")
+if [[ -n "${CACHE_DECODE_POINT_BATCH_SIZE:-}" ]]; then
+  CMD+=(--cache_decode_point_batch_size "${CACHE_DECODE_POINT_BATCH_SIZE}")
+fi
+if [[ -n "${COARSE_DECODE_POINT_BATCH_SIZE:-}" ]]; then
+  CMD+=(--coarse_decode_point_batch_size "${COARSE_DECODE_POINT_BATCH_SIZE}")
+fi
+if [[ -n "${CPU_THREADS:-}" ]]; then
+  CMD+=(--cpu_threads "${CPU_THREADS}")
+fi
+if [[ -n "${CPU_CORES:-}" ]]; then
+  CMD+=(--cpu_cores "${CPU_CORES}")
+fi
+if [[ -n "${MEMORY_BUDGET_GB:-}" ]]; then
+  CMD+=(--memory_budget_gb "${MEMORY_BUDGET_GB}")
+fi
+if [[ -n "${CONDITION_CHUNK_SIZE:-}" ]]; then
+  CMD+=(--condition_chunk_size "${CONDITION_CHUNK_SIZE}")
 fi
 
 if [[ ${#EXTRA_ARGS[@]} -gt 0 ]]; then
@@ -280,12 +324,13 @@ echo "  Coarse conds         : ${COARSE_EVAL_CONDITIONS}"
 echo "  Coarse realizations  : ${COARSE_EVAL_REALIZATIONS}"
 echo "  Global conds         : ${CONDITIONED_GLOBAL_CONDITIONS}"
 echo "  Global realizations  : ${CONDITIONED_GLOBAL_REALIZATIONS}"
-echo "  Cond realizations    : ${CONDITIONAL_REALIZATIONS}"
-echo "  Cond test samples    : ${CONDITIONAL_TEST_SAMPLES}"
-echo "  Cond k-neighbors     : ${CONDITIONAL_K_NEIGHBORS}"
-echo "  Cond corpus cap      : ${CONDITIONAL_MAX_CORPUS_SAMPLES:-full}"
-echo "  Cond plot conditions : ${CONDITIONAL_N_PLOT_CONDITIONS}"
-echo "  Cond corpus          : ${CONDITIONAL_CORPUS_LATENTS_PATH}"
+echo "  Cache devices        : sample=${CACHE_SAMPLING_DEVICE} decode=${CACHE_DECODE_DEVICE}"
+echo "  Coarse devices       : sample=${COARSE_SAMPLING_DEVICE} decode=${COARSE_DECODE_DEVICE}"
+echo "  Resource profile     : ${RESOURCE_PROFILE}"
+echo "  Conditional rollout n : ${CONDITIONAL_REALIZATIONS}"
+echo "  Conditional rollout m : ${CONDITIONAL_TEST_SAMPLES}"
+echo "  Conditional rollout k : ${CONDITIONAL_K_NEIGHBORS}"
+echo "  Conditional rollout p : ${CONDITIONAL_N_PLOT_CONDITIONS}"
 echo "  Coarse split         : ${COARSE_SPLIT}"
 echo "  Coarse selection     : ${COARSE_SELECTION}"
 if [[ ${#EXTRA_ARGS[@]} -gt 0 ]]; then

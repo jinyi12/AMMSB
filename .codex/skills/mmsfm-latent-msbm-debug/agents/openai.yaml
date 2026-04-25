@@ -1,4 +1,4 @@
 interface:
   display_name: "MMSFM Latent MSBM Debug"
-  short_description: "Inspect latent-MSBM runs and runtime state"
-  default_prompt: "Use $mmsfm-latent-msbm-debug to inspect a latent-MSBM run directory, checkpoints, and time-grid state."
+  short_description: "Inspect latent-MSBM compatibility runs"
+  default_prompt: "Use $mmsfm-latent-msbm-debug to inspect a latent-MSBM compatibility run and patch the existing loaders directly without adding debug classes, fallback reconstruction, or heuristic repair."

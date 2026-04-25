@@ -16,6 +16,22 @@ import numpy as np
 from typing import Dict, Any
 
 
+def minmax_transform(
+    data: np.ndarray,
+    data_min: float | np.ndarray,
+    data_scale: float | np.ndarray,
+    epsilon: float,
+) -> np.ndarray:
+    """Forward global min-max scaling."""
+    if isinstance(data_min, np.ndarray) and data_min.size == 1:
+        data_min = float(data_min.item())
+    if isinstance(data_scale, np.ndarray) and data_scale.size == 1:
+        data_scale = float(data_scale.item())
+    if float(data_scale) <= 0.0:
+        raise ValueError(f"minmax_transform requires data_scale > 0, got {data_scale}.")
+    return np.asarray((data - data_min) / data_scale + epsilon, dtype=np.float32)
+
+
 def inverse_minmax_transform(
     scaled_data: np.ndarray,
     data_min: float | np.ndarray,
@@ -44,6 +60,40 @@ def inverse_minmax_transform(
 
     scaled_data = np.clip(scaled_data, epsilon, 1.0 + epsilon)
     return (scaled_data - epsilon) * data_scale + data_min
+
+
+def affine_standardize_transform(
+    data: np.ndarray,
+    affine_mean: float | np.ndarray,
+    affine_std: float | np.ndarray,
+    affine_min: float,
+    affine_max: float,
+    affine_delta: float = 0.0,
+) -> np.ndarray:
+    """Forward affine-standardization transform for bounded data."""
+    if isinstance(affine_mean, np.ndarray) and affine_mean.size == 1:
+        affine_mean = float(affine_mean.item())
+    if isinstance(affine_std, np.ndarray) and affine_std.size == 1:
+        affine_std = float(affine_std.item())
+    if affine_max <= affine_min:
+        raise ValueError(
+            f"affine_standardize_transform requires affine_max > affine_min. "
+            f"Got affine_min={affine_min}, affine_max={affine_max}."
+        )
+    if float(affine_std) <= 0.0:
+        raise ValueError(f"affine_standardize_transform requires affine_std > 0, got {affine_std}.")
+    if affine_delta < 0.0 or affine_delta >= 0.5:
+        raise ValueError(
+            f"affine_standardize_transform requires 0 <= affine_delta < 0.5. "
+            f"Got affine_delta={affine_delta}."
+        )
+    scale = float(affine_max - affine_min)
+    p = (data - affine_min) / scale
+    if affine_delta > 0.0:
+        p = np.clip(p, affine_delta, 1.0 - affine_delta)
+    else:
+        p = np.clip(p, 0.0, 1.0)
+    return np.asarray((p - affine_mean) / affine_std, dtype=np.float32)
 
 
 def inverse_affine_standardize_transform(
@@ -92,6 +142,28 @@ def inverse_affine_standardize_transform(
     else:
         p = np.clip(p, 0.0, 1.0)
     return affine_min + p * (affine_max - affine_min)
+
+
+def log_standardize_transform(
+    data: np.ndarray,
+    log_mean: float | np.ndarray,
+    log_std: float | np.ndarray,
+    log_epsilon: float,
+) -> np.ndarray:
+    """Forward log-standardization transform."""
+    if isinstance(log_mean, np.ndarray) and log_mean.size == 1:
+        log_mean = float(log_mean.item())
+    if isinstance(log_std, np.ndarray) and log_std.size == 1:
+        log_std = float(log_std.item())
+    if np.min(data) + float(log_epsilon) <= 0.0:
+        raise ValueError(
+            "log_standardize_transform requires strictly positive shifted data. "
+            f"Found min(data + log_epsilon)={float(np.min(data) + float(log_epsilon))}."
+        )
+    if float(log_std) <= 0.0:
+        raise ValueError(f"log_standardize_transform requires log_std > 0, got {log_std}.")
+    log_data = np.log(data + log_epsilon)
+    return np.asarray((log_data - log_mean) / log_std, dtype=np.float32)
 
 
 def inverse_log_standardize_transform(
@@ -222,6 +294,39 @@ def apply_inverse_transform(
     else:
         # No transform applied
         return data
+
+
+def apply_forward_transform(
+    data: np.ndarray,
+    transform_info: Dict[str, Any],
+) -> np.ndarray:
+    """Apply the dataset forward transform based on transform_info."""
+    transform_type = transform_info["type"]
+
+    if transform_type == "minmax":
+        return minmax_transform(
+            data,
+            transform_info["data_min"],
+            transform_info["data_scale"],
+            transform_info["epsilon"],
+        )
+    if transform_type == "affine_standardize":
+        return affine_standardize_transform(
+            data,
+            transform_info["affine_mean"],
+            transform_info["affine_std"],
+            transform_info["affine_min"],
+            transform_info["affine_max"],
+            transform_info.get("affine_delta", 0.0),
+        )
+    if transform_type == "log_standardize":
+        return log_standardize_transform(
+            data,
+            transform_info["log_mean"],
+            transform_info["log_std"],
+            transform_info["log_epsilon"],
+        )
+    return np.asarray(data, dtype=np.float32)
 
 
 # Example usage

@@ -18,6 +18,7 @@ from csp import (
     constant_sigma,
     exp_contract_sigma,
 )
+from csp.paired_prior_bridge import DEFAULT_THETA_FEATURE_CLIP
 from data.transform_utils import load_transform_info
 from mmsfm.fae.fae_latent_utils import (
     build_fae_from_checkpoint,
@@ -51,6 +52,8 @@ class CspSamplingRuntime:
     dt0: float
     tau_knots: np.ndarray
     condition_mode: str | None = None
+    delta_v: float | None = None
+    theta_feature_clip: float | None = None
 
 
 @dataclass(frozen=True)
@@ -60,6 +63,8 @@ class FaeDecodeContext:
     transform_info: dict[str, Any]
     clip_bounds: tuple[float, float] | None
     decode_fn: Any
+    decode_device_kind: str | None = None
+    decode_jit_enabled: bool | None = None
 
 
 def parse_legacy_args_file(args_path: Path) -> dict[str, Any]:
@@ -100,11 +105,12 @@ def load_corpus_latents(
     corpus_path = resolve_repo_path(corpus_latents_path)
     with np.load(corpus_path, allow_pickle=True) as payload:
         requested_time_indices = np.asarray(time_indices, dtype=np.int64).reshape(-1)
+        requested_time_indices_list = [int(tidx) for tidx in requested_time_indices.tolist()]
         corpus_latents_by_tidx: dict[int, np.ndarray] = {}
         n_corpus: int | None = None
 
-        if all(f"latents_{int(tidx)}" in payload for tidx in requested_time_indices.tolist()):
-            for tidx in requested_time_indices.tolist():
+        if all(f"latents_{int(tidx)}" in payload for tidx in requested_time_indices_list):
+            for tidx in requested_time_indices_list:
                 arr = np.asarray(payload[f"latents_{int(tidx)}"], dtype=np.float32)
                 corpus_latents_by_tidx[int(tidx)] = arr
                 if n_corpus is None:
@@ -130,13 +136,19 @@ def load_corpus_latents(
                 int(tidx): pos
                 for pos, tidx in enumerate(archive_time_indices.tolist())
             }
-            for tidx in requested_time_indices.tolist():
-                if int(tidx) not in tidx_to_pos:
-                    raise KeyError(
-                        f"Missing dataset time index {int(tidx)} in {corpus_path}. "
-                        "Expected either `latents_<time_idx>` arrays from encode_corpus.py "
-                        "or a flat `fae_latents.npz` archive whose time_indices contain the requested levels."
-                    )
+            archive_time_indices_list = [int(tidx) for tidx in archive_time_indices.tolist()]
+            missing_time_indices = [
+                int(tidx) for tidx in requested_time_indices_list if int(tidx) not in tidx_to_pos
+            ]
+            if missing_time_indices:
+                raise KeyError(
+                    f"Missing dataset time index {missing_time_indices[0]} in {corpus_path}. "
+                    f"Requested time_indices={requested_time_indices_list}, "
+                    f"available time_indices={archive_time_indices_list}. "
+                    "Expected either `latents_<time_idx>` arrays from encode_corpus.py "
+                    "or a flat `fae_latents.npz` archive whose time_indices contain the requested levels."
+                )
+            for tidx in requested_time_indices_list:
                 pos = tidx_to_pos[int(tidx)]
                 arr = np.concatenate([latent_train[pos], latent_test[pos]], axis=0).astype(np.float32, copy=False)
                 corpus_latents_by_tidx[int(tidx)] = arr
@@ -174,7 +186,16 @@ def build_sigma_fn_from_config(cfg: dict[str, Any], tau_knots: np.ndarray):
     )
 
 
-def _resolve_compat_source_run_dir(cfg: dict[str, Any]) -> Path | None:
+def normalize_condition_mode(raw: Any, *, default: str | None = None) -> str | None:
+    if raw in (None, "", "None"):
+        return default
+    mode = str(raw)
+    if mode == "previous_state_fixed":
+        return "previous_state"
+    return mode
+
+
+def resolve_compat_source_run_dir(cfg: dict[str, Any]) -> Path | None:
     raw = cfg.get("source_run_dir")
     if raw in (None, "", "None"):
         return None
@@ -184,14 +205,15 @@ def _resolve_compat_source_run_dir(cfg: dict[str, Any]) -> Path | None:
     return path
 
 
-def _resolve_dataset_path(
-    cfg: dict[str, Any],
-    archive: FaeLatentArchive,
+def resolve_source_dataset_path(
     *,
+    cfg: dict[str, Any],
+    archive_dataset_path: str | Path | None,
     dataset_override: str | None,
     source_run_dir: Path | None,
+    contract_name: str = "CSP",
 ) -> Path:
-    raw = dataset_override or cfg.get("source_dataset_path") or archive.dataset_path
+    raw = dataset_override or cfg.get("source_dataset_path") or archive_dataset_path
     if raw is not None:
         path = resolve_repo_path(str(raw))
         if path.exists():
@@ -203,17 +225,17 @@ def _resolve_dataset_path(
             path = resolve_repo_path(str(legacy_raw))
             if path.exists():
                 return path
-    raise FileNotFoundError("Could not resolve source dataset path from the CSP run contract.")
+    raise FileNotFoundError(f"Could not resolve source dataset path from the {contract_name} run contract.")
 
 
-def _resolve_fae_checkpoint_path(
-    cfg: dict[str, Any],
-    archive: FaeLatentArchive,
+def resolve_source_fae_checkpoint_path(
     *,
+    cfg: dict[str, Any],
+    archive_fae_checkpoint_path: str | Path | None,
     fae_checkpoint_override: str | None,
     source_run_dir: Path | None,
 ) -> Path | None:
-    raw = fae_checkpoint_override or cfg.get("fae_checkpoint") or archive.fae_checkpoint_path
+    raw = fae_checkpoint_override or cfg.get("fae_checkpoint") or archive_fae_checkpoint_path
     if raw is not None:
         path = resolve_repo_path(str(raw))
         if path.exists():
@@ -226,6 +248,28 @@ def _resolve_fae_checkpoint_path(
             if path.exists():
                 return path
     return None
+
+
+def load_decode_dataset_metadata(
+    dataset_path: Path,
+) -> tuple[int, np.ndarray, dict[str, Any], tuple[float, float] | None]:
+    dataset_path = resolve_repo_path(dataset_path)
+    with np.load(dataset_path, allow_pickle=True) as dataset:
+        transform_info = load_transform_info(dataset)
+        resolution = int(dataset["resolution"])
+        grid_coords = np.asarray(dataset["grid_coords"], dtype=np.float32)
+        raw_keys = sorted(key for key in dataset.files if str(key).startswith("raw_marginal_"))
+        clip_bounds = None
+        if raw_keys:
+            data_min = float("inf")
+            data_max = float("-inf")
+            for key in raw_keys:
+                arr = np.asarray(dataset[key], dtype=np.float32)
+                data_min = min(data_min, float(np.min(arr)))
+                data_max = max(data_max, float(np.max(arr)))
+            if np.isfinite(data_min) and np.isfinite(data_max) and data_max > data_min:
+                clip_bounds = (data_min, data_max)
+    return resolution, grid_coords, transform_info, clip_bounds
 
 
 def resolve_csp_source_context(
@@ -253,16 +297,16 @@ def resolve_csp_source_context(
     latents_path = resolve_repo_path(str(latents_raw))
     archive = load_fae_latent_archive(latents_path)
 
-    source_run_dir = _resolve_compat_source_run_dir(cfg)
-    dataset_path = _resolve_dataset_path(
-        cfg,
-        archive,
+    source_run_dir = resolve_compat_source_run_dir(cfg)
+    dataset_path = resolve_source_dataset_path(
+        cfg=cfg,
+        archive_dataset_path=archive.dataset_path,
         dataset_override=dataset_override,
         source_run_dir=source_run_dir,
     )
-    fae_checkpoint_path = _resolve_fae_checkpoint_path(
-        cfg,
-        archive,
+    fae_checkpoint_path = resolve_source_fae_checkpoint_path(
+        cfg=cfg,
+        archive_fae_checkpoint_path=archive.fae_checkpoint_path,
         fae_checkpoint_override=fae_checkpoint_override,
         source_run_dir=source_run_dir,
     )
@@ -291,9 +335,45 @@ def load_csp_sampling_runtime(
         fae_checkpoint_override=fae_checkpoint_override,
     )
     tau_knots = (1.0 - archive.zt).astype(np.float32)
-    sigma_fn = build_sigma_fn_from_config(cfg, tau_knots)
     model_type = str(cfg.get("model_type", "legacy_unconditional"))
     dt0 = float(cfg["dt0"])
+    condition_mode = normalize_condition_mode(cfg.get("condition_mode"))
+
+    if model_type == "paired_prior_bridge":
+        drift_architecture = str(cfg.get("drift_architecture", "mlp"))
+        model = build_conditional_drift_model(
+            latent_dim=archive.latent_dim,
+            condition_dim=bridge_condition_dim(
+                archive.latent_dim,
+                archive.num_intervals,
+                "previous_state",
+            ),
+            hidden_dims=tuple(int(width) for width in cfg["hidden"]),
+            time_dim=int(cfg["time_dim"]),
+            architecture=drift_architecture,
+            transformer_hidden_dim=int(cfg.get("transformer_hidden_dim", 256)),
+            transformer_n_layers=int(cfg.get("transformer_n_layers", 3)),
+            transformer_num_heads=int(cfg.get("transformer_num_heads", 4)),
+            transformer_mlp_ratio=float(cfg.get("transformer_mlp_ratio", 2.0)),
+            transformer_token_dim=int(cfg.get("transformer_token_dim", 32)),
+            key=jax.random.PRNGKey(0),
+        )
+        model = eqx.tree_deserialise_leaves(source.run_dir / "checkpoints" / "conditional_bridge.eqx", model)
+        return CspSamplingRuntime(
+            cfg=cfg,
+            source=source,
+            archive=archive,
+            model=model,
+            model_type="paired_prior_bridge",
+            sigma_fn=None,
+            dt0=dt0,
+            tau_knots=tau_knots,
+            condition_mode="previous_state",
+            delta_v=float(cfg["delta_v"]),
+            theta_feature_clip=float(cfg.get("theta_feature_clip", DEFAULT_THETA_FEATURE_CLIP)),
+        )
+
+    sigma_fn = build_sigma_fn_from_config(cfg, tau_knots)
 
     if model_type == "conditional_bridge" or (source.run_dir / "checkpoints" / "conditional_bridge.eqx").exists():
         drift_architecture = str(cfg.get("drift_architecture", "mlp"))
@@ -302,7 +382,7 @@ def load_csp_sampling_runtime(
             condition_dim=bridge_condition_dim(
                 archive.latent_dim,
                 archive.num_intervals,
-                str(cfg.get("condition_mode", "global_and_previous")),
+                str(condition_mode or "global_and_previous"),
             ),
             hidden_dims=tuple(int(width) for width in cfg["hidden"]),
             time_dim=int(cfg["time_dim"]),
@@ -324,7 +404,7 @@ def load_csp_sampling_runtime(
             sigma_fn=sigma_fn,
             dt0=dt0,
             tau_knots=tau_knots,
-            condition_mode=str(cfg.get("condition_mode", "global_and_previous")),
+            condition_mode=str(condition_mode or "global_and_previous"),
         )
 
     model = build_drift_model(
@@ -352,25 +432,12 @@ def load_fae_decode_context(
     dataset_path: Path,
     fae_checkpoint_path: Path,
     decode_mode: str,
+    decode_device: Any | None = None,
+    decode_device_kind: str | None = None,
+    jit_decode: bool = True,
 ) -> FaeDecodeContext:
-    dataset_path = resolve_repo_path(dataset_path)
+    resolution, grid_coords, transform_info, clip_bounds = load_decode_dataset_metadata(dataset_path)
     fae_checkpoint_path = resolve_repo_path(fae_checkpoint_path)
-
-    with np.load(dataset_path, allow_pickle=True) as dataset:
-        transform_info = load_transform_info(dataset)
-        resolution = int(dataset["resolution"])
-        grid_coords = np.asarray(dataset["grid_coords"], dtype=np.float32)
-        raw_keys = sorted(key for key in dataset.files if str(key).startswith("raw_marginal_"))
-        clip_bounds = None
-        if raw_keys:
-            data_min = float("inf")
-            data_max = float("-inf")
-            for key in raw_keys:
-                arr = np.asarray(dataset[key], dtype=np.float32)
-                data_min = min(data_min, float(np.min(arr)))
-                data_max = max(data_max, float(np.max(arr)))
-            if np.isfinite(data_min) and np.isfinite(data_max) and data_max > data_min:
-                clip_bounds = (data_min, data_max)
 
     ckpt = load_fae_checkpoint(fae_checkpoint_path)
     autoencoder, fae_params, fae_batch_stats, _ = build_fae_from_checkpoint(ckpt)
@@ -379,6 +446,8 @@ def load_fae_decode_context(
         fae_params,
         fae_batch_stats,
         decode_mode=decode_mode,
+        decode_device=decode_device,
+        jit_decode=jit_decode,
     )
     return FaeDecodeContext(
         resolution=resolution,
@@ -386,4 +455,6 @@ def load_fae_decode_context(
         transform_info=transform_info,
         clip_bounds=clip_bounds,
         decode_fn=decode_fn,
+        decode_device_kind=decode_device_kind,
+        decode_jit_enabled=bool(jit_decode),
     )

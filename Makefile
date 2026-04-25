@@ -57,24 +57,22 @@ test-tran-eval:
 		tests/test_tran_evaluation_run_support.py \
 		tests/test_tran_evaluation_conditional_support.py \
 		tests/test_tran_evaluation_conditional_metrics.py \
+		tests/test_tran_evaluation_coarse_cache.py \
 		tests/test_tran_evaluation_latent_msbm_runtime.py \
 		tests/test_tran_evaluation_statistics.py \
 		tests/test_latent_geometry_model_comparison.py \
 		tests/test_latent_geometry.py
 
 test-csp:
-	$(PYTEST) -q tests/test_csp.py tests/test_csp_runtime.py tests/test_csp_token_dit.py tests/test_csp_token_runtime.py
+	$(PYTEST) -q tests/test_csp.py tests/test_csp_runtime.py tests/test_conditional_rollout_runtime.py tests/test_csp_token_dit.py tests/test_csp_token_runtime.py
 
 smoke-tran-eval:
 	$(PYTHON) scripts/fae/tran_evaluation/evaluate.py --help >/dev/null
+	$(PYTHON) scripts/fae/tran_evaluation/evaluate_generated_consistency.py --help >/dev/null
 	$(PYTHON) scripts/fae/tran_evaluation/generate.py --help >/dev/null
-	$(PYTHON) scripts/fae/tran_evaluation/evaluate_conditional.py --help >/dev/null
-	$(PYTHON) scripts/fae/tran_evaluation/evaluate_conditional_diagnostic.py --help >/dev/null
 	$(PYTHON) scripts/fae/tran_evaluation/evaluate_postfiltered_consistency.py --help >/dev/null
 	$(PYTHON) scripts/fae/tran_evaluation/compare_latent_geometry_models.py --help >/dev/null
 	$(PYTHON) scripts/fae/tran_evaluation/encode_corpus.py --help >/dev/null
-	$(PYTHON) scripts/fae/tran_evaluation/visualize_latent_msbm_manifold.py --help >/dev/null
-	$(PYTHON) scripts/fae/tran_evaluation/visualize_conditional_latent_projections.py --help >/dev/null
 
 smoke-csp:
 	$(PYTHON) scripts/csp/encode_fae_latents.py --help >/dev/null
@@ -84,10 +82,14 @@ smoke-csp:
 	$(PYTHON) scripts/csp/train_csp_token_dit.py --help >/dev/null
 	$(PYTHON) scripts/csp/train_csp_token_dit_from_fae.py --help >/dev/null
 	$(PYTHON) scripts/csp/evaluate_csp.py --help >/dev/null
-	$(PYTHON) scripts/csp/evaluate_csp_conditional.py --help >/dev/null
+	$(PYTHON) scripts/csp/build_conditional_rollout_latent_cache.py --help >/dev/null
+	$(PYTHON) scripts/csp/build_conditional_rollout_decoded_cache.py --help >/dev/null
+	$(PYTHON) scripts/csp/evaluate_csp_conditional_rollout.py --help >/dev/null
+	$(PYTHON) scripts/csp/evaluate_csp_knn_reference.py --help >/dev/null
 	$(PYTHON) scripts/csp/build_eval_cache.py --help >/dev/null
 	$(PYTHON) scripts/csp/evaluate_csp_token_dit.py --help >/dev/null
-	$(PYTHON) scripts/csp/evaluate_csp_token_dit_conditional.py --help >/dev/null
+	$(PYTHON) scripts/csp/evaluate_csp_token_dit_conditional_rollout.py --help >/dev/null
+	$(PYTHON) scripts/csp/evaluate_csp_token_dit_knn_reference.py --help >/dev/null
 	$(PYTHON) scripts/csp/build_eval_cache_token_dit.py --help >/dev/null
 	$(PYTHON) scripts/csp/train_csp_benchmark.py --help >/dev/null
 	$(PYTHON) scripts/csp/plot_csp_training.py --help >/dev/null

@@ -11,21 +11,28 @@ import matplotlib.ticker as mticker
 import numpy as np
 
 from scripts.fae.tran_evaluation.latent_geometry_model_summary import (
-    LOSS_ORDER,
     MODEL_METRICS,
-    TRACK_ORDER,
     _safe_float,
-    _summary_sort_key,
 )
-from scripts.images.field_visualization import EASTERN_HUES
+from scripts.images.field_visualization import (
+    EASTERN_HUES,
+    format_for_paper,
+    publication_figure_width,
+    publication_style_tokens,
+)
 
 
-_FIG_W_BARS = 5.5
-_FIG_W_CHAIN = 4.9
-_FIG_H = 2.5
-_FONT_LABEL = 7
-_FONT_LEGEND = 6.5
-_FONT_TICK = 7
+_PUB_STYLE = publication_style_tokens()
+_FIG_W_BARS = publication_figure_width(column_span=1)
+_FIG_W_DELTA = publication_figure_width(column_span=2, fraction=0.58)
+_FIG_H = 2.45
+_FONT_LABEL = _PUB_STYLE["font_label"]
+_FONT_LEGEND = _PUB_STYLE["font_legend"]
+_FONT_TICK = _PUB_STYLE["font_tick"]
+_FONT_TITLE = _PUB_STYLE["font_title"]
+
+_BASELINE_COLOR = EASTERN_HUES[4]
+_TREATMENT_COLOR = EASTERN_HUES[7]
 
 
 def _save_fig(fig: plt.Figure, out_dir: Path, name: str) -> None:
@@ -35,7 +42,6 @@ def _save_fig(fig: plt.Figure, out_dir: Path, name: str) -> None:
 
 
 def _apply_sci_yticks(ax: plt.Axes, yscale: str | None) -> None:
-    """Apply ×10^n scientific notation to linear-scale y-axes with large values."""
     if yscale == "log":
         return
     fmt = mticker.ScalarFormatter(useMathText=True)
@@ -44,246 +50,185 @@ def _apply_sci_yticks(ax: plt.Axes, yscale: str | None) -> None:
     ax.yaxis.set_major_formatter(fmt)
 
 
-def remove_legacy_multi_metric_figures(out_dir: Path) -> None:
-    """Remove pre-refactor grid figures to avoid confusing output directories."""
+def _resolve_metric_yscale(spec: dict[str, Any], vals: np.ndarray) -> str | None:
+    explicit = spec.get("yscale")
+    if explicit:
+        return str(explicit)
+    finite_positive = vals[np.isfinite(vals) & (vals > 0.0)]
+    if finite_positive.size >= 2:
+        dynamic_range = float(np.max(finite_positive) / np.min(finite_positive))
+        if dynamic_range >= 1e3:
+            return "log"
+    return None
+
+
+def _annotate_bars(ax: plt.Axes, vals: np.ndarray, yscale: str | None) -> None:
+    finite_vals = vals[np.isfinite(vals)]
+    if finite_vals.size == 0:
+        return
+    if yscale == "log":
+        positive_vals = finite_vals[finite_vals > 0.0]
+        if positive_vals.size == 0:
+            return
+        for idx, value in enumerate(vals):
+            if not np.isfinite(value) or value <= 0.0:
+                continue
+            ax.text(
+                idx,
+                value * 1.12,
+                f"{value:.2e}",
+                ha="center",
+                va="bottom",
+                fontsize=_FONT_LEGEND,
+            )
+        return
+
+    span = float(np.max(finite_vals) - np.min(finite_vals))
+    offset = 0.03 * span if span > 0.0 else max(abs(float(finite_vals[0])) * 0.04, 0.02)
+    for idx, value in enumerate(vals):
+        if not np.isfinite(value):
+            continue
+        ax.text(
+            idx,
+            value + offset,
+            f"{value:.3g}",
+            ha="center",
+            va="bottom",
+            fontsize=_FONT_LEGEND,
+        )
+
+
+def remove_legacy_pairwise_outputs(out_dir: Path) -> None:
     legacy_stems = [
         "latent_geom_model_metric_matrix",
         "latent_geom_l2_ntk_prior_chain",
+        "latent_geom_l2_ntk_diffusion_prior_chain",
+        "latent_geom_l2_ntk_sigreg_chain",
         "latent_geom_ntk_effect",
         "latent_geom_prior_effect",
+        "latent_geom_diffusion_prior_effect",
+        "latent_geom_sigreg_effect",
         "latent_geom_model_flags",
+        "latent_geom_model_summary",
     ]
     for stem in legacy_stems:
-        for ext in ("png", "pdf"):
+        for ext in ("png", "pdf", "json", "csv", "md"):
             path = out_dir / f"{stem}.{ext}"
             if path.exists():
                 path.unlink()
 
-    for prefix in ("latent_geom_ntk_effect_", "latent_geom_prior_effect_"):
+    for prefix in (
+        "latent_geom_ntk_effect_",
+        "latent_geom_prior_effect_",
+        "latent_geom_diffusion_prior_effect_",
+        "latent_geom_sigreg_effect_",
+        "latent_geom_l2_ntk_",
+        "latent_geom_model_metric_",
+    ):
         for ext in ("png", "pdf"):
             for path in out_dir.glob(f"{prefix}*.{ext}"):
                 path.unlink()
 
 
-def plot_model_metric_bars(summaries: list[dict[str, Any]], out_dir: Path) -> None:
-    if not summaries:
+def plot_pair_metric_bars(summaries: list[dict[str, Any]], out_dir: Path) -> None:
+    if len(summaries) != 2:
         return
 
-    ordered = sorted(summaries, key=_summary_sort_key)
-    x = np.arange(len(ordered), dtype=np.float64)
-    optimizers_present = {
-        str(row.get("optimizer", "")).lower()
+    format_for_paper()
+    ordered = sorted(summaries, key=lambda row: str(row.get("run_role", "")))
+    labels = [
+        str(row.get("run_label", row.get("run_role", ""))).strip() or str(row.get("run_role", "run"))
         for row in ordered
-        if str(row.get("optimizer", "")).strip()
-    }
-
-    def _config_key(row: dict[str, Any]) -> tuple[Any, ...]:
-        return (
-            str(row.get("track", "")),
-            str(row.get("decoder_type", "")),
-            str(row.get("scale", "")),
-            str(row.get("loss_type", "")),
-            int(row.get("prior_flag", 0)),
-        )
-
-    def _config_sort_key(key: tuple[Any, ...]) -> tuple[Any, ...]:
-        track, decoder, scale, loss, prior = key
-        return (
-            TRACK_ORDER.get(str(track), 99),
-            str(decoder),
-            str(scale),
-            LOSS_ORDER.get(str(loss), 99),
-            int(prior),
-        )
-
-    configs = sorted({_config_key(row) for row in ordered}, key=_config_sort_key)
-    config_colors = {cfg: EASTERN_HUES[i % len(EASTERN_HUES)] for i, cfg in enumerate(configs)}
-
-    def _tick_label(row: dict[str, Any]) -> str:
-        loss = str(row.get("loss_type", "")).lower()
-        if loss == "ntk_scaled":
-            loss_tag = "NTK-Scale"
-        elif loss == "ntk_prior_balanced":
-            loss_tag = "NTK-Bal"
-        else:
-            loss_tag = loss.upper()
-        prior = "+P" if int(row.get("prior_flag", 0)) == 1 else ""
-        decoder = str(row.get("decoder_type", "film"))
-        decoder_tag = "" if decoder == "film" else "Den"
-        suffix = f" {decoder_tag}".rstrip()
-        return f"{loss_tag}{prior}{suffix}".strip()
-
-    tick_labels = [_tick_label(row) for row in ordered]
-    colors = [config_colors[_config_key(row)] for row in ordered]
-    hatches = []
-    for row in ordered:
-        opt = str(row.get("optimizer", "")).lower()
-        if opt == "muon":
-            hatches.append("//")
-        elif opt == "adam":
-            hatches.append("")
-        else:
-            hatches.append("..")
+    ]
+    colors = [_BASELINE_COLOR, _TREATMENT_COLOR]
+    x = np.arange(2, dtype=np.float64)
 
     for spec in MODEL_METRICS:
         key = spec["key"]
-        vals = np.asarray([_safe_float(row.get(key)) for row in ordered], dtype=np.float64)
         std_key = key.replace("_mean_over_time", "_std_over_time")
+        vals = np.asarray([_safe_float(row.get(key)) for row in ordered], dtype=np.float64)
         errs = np.asarray([_safe_float(row.get(std_key)) for row in ordered], dtype=np.float64)
         errs = np.where(np.isfinite(errs), errs, 0.0)
 
         fig, ax = plt.subplots(1, 1, figsize=(_FIG_W_BARS, _FIG_H))
-        bars = ax.bar(
+        ax.bar(
             x,
             vals,
             color=colors,
             edgecolor="black",
-            alpha=0.9,
             yerr=errs,
             capsize=2.0,
             error_kw={"linewidth": 0.8, "alpha": 0.8},
         )
-        for bar, hatch in zip(bars, hatches):
-            if hatch:
-                bar.set_hatch(hatch)
-
         ax.set_xticks(x)
-        ax.set_xticklabels(tick_labels, rotation=0, ha="center", fontsize=_FONT_TICK)
+        ax.set_xticklabels(labels, fontsize=_FONT_TICK)
         ax.set_ylabel(spec["display"], fontsize=_FONT_LABEL)
+        ax.set_title(spec["title"], fontsize=_FONT_TITLE)
         ax.grid(axis="y", alpha=0.2)
         ax.tick_params(axis="both", labelsize=_FONT_TICK)
-
-        yscale = spec.get("yscale")
+        yscale = _resolve_metric_yscale(spec, vals)
         if yscale:
             ax.set_yscale(str(yscale))
         ylim = spec.get("ylim")
         if isinstance(ylim, (list, tuple)) and len(ylim) == 2:
             ax.set_ylim(float(ylim[0]), float(ylim[1]))
+        elif yscale == "log":
+            finite_positive = vals[np.isfinite(vals) & (vals > 0.0)]
+            if finite_positive.size:
+                ax.set_ylim(float(np.min(finite_positive) / 1.8), float(np.max(finite_positive) * 2.2))
         _apply_sci_yticks(ax, yscale)
+        _annotate_bars(ax, vals, yscale)
 
-        if "adam" in optimizers_present or "muon" in optimizers_present:
-            from matplotlib.patches import Patch
+        from matplotlib.patches import Patch
 
-            legend_items = []
-            if "adam" in optimizers_present:
-                legend_items.append(Patch(facecolor="white", edgecolor="black", hatch="", label="ADAM"))
-            if "muon" in optimizers_present:
-                legend_items.append(Patch(facecolor="white", edgecolor="black", hatch="//", label="MUON"))
-            if legend_items:
-                ax.legend(handles=legend_items, loc="upper left", frameon=False, fontsize=_FONT_LEGEND)
+        ax.legend(
+            handles=[
+                Patch(facecolor=_BASELINE_COLOR, edgecolor="black", label=labels[0]),
+                Patch(facecolor=_TREATMENT_COLOR, edgecolor="black", label=labels[1]),
+            ],
+            loc="upper left",
+            frameon=False,
+            fontsize=_FONT_LEGEND,
+        )
+        fig.tight_layout(pad=0.7)
+        _save_fig(fig, out_dir, f"latent_geom_pair_metric_{spec['label']}")
 
-        fig.tight_layout()
-        _save_fig(fig, out_dir, f"latent_geom_model_metric_{spec['label']}")
 
-
-def plot_ntk_prior_chain(
-    summaries: list[dict[str, Any]],
-    effects: dict[str, Any],
-    *,
-    out_dir: Path,
-) -> None:
-    rows = list(effects.get("ntk_prior_chain", []))
-    if not rows:
+def plot_pair_time_deltas(pairwise: dict[str, Any], *, out_dir: Path) -> None:
+    per_time = list(pairwise.get("per_time", []))
+    if not per_time:
         return
 
-    cell_index = {str(row.get("matrix_cell_id", "")): row for row in summaries}
-    x = np.asarray([0.0, 1.0, 2.0], dtype=np.float64)
-    x_labels = ["L2", "NTK", "NTK+Prior"]
-    stage_colors = [EASTERN_HUES[0], EASTERN_HUES[1], EASTERN_HUES[2]]
+    format_for_paper()
+    x = np.asarray([int(row.get("dataset_time_index", idx)) for idx, row in enumerate(per_time)], dtype=np.int64)
+    baseline_label = str(dict(pairwise.get("baseline", {})).get("run_label", "Baseline"))
+    treatment_label = str(dict(pairwise.get("treatment", {})).get("run_label", "Treatment"))
 
     for spec in MODEL_METRICS:
-        fig, ax = plt.subplots(1, 1, figsize=(_FIG_W_CHAIN, _FIG_H))
-        key = spec["key"]
-        std_key = key.replace("_mean_over_time", "_std_over_time")
+        y_vals: list[float] = []
+        for row in per_time:
+            metrics = list(row.get("metrics", []))
+            match = next((metric for metric in metrics if str(metric.get("metric_key", "")) == spec["key"]), None)
+            y_vals.append(_safe_float(None if match is None else match.get("signed_relative_delta")))
+        y = np.asarray(y_vals, dtype=np.float64)
 
-        seen_labels: set[str] = set()
-        for row in rows:
-            std = cell_index.get(str(row.get("standard", "")))
-            ntk = cell_index.get(str(row.get("ntk", "")))
-            ntk_prior = cell_index.get(str(row.get("ntk_prior", "")))
-            if std is None or ntk is None or ntk_prior is None:
-                continue
-            y0 = _safe_float(std.get(key))
-            y1 = _safe_float(ntk.get(key))
-            y2 = _safe_float(ntk_prior.get(key))
-            if not (np.isfinite(y0) and np.isfinite(y1) and np.isfinite(y2)):
-                continue
-            e0 = _safe_float(std.get(std_key))
-            e1 = _safe_float(ntk.get(std_key))
-            e2 = _safe_float(ntk_prior.get(std_key))
-            e0 = 0.0 if not np.isfinite(e0) else float(e0)
-            e1 = 0.0 if not np.isfinite(e1) else float(e1)
-            e2 = 0.0 if not np.isfinite(e2) else float(e2)
-
-            yscale = str(spec.get("yscale") or "")
-            if yscale == "log" and (y0 <= 0.0 or y1 <= 0.0 or y2 <= 0.0):
-                continue
-
-            optimizer_key = str(row.get("optimizer", "")).lower()
-            optimizer = optimizer_key.upper()
-            label = optimizer if optimizer and optimizer not in seen_labels else None
-            if label is not None:
-                seen_labels.add(label)
-
-            linestyle = "-" if optimizer_key == "adam" else "--"
-            x_off = x + (-0.04 if optimizer_key == "adam" else 0.04)
-            ax.errorbar(
-                x_off,
-                [y0, y1, y2],
-                yerr=[e0, e1, e2],
-                fmt="none",
-                ecolor="0.35",
-                elinewidth=0.9,
-                capsize=2.0,
-            )
-            ax.plot(
-                x_off,
-                [y0, y1, y2],
-                linestyle=linestyle,
-                linewidth=1.2,
-                color="0.35",
-                label=label,
-            )
-            ax.scatter(
-                x_off,
-                [y0, y1, y2],
-                s=28,
-                c=stage_colors,
-                edgecolors="black",
-                linewidths=0.4,
-                zorder=3,
-            )
-
-        ax.set_xticks(x)
-        ax.set_xticklabels(x_labels, fontsize=_FONT_TICK)
-        ax.set_ylabel(spec["display"], fontsize=_FONT_LABEL)
-        ax.grid(axis="y", alpha=0.2)
+        fig, ax = plt.subplots(1, 1, figsize=(_FIG_W_DELTA, _FIG_H))
+        ax.axhline(0.0, color="0.35", linewidth=0.8, linestyle="--")
+        ax.plot(x, y, color=_TREATMENT_COLOR, linewidth=1.3)
+        ax.scatter(x, y, s=22, color=_TREATMENT_COLOR, edgecolors="black", linewidths=0.4, zorder=3)
+        ax.set_xlabel(r"Modeled time index $t$", fontsize=_FONT_LABEL)
+        ax.set_ylabel("Signed relative improvement (%)", fontsize=_FONT_LABEL)
+        ax.set_title(
+            f"{spec['title']}: {treatment_label} vs {baseline_label}",
+            fontsize=_FONT_TITLE,
+        )
+        ax.grid(alpha=0.2)
         ax.tick_params(axis="both", labelsize=_FONT_TICK)
-
-        yscale = spec.get("yscale")
-        if yscale:
-            ax.set_yscale(str(yscale))
-        ylim = spec.get("ylim")
-        if isinstance(ylim, (list, tuple)) and len(ylim) == 2:
-            ax.set_ylim(float(ylim[0]), float(ylim[1]))
-        _apply_sci_yticks(ax, yscale)
-
-        if seen_labels:
-            from matplotlib.lines import Line2D
-
-            legend_items = []
-            if "ADAM" in seen_labels:
-                legend_items.append(Line2D([0], [0], color="0.35", lw=1.2, ls="-", label="ADAM"))
-            if "MUON" in seen_labels:
-                legend_items.append(Line2D([0], [0], color="0.35", lw=1.2, ls="--", label="MUON"))
-            if legend_items:
-                ax.legend(
-                    handles=legend_items,
-                    loc="upper center",
-                    ncol=len(legend_items),
-                    frameon=False,
-                    fontsize=_FONT_LEGEND,
-                )
-
-        fig.tight_layout()
-        _save_fig(fig, out_dir, f"latent_geom_l2_ntk_prior_chain_{spec['label']}")
+        ax.xaxis.set_major_locator(mticker.MaxNLocator(integer=True))
+        ax.yaxis.set_major_formatter(mticker.PercentFormatter(xmax=1.0))
+        finite_y = y[np.isfinite(y)]
+        if finite_y.size:
+            y_lim = 1.12 * max(float(np.max(np.abs(finite_y))), 0.05)
+            ax.set_ylim(-y_lim, y_lim)
+        fig.tight_layout(pad=0.7)
+        _save_fig(fig, out_dir, f"latent_geom_pair_time_delta_{spec['label']}")

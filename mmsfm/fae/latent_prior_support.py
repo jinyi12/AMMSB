@@ -275,3 +275,4 @@ def setup_film_prior_training(autoencoder, args):
 
 
 setup_deterministic_prior_training = setup_film_prior_training
+setup_vector_prior_training = setup_film_prior_training

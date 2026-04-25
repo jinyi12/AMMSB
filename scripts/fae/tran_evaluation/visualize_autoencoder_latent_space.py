@@ -28,11 +28,11 @@ REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from scripts.fae.analyze_latent_noise_sweep import compute_latent_codes  # noqa: E402
 from mmsfm.fae.fae_latent_utils import (  # noqa: E402
     build_fae_from_checkpoint,
     load_fae_checkpoint,
 )
+from scripts.fae.tran_evaluation.latent_encoding import compute_latent_codes  # noqa: E402
 from scripts.fae.tran_evaluation.run_support import (  # noqa: E402
     load_json_dict,
     resolve_data_path_from_args_json,
@@ -40,7 +40,16 @@ from scripts.fae.tran_evaluation.run_support import (  # noqa: E402
     resolve_run_checkpoint,
 )
 from mmsfm.fae.multiscale_dataset_naive import load_training_time_data_naive  # noqa: E402
-from scripts.images.field_visualization import format_for_paper  # noqa: E402
+from scripts.images.field_visualization import (  # noqa: E402
+    format_for_paper,
+    math_pc_axis_label,
+    publication_figure_width,
+    publication_grid_figure_size,
+    publication_style_tokens,
+)
+
+
+_PUB_STYLE = publication_style_tokens()
 
 
 def _parse_args() -> argparse.Namespace:
@@ -167,19 +176,27 @@ def _fit_pca(
 def _model_label(args_json: dict[str, Any]) -> str:
     optimizer = str(args_json.get("optimizer", "unknown")).upper()
     loss = str(args_json.get("loss_type", "unknown")).lower()
-    use_prior = bool(args_json.get("use_prior", False))
+    regularizer = str(args_json.get("latent_regularizer", "")).strip().lower()
+    if regularizer not in {"none", "diffusion_prior", "sigreg"}:
+        regularizer = "diffusion_prior" if bool(args_json.get("use_prior", False)) else "none"
 
     if loss == "ntk_scaled":
         loss_name = "NTK-Scale"
     elif loss == "ntk_prior_balanced":
         loss_name = "NTK-Bal"
+    elif loss == "ntk_sigreg_balanced":
+        loss_name = "NTK-SIG"
     elif loss == "l2":
         loss_name = "L2"
     else:
         loss_name = loss.upper()
 
-    if use_prior:
+    if loss == "ntk_sigreg_balanced":
+        return f"{optimizer}+{loss_name}"
+    if regularizer == "diffusion_prior":
         return f"{optimizer}+{loss_name}+Prior"
+    if regularizer == "sigreg":
+        return f"{optimizer}+{loss_name}+SIGReg"
     return f"{optimizer}+{loss_name}"
 
 
@@ -218,7 +235,7 @@ def _plot_single_run(
     points = np.concatenate(keep_points, axis=0)
     t_labels = np.concatenate(keep_time, axis=0)
 
-    fig, ax = plt.subplots(1, 1, figsize=(5.6, 4.4))
+    fig, ax = plt.subplots(1, 1, figsize=(publication_figure_width(column_span=1), 2.95))
     cmap = plt.get_cmap("cividis", t_count)
     sc = ax.scatter(
         points[:, 0],
@@ -229,14 +246,15 @@ def _plot_single_run(
         alpha=0.75,
         linewidths=0.0,
     )
-    cbar = fig.colorbar(sc, ax=ax, fraction=0.045, pad=0.04)
-    cbar.set_label("time-marginal index")
+    cbar = fig.colorbar(sc, ax=ax, fraction=0.04, pad=0.03)
+    cbar.set_label("time-marginal index", fontsize=_PUB_STYLE["font_label"])
+    cbar.ax.tick_params(labelsize=_PUB_STYLE["font_tick"])
     cbar.set_ticks(np.arange(t_count))
     cbar.set_ticklabels([f"{int(i)}@{float(tn):.3f}" for i, tn in zip(time_indices, times_norm)])
 
-    ax.set_title(title, fontsize=10)
-    ax.set_xlabel("PC1")
-    ax.set_ylabel("PC2")
+    ax.set_title(title, fontsize=_PUB_STYLE["font_title"])
+    ax.set_xlabel(math_pc_axis_label(1, context="Projected coordinate"))
+    ax.set_ylabel(math_pc_axis_label(2, context="Projected coordinate"))
     ax.grid(alpha=0.2)
     fig.tight_layout()
 
@@ -258,7 +276,17 @@ def _plot_combined_grid(
     n_runs = len(run_titles)
     n_cols = 3
     n_rows = int(np.ceil(n_runs / float(n_cols)))
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(4.6 * n_cols, 3.6 * n_rows), squeeze=False)
+    fig_width, fig_height = publication_grid_figure_size(
+        n_cols,
+        n_rows,
+        column_span=2,
+        width_fraction=0.82,
+        panel_height_in=1.85,
+        extra_height_in=0.2,
+        min_panel_width_in=1.7,
+        max_width_in=publication_figure_width(column_span=2),
+    )
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(fig_width, fig_height), squeeze=False)
     cmap = plt.get_cmap("cividis", n_times)
 
     for i in range(n_rows * n_cols):
@@ -277,9 +305,9 @@ def _plot_combined_grid(
             alpha=0.70,
             linewidths=0.0,
         )
-        ax.set_title(run_titles[i], fontsize=9)
-        ax.set_xlabel("PC1")
-        ax.set_ylabel("PC2")
+        ax.set_title(run_titles[i], fontsize=_PUB_STYLE["font_title"])
+        ax.set_xlabel(math_pc_axis_label(1, context="Projected coordinate"))
+        ax.set_ylabel(math_pc_axis_label(2, context="Projected coordinate"))
         ax.grid(alpha=0.2)
 
     fig.tight_layout()

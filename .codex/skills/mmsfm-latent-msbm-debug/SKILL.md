@@ -1,28 +1,20 @@
 ---
 name: mmsfm-latent-msbm-debug
-description: Use when inspecting latent-MSBM run directories, rebuilding runtime state from args files, validating zt and time-index mappings, resolving checkpoints, or checking corpus-latent compatibility. Read run_support.py and latent_msbm_runtime.py first.
+description: Use when a latent-MSBM compatibility run must be reconstructed from `args`, checkpoints, `zt`, or corpus latents.
 ---
 
 # MMSFM Latent MSBM Debug
 
-## Use This Skill When
+Use this skill when a latent-MSBM compatibility run must be rebuilt from `args`, checkpoints, `zt`, `time_indices`, or corpus latents.
 
-- a latent-MSBM run directory needs inspection
-- checkpoint loading fails
-- `zt`, `time_indices`, or internal time-grid reconstruction looks wrong
-- corpus latent archives do not line up with run metadata
+1. Read `scripts/fae/tran_evaluation/run_support.py` and `scripts/fae/tran_evaluation/latent_msbm_runtime.py`.
+2. Read `tests/test_tran_evaluation_run_support.py` and `tests/test_tran_evaluation_latent_msbm_runtime.py`.
+3. Inspect `args.txt`, `args.json`, `fae_latents.npz`, and checkpoint files in the run directory.
+4. Patch the existing loader or reconstruction path directly.
+5. Reconstruct from run files; do not guess missing values.
+6. Fail loudly on inconsistent args, checkpoints, or time grids.
+7. Keep the fix function-first and direct. Do not build new debug classes or wrappers.
+8. Do not add fallback reconstruction, heuristic repair, local stabilization, or post-processing bandages that are not faithful general algorithms.
+9. Run the focused tests after the fix.
 
-## Workflow
-
-1. Read `scripts/fae/tran_evaluation/run_support.py`.
-2. Read `scripts/fae/tran_evaluation/latent_msbm_runtime.py`.
-3. Read the focused tests:
-   `tests/test_tran_evaluation_run_support.py` and `tests/test_tran_evaluation_latent_msbm_runtime.py`.
-4. Inspect `args.txt`, `args.json`, `fae_latents.npz`, and checkpoint files in the run directory.
-5. Prefer the existing support modules over adding new one-off parsing code.
-
-## Primary References
-
-- `scripts/fae/tran_evaluation/run_support.py`
-- `scripts/fae/tran_evaluation/latent_msbm_runtime.py`
-- `docs/evaluation_pipeline.md`
+This skill is for compatibility maintenance. New downstream transport work belongs in `csp/`.

@@ -27,6 +27,8 @@ _PROJECT_ROOT = str(Path(__file__).resolve().parent.parent.parent)
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
+from scripts.fae.tran_evaluation.latent_encoding import compute_latent_codes
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -155,32 +157,6 @@ def compute_reconstruction_mse(
 
     overall_mse = float(np.mean(per_time_mse))
     return overall_mse, per_time_mse
-
-
-def compute_latent_codes(
-    autoencoder, params, batch_stats, fields, coords, batch_size: int = 32,
-):
-    """Encode fields and return latent codes (T, N, K)."""
-    from mmsfm.fae.fae_latent_utils import make_fae_apply_fns
-
-    encode_fn, _ = make_fae_apply_fns(
-        autoencoder, params, batch_stats, decode_mode="standard",
-    )
-
-    t, n, p, c = fields.shape
-    x = coords.astype(np.float32)
-    all_z = []
-
-    for t_idx in range(t):
-        u_all = fields[t_idx].astype(np.float32)
-        parts = []
-        for i in range(0, n, batch_size):
-            u_b = u_all[i : i + batch_size]
-            x_b = np.broadcast_to(x[None, ...], (u_b.shape[0], *x.shape))
-            parts.append(encode_fn(u_b, x_b))
-        all_z.append(np.concatenate(parts, axis=0))
-
-    return np.stack(all_z, axis=0)  # (T, N, K)
 
 
 def compute_distance_correlation(

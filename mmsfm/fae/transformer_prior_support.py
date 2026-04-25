@@ -25,6 +25,13 @@ def build_transformer_prior_components(
 
     import jax.numpy as jnp
 
+    prior_architecture = str(getattr(args, "prior_architecture", "transformer_dit")).strip().lower()
+    if prior_architecture != "transformer_dit":
+        raise ValueError(
+            "Transformer FAE prior training requires prior_architecture='transformer_dit'. "
+            f"Got {prior_architecture!r}."
+        )
+
     num_latents, token_dim = get_transformer_latent_shape(autoencoder)
     raw_prior_num_heads = getattr(args, "prior_num_heads", None)
     prior_num_heads = int(args.n_heads if raw_prior_num_heads is None else raw_prior_num_heads)
@@ -47,6 +54,12 @@ def build_transformer_prior_components(
         leaf.size for leaf in jax.tree.leaves(extra_init_params_fn(jax.random.PRNGKey(0)))
     )
     print(f"Transformer DiT velocity prior: {n_prior_params:,} parameters")
+    print(
+        "  prior_architecture=transformer_dit "
+        f"(token_shape=({num_latents}, {token_dim}), hidden_dim={int(args.prior_hidden_dim)}, "
+        f"layers={int(args.prior_n_layers)}, heads={prior_num_heads}, "
+        f"mlp_ratio={float(getattr(args, 'prior_mlp_ratio', 2.0)):.3g})"
+    )
     calibration = getattr(args, "prior_logsnr_calibration", None)
     if calibration is not None:
         print(

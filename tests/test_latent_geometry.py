@@ -17,7 +17,10 @@ from scripts.fae.tran_evaluation.latent_geometry import (
     LatentGeometryConfig,
     estimate_hessian_norm,
     estimate_pullback_spectrum,
+    evaluate_latent_geometry,
 )
+from scripts.fae.tran_evaluation.latent_encoding import compute_latent_codes
+from mmsfm.fae.fae_training_components import build_autoencoder
 
 
 def _base_config(seed: int = 0) -> LatentGeometryConfig:
@@ -145,3 +148,115 @@ def test_hutchpp_trace_mode_produces_finite_metrics():
     assert np.isfinite(spec["fro_norm_g"])
     assert np.isfinite(spec["effective_rank"])
     assert np.isfinite(spec["rho_vol"])
+
+
+def test_transformer_patch_geometry_evaluation_restores_token_latents():
+    key = jax.random.PRNGKey(23)
+    autoencoder, _architecture_info = build_autoencoder(
+        key=key,
+        latent_dim=8,
+        n_freqs=4,
+        fourier_sigma=1.0,
+        decoder_features=(16, 16),
+        encoder_type="transformer",
+        decoder_type="transformer",
+        transformer_emb_dim=16,
+        transformer_num_latents=4,
+        transformer_encoder_depth=2,
+        transformer_cross_attn_depth=1,
+        transformer_decoder_depth=2,
+        transformer_mlp_ratio=2,
+        transformer_tokenization="patches",
+        transformer_patch_size=2,
+        transformer_grid_size=(4, 4),
+        n_heads=4,
+    )
+
+    side = 4
+    n_points = side * side
+    coords_lin = jnp.linspace(0.0, 1.0, side, dtype=jnp.float32)
+    coords = jnp.stack(jnp.meshgrid(coords_lin, coords_lin, indexing="ij"), axis=-1)
+    coords = np.asarray(jnp.reshape(coords, (n_points, 2)), dtype=np.float32)
+
+    init_u = jnp.ones((2, n_points, 1), dtype=jnp.float32)
+    init_x = jnp.broadcast_to(coords[None, ...], (2, n_points, 2))
+    variables = autoencoder.init(jax.random.PRNGKey(24), init_u, init_x, init_x, train=False)
+
+    fields = np.asarray(
+        jax.random.normal(jax.random.PRNGKey(25), (2, 3, n_points, 1), dtype=jnp.float32),
+        dtype=np.float32,
+    )
+    results = evaluate_latent_geometry(
+        autoencoder,
+        variables["params"],
+        variables.get("batch_stats", {}),
+        fields,
+        coords,
+        config=LatentGeometryConfig(
+            n_samples=2,
+            n_probes=2,
+            n_slq_probes=1,
+            n_lanczos_steps=4,
+            n_hvp_probes=1,
+            seed=31,
+        ),
+    )
+
+    meta = results["latent_geometry_metadata"]
+    assert meta["latent_representation"] == "flattened_transformer_tokens"
+    assert meta["transformer_latent_shape"] == [4, 16]
+    assert meta["decoder_type"] == "transformer"
+    assert len(results["per_time"]) == 2
+    assert np.isfinite(results["global_summary"]["trace_g_mean_over_time"])
+    assert np.isfinite(results["global_summary"]["effective_rank_mean_over_time"])
+    assert np.isfinite(results["global_summary"]["rho_vol_mean_over_time"])
+    assert np.isfinite(results["global_summary"]["near_null_mass_mean_over_time"])
+
+
+def test_compute_latent_codes_uses_flattened_transformer_transport_boundary():
+    key = jax.random.PRNGKey(41)
+    autoencoder, _architecture_info = build_autoencoder(
+        key=key,
+        latent_dim=8,
+        n_freqs=4,
+        fourier_sigma=1.0,
+        decoder_features=(16, 16),
+        encoder_type="transformer",
+        decoder_type="transformer",
+        transformer_emb_dim=16,
+        transformer_num_latents=4,
+        transformer_encoder_depth=2,
+        transformer_cross_attn_depth=1,
+        transformer_decoder_depth=2,
+        transformer_mlp_ratio=2,
+        transformer_tokenization="patches",
+        transformer_patch_size=2,
+        transformer_grid_size=(4, 4),
+        n_heads=4,
+    )
+
+    side = 4
+    n_points = side * side
+    coords_lin = jnp.linspace(0.0, 1.0, side, dtype=jnp.float32)
+    coords = jnp.stack(jnp.meshgrid(coords_lin, coords_lin, indexing="ij"), axis=-1)
+    coords = np.asarray(jnp.reshape(coords, (n_points, 2)), dtype=np.float32)
+
+    init_u = jnp.ones((2, n_points, 1), dtype=jnp.float32)
+    init_x = jnp.broadcast_to(coords[None, ...], (2, n_points, 2))
+    variables = autoencoder.init(jax.random.PRNGKey(42), init_u, init_x, init_x, train=False)
+
+    fields = np.asarray(
+        jax.random.normal(jax.random.PRNGKey(43), (2, 3, n_points, 1), dtype=jnp.float32),
+        dtype=np.float32,
+    )
+    latent_codes = compute_latent_codes(
+        autoencoder,
+        variables["params"],
+        variables.get("batch_stats", {}),
+        fields,
+        coords,
+        batch_size=2,
+    )
+
+    assert latent_codes.shape == (2, 3, 64)
+    assert np.isfinite(latent_codes).all()

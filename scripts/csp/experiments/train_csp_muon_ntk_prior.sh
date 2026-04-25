@@ -74,14 +74,14 @@ case "$PROFILE" in
     NUM_STEPS="${NUM_STEPS:-10}"
     BATCH_SIZE="${BATCH_SIZE:-32}"
     SAMPLE_COUNT="${SAMPLE_COUNT:-4}"
-    CONDITION_MODE="${CONDITION_MODE:-global_and_previous}"
+    CONDITION_MODE="${CONDITION_MODE:-previous_state}"
     ;;
   main)
     OUTDIR="${OUTDIR:-${OUTPUT_BASE}/main}"
     NUM_STEPS="${NUM_STEPS:-10000}"
     BATCH_SIZE="${BATCH_SIZE:-256}"
     SAMPLE_COUNT="${SAMPLE_COUNT:-128}"
-    CONDITION_MODE="${CONDITION_MODE:-global_and_previous}"
+    CONDITION_MODE="${CONDITION_MODE:-previous_state}"
     ;;
   coarse_only)
     OUTDIR="${OUTDIR:-${OUTPUT_BASE}/coarse_only}"

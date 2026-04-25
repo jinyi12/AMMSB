@@ -1,0 +1,4 @@
+interface:
+  display_name: "MMSFM Manuscript Writing"
+  short_description: "Rewrite manuscript prose directly"
+  default_prompt: "Use $mmsfm-manuscript-writing to rewrite manuscript prose so it directly states what is defined, proved, implemented, or measured without elevating fallback bandages or heuristics into general algorithmic claims."

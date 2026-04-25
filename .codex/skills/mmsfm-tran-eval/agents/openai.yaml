@@ -1,4 +1,4 @@
 interface:
   display_name: "MMSFM Tran Eval"
-  short_description: "Run and debug Tran evaluation flows"
-  default_prompt: "Use $mmsfm-tran-eval to run or debug the Tran evaluation family in this repository."
+  short_description: "Run or debug Tran evaluation"
+  default_prompt: "Use $mmsfm-tran-eval to run or debug the Tran evaluation scripts, keep fixes local to that package, avoid adding class-based orchestration, and avoid fallback or post-processing bandages that are not faithful general algorithms."

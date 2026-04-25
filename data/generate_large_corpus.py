@@ -144,8 +144,8 @@ def main() -> None:
     # Infer H_meso_list from the number of intermediate times
     # Reference times: [0.0, t1, t2, ..., 1.0] where intermediates are meso scales
     n_meso = len(ref_times) - 2  # exclude t=0 (micro) and t=1 (macro)
-    # Default meso schedule from generate_fae_data.py
-    default_meso = [1.0, 1.25, 1.5, 2.0, 2.5, 3.0]
+    # Canonical FAE Tran meso schedule.
+    default_meso = [1.0, 1.25, 1.5, 2.0, 2.5, 3.0, 4.0]
     if n_meso <= len(default_meso):
         H_meso_list = [h * D_large for h in default_meso[:n_meso]]
     else:

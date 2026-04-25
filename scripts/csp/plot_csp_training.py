@@ -16,18 +16,27 @@ matplotlib.use("Agg")
 from matplotlib import pyplot as plt
 import numpy as np
 
-from scripts.images.field_visualization import EASTERN_HUES, format_for_paper
+from scripts.images.field_visualization import (
+    EASTERN_HUES,
+    format_for_paper,
+    publication_figure_width,
+    publication_style_tokens,
+)
 
 
 C_RAW = "0.75"
 C_TRAIN = EASTERN_HUES[7]
-FONT_LABEL = 7
-FONT_TICK = 7
+_PUB_STYLE = publication_style_tokens()
+FONT_LABEL = _PUB_STYLE["font_label"]
+FONT_TICK = _PUB_STYLE["font_tick"]
+FIG_WIDTH = publication_figure_width(column_span=1)
+FIG_HEIGHT = 2.35
 _BRIDGE_MATCHING_MODEL_TYPES = {"conditional_bridge", "conditional_bridge_token_dit"}
 _BRIDGE_MATCHING_OBJECTIVES = {
     "paired_conditional_bridge_matching",
     "paired_conditional_multimarginal_bridge_matching",
 }
+_STATE_PREDICTION_OBJECTIVES = {"paired_prior_bridge_state_prediction"}
 
 
 def _parse_args() -> argparse.Namespace:
@@ -82,12 +91,28 @@ def _infer_loss_label(
     *,
     model_type: str | None,
     training_objective: str | None,
+    loss_key: str,
 ) -> str:
+    if loss_key == "state_loss_history":
+        return "State prediction loss"
     if training_objective in _BRIDGE_MATCHING_OBJECTIVES:
         return "Bridge matching loss"
+    if training_objective in _STATE_PREDICTION_OBJECTIVES:
+        return "State prediction loss"
     if model_type in _BRIDGE_MATCHING_MODEL_TYPES:
         return "Bridge matching loss"
     return "ECMMD loss"
+
+
+def _select_loss_history(data: np.lib.npyio.NpzFile) -> tuple[str, np.ndarray]:
+    for key in ("loss_history", "state_loss_history"):
+        if key in data:
+            return key, np.asarray(data[key], dtype=np.float32)
+    available = ", ".join(sorted(data.files))
+    raise KeyError(
+        "training_summary.npz is missing a supported loss history. "
+        f"Expected one of: loss_history, state_loss_history. Available keys: {available}"
+    )
 
 
 def plot_training_curve(
@@ -101,7 +126,7 @@ def plot_training_curve(
         raise FileNotFoundError(f"Missing training summary: {summary_path}")
 
     with np.load(summary_path, allow_pickle=True) as data:
-        loss_history = np.asarray(data["loss_history"], dtype=np.float32)
+        loss_key, loss_history = _select_loss_history(data)
         training_seconds = float(np.asarray(data["training_seconds"]).item()) if "training_seconds" in data else None
         model_type = _read_optional_scalar_string(data, "model_type")
         training_objective = _read_optional_scalar_string(data, "training_objective")
@@ -112,12 +137,16 @@ def plot_training_curve(
     window = _auto_smooth_window(int(loss_history.size), int(smooth_window))
     smooth = _moving_average(loss_history, window)
     steps = np.arange(1, loss_history.shape[0] + 1, dtype=np.int64)
-    loss_label = _infer_loss_label(model_type=model_type, training_objective=training_objective)
+    loss_label = _infer_loss_label(
+        model_type=model_type,
+        training_objective=training_objective,
+        loss_key=loss_key,
+    )
 
     format_for_paper()
-    fig, ax = plt.subplots(figsize=(5.0, 3.2))
+    fig, ax = plt.subplots(figsize=(FIG_WIDTH, FIG_HEIGHT))
     ax.plot(steps, loss_history, color=C_RAW, linewidth=0.8, alpha=0.9)
-    ax.plot(steps, smooth, color=C_TRAIN, linewidth=1.4)
+    ax.plot(steps, smooth, color=C_TRAIN, linewidth=1.2)
     ax.set_xlabel("Optimizer step", fontsize=FONT_LABEL)
     ax.set_ylabel(loss_label, fontsize=FONT_LABEL)
     ax.grid(alpha=0.18)
@@ -141,6 +170,7 @@ def plot_training_curve(
         "training_seconds": training_seconds,
         "model_type": model_type,
         "training_objective": training_objective,
+        "loss_key": loss_key,
         "loss_label": loss_label,
     }
     (output_dir / "training_curve_summary.json").write_text(json.dumps(summary, indent=2))

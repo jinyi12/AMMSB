@@ -1,5 +1,10 @@
 from ._conditional_bridge import BRIDGE_CONDITION_MODES, bridge_condition_dim, bridge_condition_uses_global_state
-from .bridge_matching import make_bridge_matching_loss_fn, train_bridge_matching
+from .bridge_matching import (
+    estimate_monte_carlo_detached_bridge_matching_loss,
+    estimate_monte_carlo_bridge_matching_loss,
+    make_bridge_matching_loss_fn,
+    train_bridge_matching,
+)
 from .benchmark import (
     HIERARCHICAL_GAUSSIAN_BENCHMARK_NAME,
     HierarchicalGaussianBenchmarkConfig,
@@ -31,6 +36,13 @@ from .sde import (
 )
 from .token_bridge_matching import make_token_bridge_matching_loss_fn, train_token_bridge_matching
 from .token_dit import TokenBridgeCondition, TokenConditionalDiT, build_token_conditional_dit
+from .token_paired_prior_bridge import (
+    PAIRED_PRIOR_TOKEN_DIT_MODEL_TYPE,
+    PAIRED_PRIOR_TOKEN_DIT_TRAINING_OBJECTIVE,
+    sample_token_paired_prior_conditional_batch,
+    sample_token_paired_prior_conditional_trajectory,
+    train_token_paired_prior_bridge,
+)
 from .token_sample import sample_token_conditional_batch, sample_token_conditional_trajectory
 
 __all__ = [
@@ -43,6 +55,8 @@ __all__ = [
     "TokenConditionalDiT",
     "BRIDGE_CONDITION_MODES",
     "DriftNet",
+    "PAIRED_PRIOR_TOKEN_DIT_MODEL_TYPE",
+    "PAIRED_PRIOR_TOKEN_DIT_TRAINING_OBJECTIVE",
     "build_conditional_drift_model",
     "build_conditional_transformer_drift_model",
     "build_token_conditional_dit",
@@ -53,6 +67,8 @@ __all__ = [
     "evaluate_hierarchical_gaussian_sampler_benchmark",
     "evaluate_hierarchical_gaussian_benchmark",
     "exp_contract_sigma",
+    "estimate_monte_carlo_detached_bridge_matching_loss",
+    "estimate_monte_carlo_bridge_matching_loss",
     "hierarchical_gaussian_interval_logpdf",
     "hierarchical_gaussian_path_logpdf",
     "hierarchical_gaussian_path_score",
@@ -68,10 +84,13 @@ __all__ = [
     "sample_conditional_trajectory",
     "sample_token_conditional_batch",
     "sample_token_conditional_trajectory",
+    "sample_token_paired_prior_conditional_batch",
+    "sample_token_paired_prior_conditional_trajectory",
     "sample_hierarchical_gaussian_rollouts",
     "sample_trajectory",
     "sinusoidal_embedding",
     "train_bridge_matching",
+    "train_token_paired_prior_bridge",
     "train_token_bridge_matching",
     "wasserstein1_wasserstein2_latents",
 ]

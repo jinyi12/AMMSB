@@ -8,6 +8,19 @@ This document summarizes the *current* mathematical formulation implemented in:
 It is intended to be read as "what the code computes", not as a claim of the
 best possible estimator.
 
+The maintained cross-run surface is the canonical transformer pair selected by
+default in `scripts/fae/tran_evaluation/compare_latent_geometry_models.py` and
+documented in `docs/experiments/transformer_pair_geometry.md`. The companion
+CSV `docs/experiments/transformer_pair_geometry_registry.csv` is retained as a
+provenance record for the fixed pair. Historical multi-run latent128
+publication comparisons are no longer the active maintained workflow.
+
+For transformer-token FAEs, encoder outputs are stored through the maintained
+flattened downstream latent surface, then restored to token memory
+`[batch, n_latents, emb_dim]` before any direct decoder apply, JVP, VJP, or
+Hessian probe. This preserves the estimator definitions below while fixing the
+runtime representation boundary.
+
 ## Notation
 
 Fix a coordinate set (grid/point cloud)
@@ -248,10 +261,11 @@ p99_t > \max(10 \cdot \text{median}_t,\varepsilon)
 $$
 Overall flags are the logical OR across $t$ for collapse and folding.
 
-## F. Cross-Model Relative Improvement (Used in Comparison Script)
+## F. Pairwise Relative Improvement (Used in Comparison Script)
 
-In `compare_latent_geometry_models.py`, relative changes are reported for a
-baseline $b$ and treatment $t$ using per-metric direction conventions:
+In `compare_latent_geometry_models.py`, the maintained comparison is a fixed
+baseline/treatment pair. Relative changes are reported for a baseline $b$ and
+treatment $t$ using per-metric direction conventions:
 
 1. If "higher is better":
 $$
@@ -263,7 +277,11 @@ $$
 \Delta_{\mathrm{rel}} := \frac{b - t}{|b| + 10^{-12}}.
 $$
 
-3. If "higher absolute value is better":
-$$
-\Delta_{\mathrm{rel}} := \frac{|t| - |b|}{|b| + 10^{-12}}.
-$$
+The maintained metric directions are:
+
+- higher is better: `trace_g`, effective rank, `rho_vol`
+- lower is better: near-null mass, Hessian Frobenius `p99`
+
+These sign conventions are written into the pairwise summary payload and the
+pairwise delta table so positive `\Delta_{\mathrm{rel}}` always means
+"treatment improved relative to baseline".

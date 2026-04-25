@@ -21,6 +21,17 @@ def test_check_required_files_reports_missing_targets(tmp_path):
     assert "README.md" not in missing
 
 
+def test_check_required_files_requires_skill_metadata_for_repo_skills(tmp_path):
+    repo_root = tmp_path / "repo"
+    skill_dir = repo_root / ".codex" / "skills" / "demo-skill"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("---\nname: demo-skill\ndescription: demo\n---\n")
+
+    missing = check_required_files(repo_root)
+
+    assert ".codex/skills/demo-skill/agents/openai.yaml" in missing
+
+
 def test_check_make_targets_reports_missing_targets(tmp_path):
     repo_root = tmp_path / "repo"
     repo_root.mkdir()

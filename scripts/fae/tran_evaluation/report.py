@@ -6,6 +6,8 @@ prescribed by the Tran-aligned evaluation plan.
 
 from __future__ import annotations
 
+import functools
+import shutil
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -15,7 +17,16 @@ from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
 from numpy.typing import NDArray
 
-from scripts.images.field_visualization import EASTERN_HUES, format_for_paper
+from scripts.images.field_visualization import (
+    EASTERN_HUES,
+    format_for_paper,
+    math_correlation_axis_label,
+    math_density_axis_label,
+    math_lag_axis_label,
+    math_quantile_axis_label,
+    publication_figure_width,
+    publication_style_tokens,
+)
 
 
 # ============================================================================
@@ -38,36 +49,70 @@ C_TEXT = "#1B1B1B"
 CMAP_FIELD = "cividis"
 CMAP_DIFF = "RdBu_r"
 
+_PUB_STYLE = publication_style_tokens()
+
 # ============================================================================
-# Font sizes (tuned for multi-panel figures at 7-inch width)
+# Font sizes (shared publication scale)
 # ============================================================================
-FONT_TITLE = 8
-FONT_LABEL = 7
-FONT_LEGEND = 6.5
-FONT_TICK = 7
+FONT_TITLE = _PUB_STYLE["font_title"]
+FONT_LABEL = _PUB_STYLE["font_label"]
+FONT_LEGEND = _PUB_STYLE["font_legend"]
+FONT_TICK = _PUB_STYLE["font_tick"]
 
 # ============================================================================
 # Standard layout constants
 # ============================================================================
-FIG_WIDTH = 7.0                # inches, all multi-panel figures
+FIG_WIDTH = publication_figure_width(column_span=2)
 SUBPLOT_HEIGHT = 2.5           # inches per row for grid plots (PDF, corr, PSD)
 SUBPLOT_HEIGHT_SQ = 2.3        # inches per row for square subplots (QQ)
 FIELD_ROW_HEIGHT = 1.75        # inches per row for field-image grids
 N_COLS = 3                     # standard columns for grid plots
+
+PDF_VALUE_LABEL = r"$u$"
+PDF_DENSITY_LABEL = math_density_axis_label("u")
+QQ_OBS_LABEL = math_quantile_axis_label("obs")
+QQ_GEN_LABEL = math_quantile_axis_label("gen")
+CORRELATION_LAG_LABEL = math_lag_axis_label(normalizer_tex="D")
+CORRELATION_VALUE_LABEL = math_correlation_axis_label(symbol_tex="R")
 
 
 # ============================================================================
 # Helpers
 # ============================================================================
 
+
+@functools.lru_cache(maxsize=1)
+def _latex_rendering_available() -> bool:
+    return shutil.which("latex") is not None and shutil.which("dvipng") is not None
+
 def _save_fig(fig: plt.Figure, out_dir: Path, name: str, *, png_dpi: int = 150) -> None:
     """Save *fig* as both PNG and PDF with tight bounding box."""
+    latex_rc = {
+        "text.usetex": True,
+        "font.family": "serif",
+    }
     for ext in ("png", "pdf"):
-        fig.savefig(
-            out_dir / f"{name}.{ext}",
-            dpi=png_dpi if ext == "png" else None,
-            bbox_inches="tight",
-        )
+        path = out_dir / f"{name}.{ext}"
+        try:
+            if _latex_rendering_available():
+                with plt.rc_context(latex_rc):
+                    fig.savefig(
+                        path,
+                        dpi=png_dpi if ext == "png" else None,
+                        bbox_inches="tight",
+                    )
+            else:
+                fig.savefig(
+                    path,
+                    dpi=png_dpi if ext == "png" else None,
+                    bbox_inches="tight",
+                )
+        except (RuntimeError, FileNotFoundError):
+            fig.savefig(
+                path,
+                dpi=png_dpi if ext == "png" else None,
+                bbox_inches="tight",
+            )
 
 
 def _band_label(band: int, H_schedule: Optional[List[float]] = None) -> str:
@@ -110,6 +155,127 @@ def add_column_cbar_horizontal(
     cbar = fig.colorbar(mappable, cax=cax, orientation="horizontal")
     cbar.ax.tick_params(labelsize=fontsize)
     return cbar
+
+
+def add_row_cbar_vertical(
+    fig: plt.Figure,
+    axes_row: List[plt.Axes],
+    mappable,
+    *,
+    pad: float = 0.010,
+    width: float = 0.02,
+    fontsize: float = FONT_TICK,
+):
+    """Add a vertical colorbar to the right of a row of axes."""
+    fig.canvas.draw()
+
+    bbs = [ax.get_position() for ax in axes_row]
+    x1 = max(bb.x1 for bb in bbs)
+    y0 = min(bb.y0 for bb in bbs)
+    y1 = max(bb.y1 for bb in bbs)
+
+    cax = fig.add_axes([
+        x1 + pad,
+        y0,
+        width,
+        y1 - y0,
+    ])
+    cbar = fig.colorbar(mappable, cax=cax)
+    cbar.ax.tick_params(labelsize=fontsize)
+    return cbar
+
+
+def _image_limits(
+    images: List[NDArray[np.float64]],
+    *,
+    symmetric: bool = False,
+) -> Tuple[float, float]:
+    """Return stable display limits for a list of images."""
+    if not images:
+        return (-1.0, 1.0)
+
+    if symmetric:
+        vmax = float(max(np.max(np.abs(img)) for img in images))
+        if not np.isfinite(vmax) or vmax <= 0.0:
+            vmax = 1.0
+        return (-vmax, vmax)
+
+    vmin = float(min(np.min(img) for img in images))
+    vmax = float(max(np.max(img) for img in images))
+    if not np.isfinite(vmin) or not np.isfinite(vmax):
+        return (-1.0, 1.0)
+    if vmax <= vmin:
+        pad = max(1.0, 0.05 * max(abs(vmin), abs(vmax), 1.0))
+        return (vmin - pad, vmax + pad)
+    return (vmin, vmax)
+
+
+def _publication_conditioned_panel_size(
+    *,
+    n_rows: int,
+    n_cols: int,
+    rowwise_colorbars: bool,
+) -> Tuple[float, float]:
+    """Compact figure size for publication field panels."""
+    width_extra = 0.92 if rowwise_colorbars else 0.48
+    fig_width = min(FIG_WIDTH, max(5.6, 1.34 * float(n_cols) + width_extra))
+    fig_height = max(5.15, 1.25 * float(n_rows) + 0.15)
+    return fig_width, fig_height
+
+
+def _format_h_tex(value: float | None) -> str:
+    if value is None:
+        return "?"
+    numeric = float(value)
+    if numeric.is_integer():
+        return str(int(numeric))
+    return f"{numeric:g}"
+
+
+def _coarse_consistency_qualitative_row_labels(
+    qualitative_examples: Dict | None = None,
+) -> Tuple[str, str, str, str]:
+    transfer_meta = {}
+    if isinstance(qualitative_examples, dict):
+        transfer_meta = qualitative_examples.get("transfer_metadata", {}) or {}
+    source_h = _format_h_tex(transfer_meta.get("source_H"))
+    target_h = _format_h_tex(transfer_meta.get("target_H"))
+    ridge_lambda = float(transfer_meta.get("ridge_lambda", 0.0) or 0.0)
+    if ridge_lambda > 0.0:
+        transfer_symbol = rf"\mathcal{{T}}^{{\mathrm{{reg}}}}_{{{target_h}\leftarrow{source_h}}}"
+    else:
+        transfer_symbol = rf"\mathcal{{T}}_{{{target_h}\leftarrow{source_h}}}"
+    source_field = rf"\widetilde U_{{H={source_h}}}"
+    target_field = rf"U_{{H={target_h}}}"
+    return (
+        rf"${source_field}$",
+        rf"${transfer_symbol}{source_field}$",
+        rf"${target_field}$",
+        rf"${transfer_symbol}{source_field} - {target_field}$",
+    )
+
+
+def _add_left_row_labels(
+    fig: plt.Figure,
+    axes: NDArray,
+    labels: List[str],
+    *,
+    x: float,
+    fontsize: float = FONT_LABEL,
+) -> None:
+    """Place vertically rotated row labels using figure coordinates."""
+    fig.canvas.draw()
+    for row_idx, label in enumerate(labels):
+        bb = axes[row_idx, 0].get_position()
+        fig.text(
+            x,
+            0.5 * (bb.y0 + bb.y1),
+            str(label),
+            rotation=90,
+            va="center",
+            ha="center",
+            fontsize=fontsize,
+        )
 
 
 def _sample_finite(
@@ -186,6 +352,11 @@ def _plot_conditioned_qualitative_panel(
     resolution: int,
     out_dir: Path,
     name: str,
+    include_difference_row: bool = False,
+    rowwise_colorbars: bool = False,
+    row_labels: Tuple[str, ...] | None = None,
+    compact_layout: bool = False,
+    use_figtext_row_labels: bool = False,
 ) -> None:
     if not qualitative_examples:
         return
@@ -204,52 +375,152 @@ def _plot_conditioned_qualitative_panel(
     generated_imgs = [_field_to_image(generated_fields[col], resolution) for col in range(n_cols)]
     coarsened_imgs = [_field_to_image(coarsened_fields[col], resolution) for col in range(n_cols)]
     condition_imgs = [_field_to_image(condition_fields[col], resolution) for col in range(n_cols)]
-    all_imgs = generated_imgs + coarsened_imgs + condition_imgs
-    shared_vmin = float(min(img.min() for img in all_imgs))
-    shared_vmax = float(max(img.max() for img in all_imgs))
+    if not include_difference_row and not rowwise_colorbars:
+        all_imgs = generated_imgs + coarsened_imgs + condition_imgs
+        shared_vmin = float(min(img.min() for img in all_imgs))
+        shared_vmax = float(max(img.max() for img in all_imgs))
 
-    panel_size = 1.35
-    fig, axes = plt.subplots(
-        3,
-        n_cols,
-        figsize=(panel_size * n_cols, panel_size * 3),
+        panel_size = 1.35
+        fig, axes = plt.subplots(
+            3,
+            n_cols,
+            figsize=(panel_size * n_cols, panel_size * 3),
+        )
+        axes = np.asarray(axes).reshape(3, n_cols)
+        row_labels = ("Generated", "Coarsened", "GT / Cond.")
+
+        for col in range(n_cols):
+            axes[0, col].imshow(
+                generated_imgs[col],
+                origin="lower",
+                cmap=CMAP_FIELD,
+                vmin=shared_vmin,
+                vmax=shared_vmax,
+            )
+            axes[0, col].axis("off")
+
+            axes[1, col].imshow(
+                coarsened_imgs[col],
+                origin="lower",
+                cmap=CMAP_FIELD,
+                vmin=shared_vmin,
+                vmax=shared_vmax,
+            )
+            axes[1, col].axis("off")
+
+            axes[2, col].imshow(
+                condition_imgs[col],
+                origin="lower",
+                cmap=CMAP_FIELD,
+                vmin=shared_vmin,
+                vmax=shared_vmax,
+            )
+            axes[2, col].axis("off")
+
+        row_y = (0.83, 0.50, 0.17)
+        for label, y in zip(row_labels, row_y, strict=True):
+            fig.text(0.035, y, label, rotation=90, va="center", ha="center", fontsize=FONT_LABEL)
+
+        fig.subplots_adjust(left=0.08, right=0.99, top=0.99, bottom=0.01, wspace=0.02, hspace=0.02)
+        _save_fig(fig, out_dir, name)
+        plt.close(fig)
+        return
+
+    difference_imgs = [coarsened_imgs[col] - condition_imgs[col] for col in range(n_cols)]
+    row_specs = [
+        {
+            "label": "Generated",
+            "images": generated_imgs,
+            "cmap": CMAP_FIELD,
+            "limits": _image_limits(generated_imgs),
+        },
+        {
+            "label": "Coarsened",
+            "images": coarsened_imgs,
+            "cmap": CMAP_FIELD,
+            "limits": _image_limits(coarsened_imgs),
+        },
+        {
+            "label": "GT / Cond.",
+            "images": condition_imgs,
+            "cmap": CMAP_FIELD,
+            "limits": _image_limits(condition_imgs),
+        },
+    ]
+    if include_difference_row:
+        row_specs.append(
+            {
+                "label": "Difference",
+                "images": difference_imgs,
+                "cmap": CMAP_DIFF,
+                "limits": _image_limits(difference_imgs, symmetric=True),
+            },
+        )
+    if row_labels is not None:
+        if len(row_labels) != len(row_specs):
+            raise ValueError(
+                f"Expected {len(row_specs)} row labels, received {len(row_labels)}."
+            )
+        for spec, label in zip(row_specs, row_labels, strict=True):
+            spec["label"] = str(label)
+
+    n_rows = len(row_specs)
+    figsize = (
+        _publication_conditioned_panel_size(
+            n_rows=n_rows,
+            n_cols=n_cols,
+            rowwise_colorbars=rowwise_colorbars,
+        )
+        if compact_layout
+        else (FIG_WIDTH, FIELD_ROW_HEIGHT * n_rows + 0.35)
     )
-    axes = np.asarray(axes).reshape(3, n_cols)
-    row_labels = ("Generated", "Coarsened", "GT / Cond.")
+    fig, axes = plt.subplots(
+        n_rows,
+        n_cols,
+        figsize=figsize,
+        squeeze=False,
+    )
+    im_handles = [None] * n_rows
+    for row_idx, spec in enumerate(row_specs):
+        vmin, vmax = spec["limits"]
+        for col in range(n_cols):
+            im = axes[row_idx, col].imshow(
+                spec["images"][col],
+                origin="lower",
+                cmap=spec["cmap"],
+                vmin=vmin,
+                vmax=vmax,
+            )
+            if col == 0:
+                im_handles[row_idx] = im
+            axes[row_idx, col].axis("off")
+        if not use_figtext_row_labels:
+            axes[row_idx, 0].set_ylabel(
+                str(spec["label"]),
+                fontsize=FONT_LABEL,
+                rotation=0,
+                ha="right",
+                va="center",
+                labelpad=18,
+            )
 
-    for col in range(n_cols):
-        axes[0, col].imshow(
-            generated_imgs[col],
-            origin="lower",
-            cmap=CMAP_FIELD,
-            vmin=shared_vmin,
-            vmax=shared_vmax,
+    left = 0.12 if compact_layout else 0.13
+    right = 0.86 if rowwise_colorbars else 0.96
+    top = 0.985 if compact_layout else 0.98
+    bottom = 0.03 if compact_layout else 0.04
+    hspace = 0.08 if compact_layout else 0.10
+    fig.subplots_adjust(left=left, right=right, top=top, bottom=bottom, wspace=0.03, hspace=hspace)
+    if use_figtext_row_labels:
+        _add_left_row_labels(
+            fig,
+            axes,
+            [str(spec["label"]) for spec in row_specs],
+            x=0.07 if compact_layout else 0.065,
         )
-        axes[0, col].axis("off")
-
-        axes[1, col].imshow(
-            coarsened_imgs[col],
-            origin="lower",
-            cmap=CMAP_FIELD,
-            vmin=shared_vmin,
-            vmax=shared_vmax,
-        )
-        axes[1, col].axis("off")
-
-        axes[2, col].imshow(
-            condition_imgs[col],
-            origin="lower",
-            cmap=CMAP_FIELD,
-            vmin=shared_vmin,
-            vmax=shared_vmax,
-        )
-        axes[2, col].axis("off")
-
-    row_y = (0.83, 0.50, 0.17)
-    for label, y in zip(row_labels, row_y, strict=True):
-        fig.text(0.035, y, label, rotation=90, va="center", ha="center", fontsize=FONT_LABEL)
-
-    fig.subplots_adjust(left=0.08, right=0.99, top=0.99, bottom=0.01, wspace=0.02, hspace=0.02)
+    if rowwise_colorbars:
+        for row_idx, im in enumerate(im_handles):
+            if im is not None:
+                add_row_cbar_vertical(fig, list(axes[row_idx, :]), im)
     _save_fig(fig, out_dir, name)
     plt.close(fig)
 
@@ -474,6 +745,11 @@ def plot_coarse_consistency_global_qualitative(
         resolution=resolution,
         out_dir=out_dir,
         name="fig1c_coarse_consistency_global_qualitative",
+        include_difference_row=True,
+        rowwise_colorbars=True,
+        row_labels=_coarse_consistency_qualitative_row_labels(qualitative_examples),
+        compact_layout=True,
+        use_figtext_row_labels=True,
     )
 
 
@@ -490,6 +766,9 @@ def plot_coarse_consistency_interval_qualitative(
             resolution=resolution,
             out_dir=out_dir,
             name=f"fig1d_coarse_consistency_{_figure_safe_key(pair_key)}_qualitative",
+            include_difference_row=True,
+            rowwise_colorbars=True,
+            row_labels=_coarse_consistency_qualitative_row_labels(qualitative_examples),
         )
 
 
@@ -673,7 +952,8 @@ def plot_pdfs(
         ax.fill_between(x, y_gen, alpha=0.14, color=C_GEN)
 
         ax.set_title(_band_label(band, H_schedule), fontsize=FONT_TITLE)
-        ax.set_ylabel("Density", fontsize=FONT_LABEL)
+        ax.set_xlabel(PDF_VALUE_LABEL, fontsize=FONT_LABEL)
+        ax.set_ylabel(PDF_DENSITY_LABEL, fontsize=FONT_LABEL)
         ax.legend(fontsize=FONT_LEGEND, framealpha=0.8)
         ax.grid(alpha=0.2)
         _set_tick_fontsize(ax)
@@ -728,8 +1008,8 @@ def plot_qq(
         ax.scatter(obs_q, gen_q, s=6, alpha=0.6, color=C_GEN)
         lims = [min(obs_q.min(), gen_q.min()), max(obs_q.max(), gen_q.max())]
         ax.plot(lims, lims, "k--", lw=0.8, alpha=0.5)
-        ax.set_xlabel("Obs quantiles", fontsize=FONT_LABEL)
-        ax.set_ylabel("Gen quantiles", fontsize=FONT_LABEL)
+        ax.set_xlabel(QQ_OBS_LABEL, fontsize=FONT_LABEL)
+        ax.set_ylabel(QQ_GEN_LABEL, fontsize=FONT_LABEL)
         ax.set_title(_band_label(band, H_schedule), fontsize=FONT_TITLE)
         ax.set_aspect("equal", adjustable="box")
         ax.grid(alpha=0.2)
@@ -814,8 +1094,8 @@ def plot_directional_correlation(
             f"{label}  ($J_{{\\mathrm{{norm}}}}$={J_val:.4f})",
             fontsize=FONT_TITLE,
         )
-        ax.set_xlabel("$\\tau / D$", fontsize=FONT_LABEL)
-        ax.set_ylabel("$R(\\tau)$", fontsize=FONT_LABEL)
+        ax.set_xlabel(CORRELATION_LAG_LABEL, fontsize=FONT_LABEL)
+        ax.set_ylabel(CORRELATION_VALUE_LABEL, fontsize=FONT_LABEL)
         if i == 0:
             ax.legend(fontsize=FONT_LEGEND, framealpha=0.8, loc="upper right")
         ax.grid(alpha=0.2)
@@ -1086,7 +1366,8 @@ def plot_direct_field_pdfs(
 
         H_val = eval_H_schedule[scale] if scale < len(eval_H_schedule) else scale
         ax.set_title(f"$H={H_val:.3g}$", fontsize=FONT_TITLE)
-        ax.set_ylabel("Density", fontsize=FONT_LABEL)
+        ax.set_xlabel(PDF_VALUE_LABEL, fontsize=FONT_LABEL)
+        ax.set_ylabel(PDF_DENSITY_LABEL, fontsize=FONT_LABEL)
         ax.legend(fontsize=FONT_LEGEND, framealpha=0.8)
         ax.grid(alpha=0.2)
         _set_tick_fontsize(ax)
@@ -1155,8 +1436,8 @@ def plot_conditional_pdfs(
 
         title = str(pair_data.get("title", pair_label))
         ax.set_title(title, fontsize=FONT_TITLE)
-        ax.set_xlabel("Volume fraction, $u$", fontsize=FONT_LABEL)
-        ax.set_ylabel("Density", fontsize=FONT_LABEL)
+        ax.set_xlabel(PDF_VALUE_LABEL, fontsize=FONT_LABEL)
+        ax.set_ylabel(PDF_DENSITY_LABEL, fontsize=FONT_LABEL)
         ax.legend(fontsize=FONT_LEGEND, framealpha=0.8)
         ax.grid(alpha=0.2)
         _set_tick_fontsize(ax)
@@ -1253,8 +1534,8 @@ def plot_direct_field_correlation(
 
         H_val = eval_H_schedule[scale] if scale < len(eval_H_schedule) else scale
         ax.set_title(f"$H = {H_val}$", fontsize=FONT_TITLE)
-        ax.set_xlabel("$\\tau / D$", fontsize=FONT_LABEL)
-        ax.set_ylabel("$R(\\tau)$", fontsize=FONT_LABEL)
+        ax.set_xlabel(CORRELATION_LAG_LABEL, fontsize=FONT_LABEL)
+        ax.set_ylabel(CORRELATION_VALUE_LABEL, fontsize=FONT_LABEL)
         if i == 0:
             ax.legend(fontsize=FONT_LEGEND, framealpha=0.8, loc="upper right")
         ax.grid(alpha=0.2)
@@ -1574,7 +1855,8 @@ def plot_trajectory_pdfs(
         ds_idx = int(time_indices[k])
         H_val = full_H_schedule[ds_idx] if ds_idx < len(full_H_schedule) else ds_idx
         ax.set_title(f"$H={H_val:.3g}$", fontsize=FONT_TITLE)
-        ax.set_ylabel("Density", fontsize=FONT_LABEL)
+        ax.set_xlabel(PDF_VALUE_LABEL, fontsize=FONT_LABEL)
+        ax.set_ylabel(PDF_DENSITY_LABEL, fontsize=FONT_LABEL)
         ax.legend(fontsize=FONT_LEGEND, framealpha=0.8)
         ax.grid(alpha=0.2)
         _set_tick_fontsize(ax)
@@ -1672,8 +1954,8 @@ def plot_trajectory_correlation(
         ds_idx = int(time_indices[k])
         H_val = full_H_schedule[ds_idx] if ds_idx < len(full_H_schedule) else ds_idx
         ax.set_title(f"$H={H_val:.3g}$", fontsize=FONT_TITLE)
-        ax.set_xlabel("$\\tau / D$", fontsize=FONT_LABEL)
-        ax.set_ylabel("$R(\\tau)$", fontsize=FONT_LABEL)
+        ax.set_xlabel(CORRELATION_LAG_LABEL, fontsize=FONT_LABEL)
+        ax.set_ylabel(CORRELATION_VALUE_LABEL, fontsize=FONT_LABEL)
         if i == 0:
             handles, _ = ax.get_legend_handles_labels()
             handles.append(
@@ -1780,9 +2062,9 @@ def plot_trajectory_correlation_superposed(
     for ax, direction in ((ax_e1, "$e_1$"), (ax_e2, "$e_2$")):
         ax.axhline(1 / np.e, color="grey", ls=":", lw=0.8, alpha=0.5)
         ax.axhline(0, color="grey", ls="-", lw=0.5, alpha=0.3)
-        ax.set_title(f"Superposed $R(\\tau {direction})$", fontsize=FONT_TITLE)
-        ax.set_xlabel("$\\tau / D$", fontsize=FONT_LABEL)
-        ax.set_ylabel("$R(\\tau)$", fontsize=FONT_LABEL)
+        ax.set_title(rf"$R(\tau {direction})$", fontsize=FONT_TITLE)
+        ax.set_xlabel(CORRELATION_LAG_LABEL, fontsize=FONT_LABEL)
+        ax.set_ylabel(CORRELATION_VALUE_LABEL, fontsize=FONT_LABEL)
         ax.grid(alpha=0.2)
         _set_tick_fontsize(ax)
 
@@ -1935,8 +2217,8 @@ def plot_trajectory_qq(
         ds_idx = int(time_indices[k])
         H_val = full_H_schedule[ds_idx] if ds_idx < len(full_H_schedule) else ds_idx
         ax.set_title(f"$H={H_val}$", fontsize=FONT_TITLE)
-        ax.set_xlabel("Obs quantiles", fontsize=FONT_LABEL)
-        ax.set_ylabel("Gen quantiles", fontsize=FONT_LABEL)
+        ax.set_xlabel(QQ_OBS_LABEL, fontsize=FONT_LABEL)
+        ax.set_ylabel(QQ_GEN_LABEL, fontsize=FONT_LABEL)
         ax.set_aspect("equal", adjustable="box")
         ax.grid(alpha=0.2)
         _set_tick_fontsize(ax)

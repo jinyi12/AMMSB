@@ -243,41 +243,17 @@ def add_masking_args(
         "--masking-strategy",
         type=str,
         default="random",
-        choices=["random", "detail", "full_grid"],
+        choices=["random", "full_grid"],
         help=(
             "How to split spatial points between encoder/decoder. "
             "'full_grid' gives both sides the full dense grid."
         ),
     )
     parser.add_argument(
-        "--detail-quantile",
-        type=float,
-        default=0.85,
-        help="Quantile defining the high-detail set for detail masking.",
-    )
-    parser.add_argument(
-        "--enc-detail-frac",
-        type=float,
-        default=0.05,
-        help="Fraction of encoder points sampled from detail set for detail masking.",
-    )
-    parser.add_argument(
-        "--importance-grad-weight",
-        type=float,
-        default=0.5,
-        help="Mixing weight between amplitude and gradient magnitude for detail score.",
-    )
-    parser.add_argument(
-        "--importance-power",
-        type=float,
-        default=1.0,
-        help="Exponent controlling sharpness of detail masking.",
-    )
-    parser.add_argument(
         "--eval-masking-strategy",
         type=str,
         default="random",
-        choices=["random", "detail", "full_grid", "same"],
+        choices=["random", "full_grid", "same"],
         help="Masking strategy used for the test dataloader / early stopping metric.",
     )
     parser.add_argument("--beta", type=float, default=beta_default)
@@ -408,10 +384,11 @@ def validate_ntk_args(
     args: argparse.Namespace,
     *,
     active_loss_type: str,
+    ignored_defaults: Mapping[str, Any] | None = None,
     warn_scale_norm_ignored_when_estimating_total: bool = True,
     warn_output_chunk_ignored_for_fhutch: bool = False,
 ) -> None:
-    if active_loss_type in {"ntk_scaled", "ntk_prior_balanced"}:
+    if active_loss_type in {"ntk_scaled", "ntk_prior_balanced", "ntk_sigreg_balanced", "ntk_bridge_balanced"}:
         if active_loss_type == "ntk_scaled":
             if args.ntk_scale_norm <= 0.0:
                 raise ValueError("--ntk-scale-norm must be > 0 for --loss-type=ntk_scaled.")
@@ -451,7 +428,7 @@ def validate_ntk_args(
                     "ntk_scale_norm": 10.0,
                     "ntk_estimate_total_trace": False,
                 },
-                "NTK arguments {flags} are ignored when --loss-type=ntk_prior_balanced.",
+                f"NTK arguments {{flags}} are ignored when --loss-type={active_loss_type}.",
             )
         if warn_output_chunk_ignored_for_fhutch:
             if args.ntk_trace_estimator == "fhutch" and args.ntk_output_chunk_size > 0:
@@ -462,18 +439,21 @@ def validate_ntk_args(
                 )
         return
 
+    defaults = {
+        "ntk_scale_norm": 10.0,
+        "ntk_epsilon": 1e-8,
+        "ntk_estimate_total_trace": False,
+        "ntk_total_trace_ema_decay": 0.99,
+        "ntk_trace_update_interval": 100,
+        "ntk_hutchinson_probes": 4,
+        "ntk_output_chunk_size": 0,
+        "ntk_trace_estimator": "fhutch",
+    }
+    if ignored_defaults:
+        defaults.update(ignored_defaults)
     warn_ignored_flags(
         args,
-        {
-            "ntk_scale_norm": 10.0,
-            "ntk_epsilon": 1e-8,
-            "ntk_estimate_total_trace": False,
-            "ntk_total_trace_ema_decay": 0.99,
-            "ntk_trace_update_interval": 100,
-            "ntk_hutchinson_probes": 4,
-            "ntk_output_chunk_size": 0,
-            "ntk_trace_estimator": "fhutch",
-        },
+        defaults,
         f"NTK arguments {{flags}} are ignored when --loss-type={active_loss_type}.",
     )
 

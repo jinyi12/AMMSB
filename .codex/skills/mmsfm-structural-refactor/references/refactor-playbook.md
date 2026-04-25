@@ -4,7 +4,7 @@
 
 1. Reduce risk by staying inside active code.
 2. Shrink the largest files that mix multiple responsibilities.
-3. Remove unused or trivial wrappers.
+3. Remove unused or trivial pass-through code.
 4. Merge duplicated logic only when the shared ownership is obvious.
 5. Add tests around extracted behavior before broadening the refactor.
 
@@ -13,7 +13,7 @@
 ### `scripts/fae/fae_naive/`
 
 - Large training files often mix argument parsing, model wiring, loss construction, trainer setup, and reporting.
-- Favor extraction into narrow modules such as CLI/config, builders, losses, datasets, and orchestration.
+- Favor extraction into narrow modules such as CLI/config, builders, losses, datasets, and direct training steps.
 
 ### `scripts/fae/tran_evaluation/`
 
@@ -27,7 +27,7 @@
 
 ### Experiment shell scripts and metadata
 
-- Normalize repeated shell wrappers and manifest handling, but keep experiment registries and output descriptions data-like.
+- Normalize repeated shell scripts and manifest handling, but keep experiment registries and output descriptions data-like.
 - Move shared defaults to one place when the same flags reappear across many scripts.
 
 ## Helper triage rubric
@@ -36,14 +36,14 @@
 - `single-use + obvious`: inline.
 - `shared in one directory`: keep near that directory.
 - `shared across active packages`: extract to the package that owns the behavior.
-- `shared only by entry scripts`: create a package-local support module, not a repo-global utility dump.
+- `shared only by entry scripts`: extract a small shared function module near those scripts, not a repo-global utility dump.
 
 ## Structure heuristics
 
 - Separate importable library code from CLI entrypoints.
 - Name modules by domain responsibility, not by refactor history.
 - Split by behavior boundary, not arbitrary line count.
-- If a file is huge because it contains variants, consider one base module plus variant-specific wrappers.
+- If a file is huge because it contains variants, split the variant logic into direct functions keyed by the real scientific differences.
 - If a file is huge because it combines phases, split by phase first.
 
 ## Validation heuristics

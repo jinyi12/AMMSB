@@ -61,6 +61,71 @@ def local_interval_time(
     return (t_arr - t_start_arr) / denom
 
 
+def sample_brownian_bridge_state(
+    x_start: jax.Array,
+    x_end: jax.Array,
+    t: jax.Array | float,
+    t_start: jax.Array | float,
+    t_end: jax.Array | float,
+    sigma: float,
+    key: jax.Array,
+) -> jax.Array:
+    """Sample an exact Brownian bridge state between two endpoints."""
+    x_start_arr = jnp.asarray(x_start)
+    x_end_arr = jnp.asarray(x_end, dtype=x_start_arr.dtype)
+    t_arr = jnp.asarray(t, dtype=x_start_arr.dtype)
+    t_start_arr = jnp.asarray(t_start, dtype=x_start_arr.dtype)
+    t_end_arr = jnp.asarray(t_end, dtype=x_start_arr.dtype)
+    sigma_arr = jnp.asarray(sigma, dtype=x_start_arr.dtype)
+
+    alpha = (t_end_arr - t_arr) / (t_end_arr - t_start_arr)
+    beta = (t_arr - t_start_arr) / (t_end_arr - t_start_arr)
+    mean_t = alpha * x_start_arr + beta * x_end_arr
+    var_t = jnp.maximum(
+        sigma_arr * sigma_arr * (t_arr - t_start_arr) * (t_end_arr - t_arr) / (t_end_arr - t_start_arr),
+        jnp.asarray(0.0, dtype=x_start_arr.dtype),
+    )
+    noise = jax.random.normal(key, x_start_arr.shape, dtype=x_start_arr.dtype)
+    return mean_t + jnp.sqrt(var_t) * noise
+
+
+def brownian_bridge_target(
+    x_t: jax.Array,
+    x_end: jax.Array,
+    t: jax.Array | float,
+    t_end: jax.Array | float,
+) -> jax.Array:
+    """Analytical Brownian bridge drift target."""
+    x_t_arr = jnp.asarray(x_t)
+    return (jnp.asarray(x_end, dtype=x_t_arr.dtype) - x_t_arr) / (
+        jnp.asarray(t_end, dtype=x_t_arr.dtype) - jnp.asarray(t, dtype=x_t_arr.dtype)
+    )
+
+
+def sample_truncated_interval_time(
+    *,
+    time_key: jax.Array,
+    batch_size: int,
+    dtype: jnp.dtype,
+    t_start: jax.Array,
+    t_end: jax.Array,
+    endpoint_epsilon: float,
+    state_rank: int,
+) -> jax.Array:
+    """Sample interval time away from the endpoints and broadcast to a state rank."""
+    interval_length = jnp.asarray(t_end - t_start, dtype=dtype)
+    epsilon = jnp.minimum(
+        jnp.asarray(max(float(endpoint_epsilon), 0.0), dtype=dtype),
+        0.5 * interval_length,
+    )
+    span = interval_length - 2.0 * epsilon
+    midpoint = jnp.asarray(t_start, dtype=dtype) + 0.5 * interval_length
+    u = jax.random.uniform(time_key, (int(batch_size), 1), dtype=dtype)
+    truncated = jnp.asarray(t_start, dtype=dtype) + epsilon + u * span
+    sampled = jnp.where(span > 0.0, truncated, midpoint)
+    return sampled.reshape((int(batch_size),) + (1,) * max(int(state_rank), 0))
+
+
 def make_bridge_condition(
     global_state: jax.Array,
     previous_state: jax.Array,

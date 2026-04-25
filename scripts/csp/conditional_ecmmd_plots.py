@@ -10,7 +10,18 @@ matplotlib.use("Agg")
 from matplotlib import pyplot as plt
 from matplotlib.colors import Normalize, TwoSlopeNorm
 
-from scripts.images.field_visualization import EASTERN_HUES, format_for_paper
+from scripts.csp.conditional_figure_saving_util import save_conditional_figure_stem
+from scripts.csp.conditional_eval.representative_selection import (
+    select_representative_conditions,
+)
+from scripts.images.field_visualization import (
+    EASTERN_HUES,
+    format_for_paper,
+    math_density_axis_label,
+    math_pc_axis_label,
+    publication_figure_width,
+    publication_style_tokens,
+)
 
 
 C_OBS = EASTERN_HUES[7]
@@ -20,23 +31,24 @@ C_ACCENT = EASTERN_HUES[3]
 C_GRID = "#D8D2CA"
 C_TEXT = "#2A2621"
 CMAP_SCORE = "coolwarm"
-FONT_LABEL = 8
-FONT_TICK = 7
-FONT_TITLE = 8
-FONT_LEGEND = 7
-FIG_WIDTH = 6.2
-OVERVIEW_FIG_HEIGHT = 3.9
-DETAIL_BLOCK_HEIGHT = 2.55
+_PUB_STYLE = publication_style_tokens()
+FONT_LABEL = _PUB_STYLE["font_label"]
+FONT_TICK = _PUB_STYLE["font_tick"]
+FONT_TITLE = _PUB_STYLE["font_title"]
+FONT_LEGEND = _PUB_STYLE["font_legend"]
+FIG_WIDTH = publication_figure_width(column_span=2, fraction=0.82)
+OVERVIEW_FIG_HEIGHT = 3.45
+DETAIL_BLOCK_HEIGHT = 2.25
 
 
 def _save_fig(fig: plt.Figure, output_stem: Path, *, png_dpi: int = 180) -> dict[str, str]:
-    output_stem.parent.mkdir(parents=True, exist_ok=True)
-    png_path = output_stem.with_suffix(".png")
-    pdf_path = output_stem.with_suffix(".pdf")
-    fig.savefig(png_path, dpi=png_dpi, bbox_inches="tight")
-    fig.savefig(pdf_path, bbox_inches="tight")
-    plt.close(fig)
-    return {"png": str(png_path), "pdf": str(pdf_path)}
+    return save_conditional_figure_stem(
+        fig,
+        output_stem=output_stem,
+        png_dpi=int(png_dpi),
+        tight=True,
+        close=True,
+    )
 
 
 def _sqdist(a: np.ndarray, b: np.ndarray) -> np.ndarray:
@@ -229,132 +241,13 @@ def _density_curve(reference: np.ndarray, generated: np.ndarray) -> tuple[np.nda
     return x, _gaussian_smooth_1d(hist_ref, sigma_bins=1.1), _gaussian_smooth_1d(hist_gen, sigma_bins=1.1)
 
 
-def _candidate_from_sorted(sorted_indices: np.ndarray, used: set[int]) -> int | None:
-    for idx in np.asarray(sorted_indices, dtype=np.int64).tolist():
-        if int(idx) not in used:
-            return int(idx)
-    return None
-
-
-def _median_candidates(order: np.ndarray) -> np.ndarray:
-    center = len(order) // 2
-    candidates: list[int] = []
-    for delta in range(len(order)):
-        right = center + delta
-        left = center - delta - 1
-        if right < len(order):
-            candidates.append(int(order[right]))
-        if left >= 0:
-            candidates.append(int(order[left]))
-    return np.asarray(candidates, dtype=np.int64)
-
-
-def _farthest_high_score_candidate(
-    *,
-    condition_pca: np.ndarray,
-    local_scores: np.ndarray,
-    used: set[int],
-    require_top_quartile: bool,
-) -> int | None:
-    n_conditions = int(local_scores.shape[0])
-    if n_conditions == 0:
-        return None
-    score_arr = np.asarray(local_scores, dtype=np.float64)
-    candidate_pool = np.arange(n_conditions, dtype=np.int64)
-    if require_top_quartile and n_conditions > 1:
-        threshold = float(np.quantile(score_arr, 0.75))
-        candidate_pool = candidate_pool[score_arr >= threshold]
-        if candidate_pool.size == 0:
-            candidate_pool = np.arange(n_conditions, dtype=np.int64)
-    candidate_pool = candidate_pool[[int(idx) not in used for idx in candidate_pool.tolist()]]
-    if candidate_pool.size == 0:
-        return None
-    if not used:
-        best_pos = int(np.argmax(score_arr[candidate_pool]))
-        return int(candidate_pool[best_pos])
-    selected = np.asarray(sorted(used), dtype=np.int64)
-    distances = np.linalg.norm(
-        condition_pca[candidate_pool, None, :] - condition_pca[selected][None, :, :],
-        axis=2,
-    )
-    min_dist = distances.min(axis=1)
-    best_pos = int(np.lexsort((-score_arr[candidate_pool], -min_dist))[-1])
-    return int(candidate_pool[best_pos])
-
-
-def select_representative_conditions(
-    *,
-    local_scores: np.ndarray,
-    condition_pca: np.ndarray,
-    n_show: int,
-    seed: int,
-) -> tuple[np.ndarray, list[str]]:
-    scores = np.asarray(local_scores, dtype=np.float64).reshape(-1)
-    n_conditions = int(scores.shape[0])
-    if n_conditions == 0 or int(n_show) <= 0:
-        return np.asarray([], dtype=np.int64), []
-    target = int(min(max(1, int(n_show)), n_conditions))
-    order = np.argsort(scores)
-    rng = np.random.default_rng(int(seed))
-
-    selected: list[int] = []
-    roles: list[str] = []
-    used: set[int] = set()
-
-    def _append(candidate: int | None, role: str) -> None:
-        if candidate is None or int(candidate) in used or len(selected) >= target:
-            return
-        selected.append(int(candidate))
-        roles.append(str(role))
-        used.add(int(candidate))
-
-    role_candidates: list[tuple[str, np.ndarray]] = [
-        ("best", order),
-        ("median", _median_candidates(order)),
-        ("worst", order[::-1]),
-    ]
-    for role, candidates in role_candidates:
-        _append(_candidate_from_sorted(candidates, used), role)
-
-    _append(
-        _farthest_high_score_candidate(
-            condition_pca=np.asarray(condition_pca, dtype=np.float64),
-            local_scores=scores,
-            used=used,
-            require_top_quartile=True,
-        ),
-        "diverse_high",
-    )
-
-    if len(selected) < target:
-        remaining = [idx for idx in range(n_conditions) if idx not in used]
-        if remaining:
-            _append(int(rng.choice(np.asarray(remaining, dtype=np.int64))), "random")
-
-    extra_idx = 1
-    while len(selected) < target:
-        _append(
-            _farthest_high_score_candidate(
-                condition_pca=np.asarray(condition_pca, dtype=np.float64),
-                local_scores=scores,
-                used=used,
-                require_top_quartile=False,
-            ),
-            f"extra_{extra_idx}",
-        )
-        extra_idx += 1
-        if len(selected) >= n_conditions:
-            break
-
-    return np.asarray(selected[:target], dtype=np.int64), roles[:target]
-
-
 def _plot_density_axis(
     ax: plt.Axes,
     reference: np.ndarray,
     generated: np.ndarray,
     *,
     xlabel: str,
+    variable_tex: str,
     reference_label: str = "Empirical conditional",
     generated_label: str = "Generated",
 ) -> None:
@@ -364,7 +257,7 @@ def _plot_density_axis(
     ax.plot(x, gen_y, color=C_GEN, linewidth=1.4, label=generated_label)
     ax.fill_between(x, gen_y, alpha=0.14, color=C_GEN)
     ax.set_xlabel(xlabel, fontsize=FONT_LABEL)
-    ax.set_ylabel("Density", fontsize=FONT_LABEL)
+    ax.set_ylabel(math_density_axis_label(variable_tex), fontsize=FONT_LABEL)
     ax.grid(alpha=0.18, color=C_GRID, linewidth=0.6)
     ax.tick_params(axis="both", labelsize=FONT_TICK)
     ax.spines["top"].set_visible(False)
@@ -476,8 +369,8 @@ def _plot_overview(
                 ha="center",
                 va="center",
             )
-    ax_scatter.set_xlabel("Condition PC1", fontsize=FONT_LABEL)
-    ax_scatter.set_ylabel("Condition PC2", fontsize=FONT_LABEL)
+    ax_scatter.set_xlabel(math_pc_axis_label(1, context="Condition coordinate"), fontsize=FONT_LABEL)
+    ax_scatter.set_ylabel(math_pc_axis_label(2, context="Condition coordinate"), fontsize=FONT_LABEL)
     ax_scatter.grid(alpha=0.18, color=C_GRID, linewidth=0.6)
     ax_scatter.tick_params(axis="both", labelsize=FONT_TICK)
     ax_scatter.spines["top"].set_visible(False)
@@ -614,8 +507,8 @@ def _plot_details(
         )
         ax_cond.set_xlim(float(np.min(all_x) - x_pad_global), float(np.max(all_x) + x_pad_global))
         ax_cond.set_ylim(float(np.min(all_y) - y_pad_global), float(np.max(all_y) + y_pad_global))
-        ax_cond.set_xlabel("Condition PC1", fontsize=FONT_LABEL)
-        ax_cond.set_ylabel("Condition PC2", fontsize=FONT_LABEL)
+        ax_cond.set_xlabel(math_pc_axis_label(1, context="Condition coordinate"), fontsize=FONT_LABEL)
+        ax_cond.set_ylabel(math_pc_axis_label(2, context="Condition coordinate"), fontsize=FONT_LABEL)
         ax_cond.grid(alpha=0.18, color=C_GRID, linewidth=0.6)
         ax_cond.tick_params(axis="both", labelsize=FONT_TICK)
         ax_cond.spines["top"].set_visible(False)
@@ -655,8 +548,8 @@ def _plot_details(
             linewidths=1.0,
             zorder=4,
         )
-        ax_pca.set_xlabel("Fine PC1", fontsize=FONT_LABEL)
-        ax_pca.set_ylabel("Fine PC2", fontsize=FONT_LABEL)
+        ax_pca.set_xlabel(math_pc_axis_label(1, context="Response coordinate"), fontsize=FONT_LABEL)
+        ax_pca.set_ylabel(math_pc_axis_label(2, context="Response coordinate"), fontsize=FONT_LABEL)
         ax_pca.grid(alpha=0.18, color=C_GRID, linewidth=0.6)
         ax_pca.tick_params(axis="both", labelsize=FONT_TICK)
         ax_pca.spines["top"].set_visible(False)
@@ -668,7 +561,8 @@ def _plot_details(
             ax_pc1,
             ref2[:, 0],
             gen2[:, 0],
-            xlabel="Fine PC1",
+            xlabel=math_pc_axis_label(1, context="Response coordinate"),
+            variable_tex=r"\mathrm{PC}_1",
             reference_label="Observed edge nodes",
             generated_label="Generated edge draws",
         )
@@ -676,7 +570,8 @@ def _plot_details(
             ax_pc2,
             ref2[:, 1],
             gen2[:, 1],
-            xlabel="Fine PC2",
+            xlabel=math_pc_axis_label(2, context="Response coordinate"),
+            variable_tex=r"\mathrm{PC}_2",
             reference_label="Observed edge nodes",
             generated_label="Generated edge draws",
         )

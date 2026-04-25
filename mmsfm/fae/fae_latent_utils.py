@@ -8,6 +8,7 @@ training entrypoint. Transformer-token downstream transport is owned by
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 import pickle
 from pathlib import Path
 from typing import Optional
@@ -30,6 +31,70 @@ class NoopTimeModule(nn.Module):
 
 
 ARCHIVE_ZT_MODES = ("retained_times", "uniform")
+_LEGACY_TRANSFORMER_DECODER_CORE_KEYS = frozenset(
+    {
+        "memory_proj",
+        "output_norm",
+        "pointwise_readout",
+        "query_proj",
+    }
+)
+
+
+def _normalize_transformer_decoder_params(
+    params,
+    *,
+    decoder_type: str,
+):
+    """Lift legacy transformer decoder params into the live decoder_core scope."""
+    if decoder_type != "transformer" or not isinstance(params, Mapping):
+        return params
+
+    decoder_params = params.get("decoder", None)
+    if not isinstance(decoder_params, Mapping):
+        return params
+    coordinate_decoder = decoder_params.get("coordinate_decoder", None)
+    if not isinstance(coordinate_decoder, Mapping):
+        return params
+    if "decoder_core" in coordinate_decoder:
+        return params
+
+    legacy_core_keys = [
+        key
+        for key in coordinate_decoder.keys()
+        if key in _LEGACY_TRANSFORMER_DECODER_CORE_KEYS or str(key).startswith("cross_attn_")
+    ]
+    if not legacy_core_keys:
+        return params
+
+    try:
+        from flax.core import FrozenDict, freeze, unfreeze
+    except ImportError:  # pragma: no cover - flax is an active dependency here.
+        FrozenDict = ()
+        freeze = None
+        unfreeze = None
+
+    if FrozenDict and isinstance(params, FrozenDict):
+        params_mut = unfreeze(params)
+        was_frozen = True
+    else:
+        params_mut = dict(params)
+        was_frozen = False
+
+    decoder_mut = dict(params_mut["decoder"])
+    coordinate_mut = dict(decoder_mut["coordinate_decoder"])
+    decoder_core = {}
+    for key in list(coordinate_mut.keys()):
+        if key in _LEGACY_TRANSFORMER_DECODER_CORE_KEYS or str(key).startswith("cross_attn_"):
+            decoder_core[key] = coordinate_mut.pop(key)
+
+    coordinate_mut["decoder_core"] = decoder_core
+    decoder_mut["coordinate_decoder"] = coordinate_mut
+    params_mut["decoder"] = decoder_mut
+
+    if was_frozen:
+        return freeze(params_mut)
+    return params_mut
 
 
 def load_fae_checkpoint(path: Path) -> dict:
@@ -38,6 +103,38 @@ def load_fae_checkpoint(path: Path) -> dict:
     if not isinstance(payload, dict):
         raise ValueError(f"FAE checkpoint at {path} is not a dict; got {type(payload)}")
     return payload
+
+
+def warmstart_variables_from_checkpoint(ckpt: dict) -> dict:
+    """Extract encoder/decoder params and batch stats for warm-start training."""
+    params = ckpt.get("params", None)
+    if not isinstance(params, Mapping):
+        raise ValueError("Checkpoint missing mapping-valued `params` for warm start.")
+    if "encoder" not in params or "decoder" not in params:
+        raise ValueError("Warm-start checkpoint must contain params['encoder'] and params['decoder'].")
+
+    payload = {
+        "params": {
+            "encoder": params["encoder"],
+            "decoder": params["decoder"],
+        }
+    }
+
+    batch_stats = ckpt.get("batch_stats", None)
+    if isinstance(batch_stats, Mapping):
+        warm_batch_stats = {}
+        if "encoder" in batch_stats:
+            warm_batch_stats["encoder"] = batch_stats["encoder"]
+        if "decoder" in batch_stats:
+            warm_batch_stats["decoder"] = batch_stats["decoder"]
+        if warm_batch_stats:
+            payload["batch_stats"] = warm_batch_stats
+    return payload
+
+
+def load_fae_warmstart_variables(path: Path) -> dict:
+    """Load warm-start-ready encoder/decoder variables from a saved FAE checkpoint."""
+    return warmstart_variables_from_checkpoint(load_fae_checkpoint(path))
 
 
 def build_fae_from_checkpoint(
@@ -72,6 +169,12 @@ def build_fae_from_checkpoint(
         """Look up a value in arch first, then ckpt_args, then fallback to default."""
         return arch.get(key, ckpt_args.get(key, default))
 
+    def _ckpt_val_or_default(key: str, default):
+        value = _ckpt_val(key, default)
+        if value in (None, "", []):
+            return default
+        return value
+
     def _grid_size_or_none(key: str) -> Optional[tuple[int, int]]:
         raw = _ckpt_val(key, None)
         if raw in (None, "", []):
@@ -88,6 +191,12 @@ def build_fae_from_checkpoint(
             "('standard', 'wire2d', 'film', 'transformer')."
         )
     encoder_type = str(_ckpt_val("encoder_type", "pooling"))
+    if encoder_type == "transformer_vector" or str(arch.get("type", "")) == "fae_transformer_vector":
+        raise ValueError(
+            "This checkpoint uses the retired transformer_vector architecture. "
+            "Active MMSFM checkpoint loading supports pooling/vector FAEs, "
+            "transformer token-latent FAEs, and their maintained prior or SIGReg variants."
+        )
 
     # Multiscale sigmas are stored as lists in arch but build_autoencoder expects
     # comma-separated strings.
@@ -122,21 +231,25 @@ def build_fae_from_checkpoint(
         wire_trainable_omega_sigma=bool(_ckpt_val("wire_trainable_omega_sigma", False)),
         wire_layers=int(_ckpt_val("wire_layers", 2)),
         film_norm_type=str(_ckpt_val("norm_type", ckpt_args.get("denoiser_norm", "layernorm"))),
-        transformer_emb_dim=int(_ckpt_val("transformer_emb_dim", 256)),
-        transformer_num_latents=int(_ckpt_val("transformer_num_latents", 16)),
-        transformer_encoder_depth=int(_ckpt_val("transformer_encoder_depth", 4)),
-        transformer_cross_attn_depth=int(_ckpt_val("transformer_cross_attn_depth", 2)),
-        transformer_decoder_depth=int(_ckpt_val("transformer_decoder_depth", 4)),
-        transformer_mlp_ratio=int(_ckpt_val("transformer_mlp_ratio", 2)),
-        transformer_layer_norm_eps=float(_ckpt_val("transformer_layer_norm_eps", 1e-5)),
-        transformer_tokenization=str(_ckpt_val("transformer_tokenization", "patches")),
-        transformer_patch_size=int(_ckpt_val("transformer_patch_size", 8)),
+        transformer_emb_dim=int(_ckpt_val_or_default("transformer_emb_dim", 256)),
+        transformer_num_latents=int(_ckpt_val_or_default("transformer_num_latents", 16)),
+        transformer_encoder_depth=int(_ckpt_val_or_default("transformer_encoder_depth", 4)),
+        transformer_cross_attn_depth=int(_ckpt_val_or_default("transformer_cross_attn_depth", 2)),
+        transformer_decoder_depth=int(_ckpt_val_or_default("transformer_decoder_depth", 4)),
+        transformer_mlp_ratio=int(_ckpt_val_or_default("transformer_mlp_ratio", 2)),
+        transformer_layer_norm_eps=float(_ckpt_val_or_default("transformer_layer_norm_eps", 1e-5)),
+        transformer_tokenization=str(_ckpt_val_or_default("transformer_tokenization", "patches")),
+        transformer_patch_size=int(_ckpt_val_or_default("transformer_patch_size", 8)),
         transformer_grid_size=transformer_grid_size,
     )
 
     params = ckpt.get("params", None)
     if params is None:
         raise ValueError("Checkpoint missing `params`.")
+    params = _normalize_transformer_decoder_params(
+        params,
+        decoder_type=decoder_type,
+    )
     batch_stats = ckpt.get("batch_stats", None)
 
     meta = {
@@ -154,6 +267,8 @@ def make_fae_apply_fns(
     batch_stats: Optional[dict],
     *,
     decode_mode: str = "standard",
+    decode_device=None,
+    jit_decode: bool = True,
 ):
     """Return numpy-level encode/decode callables for active deterministic checkpoints."""
 
@@ -172,12 +287,16 @@ def make_fae_apply_fns(
             params,
             batch_stats,
             latent_format="flattened",
+            decode_device=decode_device,
+            jit_decode=jit_decode,
         )
 
     params_enc = params["encoder"]
     params_dec = params["decoder"]
     bs_enc = None if batch_stats is None else batch_stats.get("encoder", None)
     bs_dec = None if batch_stats is None else batch_stats.get("decoder", None)
+    params_dec_bound = params_dec if decode_device is None else jax.device_put(params_dec, decode_device)
+    bs_dec_bound = bs_dec if decode_device is None or bs_dec is None else jax.device_put(bs_dec, decode_device)
 
     def _encode(u: jnp.ndarray, x: jnp.ndarray):
         variables = {"params": params_enc}
@@ -186,9 +305,9 @@ def make_fae_apply_fns(
         return autoencoder.encoder.apply(variables, u, x, train=False)
 
     def _build_dec_variables():
-        variables = {"params": params_dec}
-        if bs_dec is not None:
-            variables["batch_stats"] = bs_dec
+        variables = {"params": params_dec_bound}
+        if bs_dec_bound is not None:
+            variables["batch_stats"] = bs_dec_bound
         return variables
 
     def _decode(z: jnp.ndarray, x: jnp.ndarray):
@@ -200,17 +319,26 @@ def make_fae_apply_fns(
         )
 
     encode_jit = jax.jit(_encode)
-    decode_jit = jax.jit(_decode)
+    decode_impl = jax.jit(_decode, device=decode_device) if jit_decode else _decode
 
     def encode_np(u_np: np.ndarray, x_np: np.ndarray) -> np.ndarray:
         z = encode_jit(jnp.asarray(u_np), jnp.asarray(x_np))
         return np.asarray(jax.device_get(z), dtype=np.float32)
 
     def decode_np(z_np: np.ndarray, x_np: np.ndarray) -> np.ndarray:
-        u_hat = decode_jit(jnp.asarray(z_np), jnp.asarray(x_np))
+        if decode_device is None:
+            z_arr = jnp.asarray(z_np)
+            x_arr = jnp.asarray(x_np)
+        else:
+            z_arr = jax.device_put(np.asarray(z_np, dtype=np.float32), decode_device)
+            x_arr = jax.device_put(np.asarray(x_np, dtype=np.float32), decode_device)
+        u_hat = decode_impl(z_arr, x_arr)
         return np.asarray(jax.device_get(u_hat), dtype=np.float32)
 
-    print(f"FAE decode mode: {decode_mode}")
+    print(
+        f"FAE decode mode: {decode_mode} "
+        f"(decode_device={'default' if decode_device is None else decode_device}, jit_decode={bool(jit_decode)})"
+    )
     return encode_np, decode_np
 
 

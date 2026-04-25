@@ -26,6 +26,10 @@ from mmsfm.fae.latent_prior_support import (
     add_latent_prior_args,
     validate_latent_prior_args,
 )
+from mmsfm.fae.sigreg_support import (
+    add_sigreg_args,
+    validate_sigreg_args,
+)
 
 TRANSFORMER_DESCRIPTION = (
     "Train a time-invariant FAE with a FunDiff-style transformer encoder and "
@@ -40,6 +44,10 @@ TRANSFORMER_PRIOR_DESCRIPTION = (
     "flattened-token compatible."
 )
 
+TRANSFORMER_SIGREG_DESCRIPTION = (
+    "Train a time-invariant transformer-token FAE with flattened-token SIGReg "
+    "latent regularization."
+)
 
 def _add_feature_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--n-freqs", type=int, default=64)
@@ -62,14 +70,12 @@ def _add_feature_args(parser: argparse.ArgumentParser) -> None:
         "--decoder-multiscale-sigmas",
         type=str,
         default="",
-        help=(
-            "Comma-separated sigmas for decoder positional encoding RFF."
-        ),
+        help="Comma-separated sigmas for decoder positional encoding RFF.",
     )
     parser.add_argument("--decoder-features", type=str, default="128,128,128,128")
 
 
-def _add_transformer_args(parser: argparse.ArgumentParser) -> None:
+def _add_transformer_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--n-heads", type=int, default=4, help="Number of attention heads.")
     parser.add_argument(
         "--transformer-tokenization",
@@ -78,9 +84,9 @@ def _add_transformer_args(parser: argparse.ArgumentParser) -> None:
         choices=["patches", "points"],
         help=(
             "Transformer encoder tokenization backend. "
-            "'patches' patchifies regular-grid encoder inputs; 'points' keeps the "
-            "point-token transformer encoder. The decoder always queries actual x_dec "
-            "coordinates."
+            "'patches' patchifies regular-grid full encoder inputs with no random "
+            "encoder masking; 'points' keeps the point-token transformer encoder. "
+            "The decoder always queries actual x_dec coordinates."
         ),
     )
     parser.add_argument(
@@ -88,12 +94,6 @@ def _add_transformer_args(parser: argparse.ArgumentParser) -> None:
         type=int,
         default=256,
         help="Internal embedding width for the transformer FAE.",
-    )
-    parser.add_argument(
-        "--transformer-num-latents",
-        type=int,
-        default=256,
-        help="Number of learned latent tokens used by the transformer encoder.",
     )
     parser.add_argument(
         "--transformer-encoder-depth",
@@ -136,6 +136,14 @@ def _add_transformer_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_transformer_token_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--transformer-num-latents",
+        type=int,
+        default=256,
+        help="Number of learned latent tokens used by the transformer encoder.",
+    )
+
 def _add_loss_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--loss-type",
@@ -149,7 +157,7 @@ def _add_loss_args(parser: argparse.ArgumentParser) -> None:
         "--latent-noise-scale",
         type=float,
         default=0.0,
-        help="Std dev of isotropic Gaussian noise added to token latents before decoding.",
+        help="Std dev of isotropic Gaussian noise added to latents before decoding.",
     )
     parser.add_argument("--lambda-grad", type=float, default=1.0, help="H^1 gradient term weight.")
     parser.add_argument(
@@ -197,11 +205,12 @@ def _add_transformer_prior_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
-def _build_transformer_parser(description: str) -> argparse.ArgumentParser:
+def _build_transformer_token_parser(description: str) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=description)
     add_run_args(parser)
     _add_feature_args(parser)
-    _add_transformer_args(parser)
+    _add_transformer_common_args(parser)
+    _add_transformer_token_args(parser)
     add_masking_args(parser, beta_default=0.0)
     _add_loss_args(parser)
     add_training_args(parser)
@@ -229,7 +238,7 @@ def _build_transformer_parser(description: str) -> argparse.ArgumentParser:
 
 
 def build_transformer_parser() -> argparse.ArgumentParser:
-    return _build_transformer_parser(TRANSFORMER_DESCRIPTION)
+    return _build_transformer_token_parser(TRANSFORMER_DESCRIPTION)
 
 
 def build_transformer_prior_parser() -> argparse.ArgumentParser:
@@ -238,27 +247,50 @@ def build_transformer_prior_parser() -> argparse.ArgumentParser:
     configure_action(
         parser,
         "loss_type",
-        default="l2",
-        choices=["l2", "ntk_prior_balanced", "ntk_scaled"],
+        default="ntk_prior_balanced",
+        choices=["ntk_prior_balanced"],
         help_text=(
             "Training objective selector. "
-            "'l2' uses deterministic MSE reconstruction plus the token-latent "
-            "x0-parameterized velocity prior. "
-            "'ntk_prior_balanced' adaptively balances reconstruction and prior "
-            "losses using shared-encoder NTK traces. "
-            "'ntk_scaled' keeps the older scale-based reconstruction balancing path "
-            "as a legacy transformer-prior option."
+            "The maintained transformer diffusion-prior entrypoint always uses "
+            "'ntk_prior_balanced' to adaptively balance reconstruction and prior "
+            "losses using shared-encoder NTK traces."
         ),
     )
-    parser.set_defaults(loss_type="l2", beta=0.0)
+    parser.set_defaults(loss_type="ntk_prior_balanced", beta=0.0)
     add_latent_prior_args(parser, include_use_prior=False, include_decoder_weighting=False)
     _add_transformer_prior_args(parser)
     return parser
 
 
-def validate_transformer_args(args: argparse.Namespace) -> None:
-    if getattr(args, "encoder_type", "transformer") != "transformer":
-        raise ValueError("The transformer FAE path requires encoder_type='transformer'.")
+def build_transformer_sigreg_parser() -> argparse.ArgumentParser:
+    parser = build_transformer_parser()
+    parser.description = TRANSFORMER_SIGREG_DESCRIPTION
+    configure_action(
+        parser,
+        "loss_type",
+        default="l2",
+        choices=["l2", "ntk_sigreg_balanced"],
+        help_text=(
+            "Training objective selector. "
+            "'l2' uses deterministic MSE reconstruction plus fixed-weight SIGReg on "
+            "flattened token latents. "
+            "'ntk_sigreg_balanced' adaptively balances reconstruction and SIGReg "
+            "using shared-encoder NTK traces."
+        ),
+    )
+    parser.set_defaults(loss_type="l2", beta=0.0)
+    add_sigreg_args(parser)
+    return parser
+
+def _validate_common_transformer_args(
+    args: argparse.Namespace,
+    *,
+    expected_encoder_type: str,
+) -> None:
+    if getattr(args, "encoder_type", expected_encoder_type) != expected_encoder_type:
+        raise ValueError(
+            f"The transformer FAE path requires encoder_type='{expected_encoder_type}'."
+        )
     if getattr(args, "decoder_type", "transformer") != "transformer":
         raise ValueError("The transformer FAE path requires decoder_type='transformer'.")
 
@@ -273,8 +305,6 @@ def validate_transformer_args(args: argparse.Namespace) -> None:
 
     if args.transformer_emb_dim < 1:
         raise ValueError("--transformer-emb-dim must be >= 1.")
-    if args.transformer_num_latents < 1:
-        raise ValueError("--transformer-num-latents must be >= 1.")
     if args.transformer_encoder_depth < 1:
         raise ValueError("--transformer-encoder-depth must be >= 1.")
     if args.transformer_cross_attn_depth < 1:
@@ -304,8 +334,10 @@ def validate_transformer_args(args: argparse.Namespace) -> None:
         )
         if patch_mode_ignored:
             warnings.warn(
-                "Transformer patch tokenization uses full-grid encoder inputs, so "
-                f"{patch_mode_ignored} are ignored.",
+                "Transformer patch tokenization uses full-grid encoder inputs with "
+                "no random encoder masking, so "
+                f"{patch_mode_ignored} are ignored. In patch mode, masking flags "
+                "only control decoder query selection.",
                 UserWarning,
             )
 
@@ -325,12 +357,19 @@ def validate_transformer_args(args: argparse.Namespace) -> None:
         )
 
 
+def validate_transformer_args(args: argparse.Namespace) -> None:
+    _validate_common_transformer_args(args, expected_encoder_type="transformer")
+    if args.transformer_num_latents < 1:
+        raise ValueError("--transformer-num-latents must be >= 1.")
+    args.use_prior = False
+    args.latent_regularizer = "none"
+
+
 def validate_transformer_prior_args(args: argparse.Namespace) -> None:
     validate_transformer_args(args)
-    if args.loss_type not in {"l2", "ntk_prior_balanced", "ntk_scaled"}:
+    if args.loss_type != "ntk_prior_balanced":
         raise ValueError(
-            "train_fae_transformer_prior.py only supports --loss-type in "
-            "{'l2', 'ntk_prior_balanced', 'ntk_scaled'}."
+            "train_fae_transformer_prior.py requires --loss-type=ntk_prior_balanced."
         )
 
     if getattr(args, "latent_noise_scale", 0.0) != 0.0:
@@ -341,6 +380,9 @@ def validate_transformer_prior_args(args: argparse.Namespace) -> None:
         )
 
     args.use_prior = True
+    args.latent_regularizer = "diffusion_prior"
+    args.prior_architecture = "transformer_dit"
+    args.prior_token_mode = "token_native"
     if getattr(args, "prior_num_heads", None) is None:
         args.prior_num_heads = int(args.n_heads)
     if int(args.prior_num_heads) < 1:
@@ -351,14 +393,32 @@ def validate_transformer_prior_args(args: argparse.Namespace) -> None:
         raise ValueError(
             "--prior-hidden-dim must be divisible by --prior-num-heads for the transformer DiT prior."
         )
-    if args.loss_type == "ntk_scaled":
-        warnings.warn(
-            "--loss-type=ntk_scaled is the legacy scale-based transformer-prior objective. "
-            "Prefer --loss-type=ntk_prior_balanced for new prior balancing runs.",
-            UserWarning,
-        )
     validate_latent_prior_args(args, prior_enabled=True)
 
+def validate_transformer_sigreg_args(args: argparse.Namespace) -> None:
+    validate_transformer_args(args)
+    if args.loss_type not in {"l2", "ntk_sigreg_balanced"}:
+        raise ValueError(
+            "train_fae_transformer_sigreg.py only supports --loss-type in "
+            "{'l2', 'ntk_sigreg_balanced'}."
+        )
+    if getattr(args, "latent_noise_scale", 0.0) != 0.0:
+        warnings.warn(
+            "--latent-noise-scale is ignored in train_fae_transformer_sigreg.py because "
+            "SIGReg uses clean token latents.",
+            UserWarning,
+        )
+    if float(getattr(args, "beta", 0.0)) != 0.0:
+        warnings.warn(
+            "--beta is ignored in train_fae_transformer_sigreg.py because SIGReg "
+            "replaces the latent regularization term.",
+            UserWarning,
+        )
+    args.use_prior = False
+    args.latent_regularizer = "sigreg"
+    args.sigreg_variant = "sliced_epps_pulley"
+    args.sigreg_token_mode = "flattened"
+    validate_sigreg_args(args)
 
 def select_transformer_run_metadata() -> tuple[str, str, tuple[str, ...]]:
     return "fae_transformer", "fae_transformer", ("transformer", "deterministic")
@@ -367,6 +427,9 @@ def select_transformer_run_metadata() -> tuple[str, str, tuple[str, ...]]:
 def select_transformer_prior_run_metadata() -> tuple[str, str, tuple[str, ...]]:
     return "fae_transformer_prior", "fae_transformer_prior", ("transformer", "latent_prior")
 
+
+def select_transformer_sigreg_run_metadata() -> tuple[str, str, tuple[str, ...]]:
+    return "fae_transformer_sigreg", "fae_transformer_sigreg", ("transformer", "sigreg")
 
 def build_transformer_autoencoder(
     key: jax.Array,
@@ -397,13 +460,15 @@ def build_transformer_autoencoder(
         transformer_grid_size=getattr(args, "transformer_grid_size", None),
     )
 
-
 __all__ = [
     "build_transformer_autoencoder",
     "build_transformer_parser",
     "build_transformer_prior_parser",
+    "build_transformer_sigreg_parser",
     "select_transformer_prior_run_metadata",
     "select_transformer_run_metadata",
+    "select_transformer_sigreg_run_metadata",
     "validate_transformer_args",
     "validate_transformer_prior_args",
+    "validate_transformer_sigreg_args",
 ]

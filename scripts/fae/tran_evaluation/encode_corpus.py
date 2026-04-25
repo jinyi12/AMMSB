@@ -43,6 +43,12 @@ from mmsfm.fae.fae_latent_utils import (
     make_fae_apply_fns,
 )
 from mmsfm.fae.multiscale_dataset_naive import load_training_time_data_naive
+from scripts.fae.tran_evaluation.resumable_store import (
+    archive_dir_for_export,
+    build_expected_store_manifest,
+    prepare_resumable_store,
+    store_matches,
+)
 from scripts.fae.tran_evaluation.run_support import parse_key_value_args_file as parse_args_file
 
 
@@ -144,6 +150,21 @@ def _resolve_time_indices(
     )
 
 
+def _assemble_corpus_latents_payload(*, output_path: Path, manifest: dict[str, Any]) -> dict[str, np.ndarray]:
+    store = prepare_resumable_store(archive_dir_for_export(output_path), expected_manifest=manifest)
+    metadata = store.load_chunk("metadata")
+    time_indices = np.asarray(metadata["time_indices"], dtype=np.int64)
+    payload: dict[str, np.ndarray] = {
+        "time_indices": time_indices.astype(np.int64),
+    }
+    for tidx in time_indices:
+        payload[f"latents_{int(tidx)}"] = np.asarray(
+            store.load_chunk(f"latents_{int(tidx)}")["latents"],
+            dtype=np.float32,
+        )
+    return payload
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
@@ -210,6 +231,31 @@ def main() -> None:
         time_indices_override=args.time_indices,
     )
     print(f"Run time indices (dataset): {time_indices.tolist()}")
+    output_path = (
+        Path(args.output_path).expanduser().resolve()
+        if args.output_path is not None
+        else corpus_path.parent / "corpus_latents.npz"
+    )
+    expected_manifest = build_expected_store_manifest(
+        store_name="corpus_latents",
+        store_kind="archive",
+        fingerprint={
+            "corpus_path": str(corpus_path),
+            "run_dir": str(run_dir),
+            "output_path": str(output_path),
+            "fae_checkpoint_path": str(fae_checkpoint_path),
+            "time_indices": np.asarray(time_indices, dtype=np.int64),
+            "batch_size": int(args.batch_size),
+        },
+    )
+    if store_matches(archive_dir_for_export(output_path), expected_manifest):
+        if not output_path.exists():
+            np.savez_compressed(output_path, **_assemble_corpus_latents_payload(output_path=output_path, manifest=expected_manifest))
+        print(f"Reusing corpus latents archive at {archive_dir_for_export(output_path)}")
+        print(f"Saved corpus latents archive to {output_path}")
+        return
+    store = prepare_resumable_store(archive_dir_for_export(output_path), expected_manifest=expected_manifest)
+    store.write_chunk("metadata", {"time_indices": np.asarray(time_indices, dtype=np.int64)})
 
     # ------------------------------------------------------------------
     # Load corpus data at training times
@@ -224,6 +270,13 @@ def main() -> None:
     time_idx_set = set(time_indices.tolist())
     corpus_time_data = [d for d in corpus_time_data if d["idx"] in time_idx_set]
     corpus_time_data = sorted(corpus_time_data, key=lambda d: float(d["t_norm"]))
+    loaded_indices = {int(d["idx"]) for d in corpus_time_data}
+    missing_indices = [int(tidx) for tidx in time_indices.tolist() if int(tidx) not in loaded_indices]
+    if missing_indices:
+        raise ValueError(
+            "Corpus encoding could not find all requested time indices in the corpus: "
+            f"{missing_indices}."
+        )
 
     print(f"  Loaded {len(corpus_time_data)} time marginals")
     for d in corpus_time_data:
@@ -232,12 +285,12 @@ def main() -> None:
     # ------------------------------------------------------------------
     # Encode all samples at each time
     # ------------------------------------------------------------------
-    save_dict: dict[str, object] = {
-        "time_indices": time_indices,
-    }
-
     for d in corpus_time_data:
         idx = d["idx"]
+        chunk_name = f"latents_{int(idx)}"
+        if store.has_chunk(chunk_name):
+            print(f"Skipping time idx={idx}; reusable chunk already saved.")
+            continue
         u_all = np.asarray(d["u"], dtype=np.float32)  # (N, P, 1)
         x = np.asarray(d["x"], dtype=np.float32)       # (P, 2)
         N = u_all.shape[0]
@@ -252,20 +305,18 @@ def main() -> None:
                 print(f"  {i}/{N}")
 
         z = np.concatenate(parts, axis=0)  # (N, K)
-        save_dict[f"latents_{idx}"] = z.astype(np.float32)
+        store.write_chunk(chunk_name, {"latents": z.astype(np.float32)}, metadata={"time_idx": int(idx)})
         print(f"  -> shape {z.shape}")
 
     # ------------------------------------------------------------------
     # Save
     # ------------------------------------------------------------------
-    output_path = (
-        Path(args.output_path).expanduser().resolve()
-        if args.output_path is not None
-        else corpus_path.parent / "corpus_latents.npz"
+    store.mark_complete(
+        export_path=output_path,
+        export_payload=_assemble_corpus_latents_payload(output_path=output_path, manifest=expected_manifest),
+        status_updates={"n_time_indices": int(time_indices.shape[0])},
     )
-
-    np.savez_compressed(output_path, **save_dict)
-    print(f"\nSaved corpus latents to {output_path}")
+    print(f"\nSaved corpus latents archive to {output_path}")
 
 
 if __name__ == "__main__":

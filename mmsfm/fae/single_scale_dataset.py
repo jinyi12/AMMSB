@@ -42,15 +42,7 @@ class SingleScaleFieldDataset(Dataset):
     encoder_point_ratio : float
         Fraction of spatial points for encoder.
     masking_strategy : str
-        'random', 'detail', or 'full_grid'.
-    detail_quantile : float
-        Quantile for detail masking.
-    enc_detail_frac : float
-        Encoder detail fraction.
-    importance_grad_weight : float
-        Gradient weight for importance.
-    importance_power : float
-        Power for importance sampling.
+        'random' or 'full_grid'.
     """
 
     def __init__(
@@ -63,10 +55,6 @@ class SingleScaleFieldDataset(Dataset):
         encoder_n_points: Optional[int] = None,
         decoder_n_points: Optional[int] = None,
         masking_strategy: str = "random",
-        detail_quantile: float = 0.85,
-        enc_detail_frac: float = 0.05,
-        importance_grad_weight: float = 0.5,
-        importance_power: float = 1.0,
         return_decoder_gradients: bool = False,
         encoder_full_grid: bool = False,
     ):
@@ -78,10 +66,11 @@ class SingleScaleFieldDataset(Dataset):
         self.encoder_n_points = int(encoder_n_points) if encoder_n_points is not None else None
         self.decoder_n_points = int(decoder_n_points) if decoder_n_points is not None else None
         self.masking_strategy = masking_strategy
-        self.detail_quantile = detail_quantile
-        self.enc_detail_frac = enc_detail_frac
-        self.importance_grad_weight = importance_grad_weight
-        self.importance_power = importance_power
+        if self.masking_strategy not in {"random", "full_grid"}:
+            raise ValueError(
+                "masking_strategy must be 'random' or 'full_grid'. "
+                f"Got {self.masking_strategy!r}."
+            )
         self.return_decoder_gradients = bool(return_decoder_gradients)
         self.encoder_full_grid = bool(encoder_full_grid)
 
@@ -141,34 +130,7 @@ class SingleScaleFieldDataset(Dataset):
         print(f"  Points: {self.n_points}")
         print(f"  Resolution: {self.resolution}")
 
-    def _compute_importance_scores(self, field: np.ndarray) -> np.ndarray:
-        """Compute importance scores for detail masking."""
-        if self.masking_strategy != "detail":
-            return None
-
-        field_2d = field.reshape(self.resolution, self.resolution)
-
-        # Amplitude deviation
-        field_mean = field.mean()
-        amplitude_dev = np.abs(field - field_mean)
-
-        # Gradient magnitude (finite differences)
-        dx = 1.0 / self.resolution
-        grad_x = (np.roll(field_2d, -1, axis=0) - np.roll(field_2d, 1, axis=0)) / (2 * dx)
-        grad_y = (np.roll(field_2d, -1, axis=1) - np.roll(field_2d, 1, axis=1)) / (2 * dx)
-        grad_mag = np.sqrt(grad_x.ravel()**2 + grad_y.ravel()**2)
-
-        # Combine
-        w = self.importance_grad_weight
-        importance = w * grad_mag + (1 - w) * amplitude_dev
-
-        # Apply power
-        if self.importance_power != 1.0:
-            importance = importance ** self.importance_power
-
-        return importance
-
-    def _split_encoder_decoder_points(self, field: np.ndarray):
+    def _split_encoder_decoder_points(self):
         """Split points into encoder/decoder sets."""
         if self.encoder_n_points is None:
             n_enc = int(self.n_points * self.encoder_point_ratio)
@@ -183,59 +145,13 @@ class SingleScaleFieldDataset(Dataset):
             n_dec = int(min(int(self.decoder_n_points), max_dec))
         n_dec = int(np.clip(n_dec, 1, max_dec))
 
-        if self.masking_strategy == "random":
-            # Random split
-            perm = np.random.permutation(self.n_points)
-            enc_idx = perm[:n_enc]
-            remaining = perm[n_enc:]
-            dec_idx = remaining[:n_dec]
-
-        elif self.masking_strategy == "detail":
-            # Detail-aware split
-            importance = self._compute_importance_scores(field)
-            threshold = np.quantile(importance, self.detail_quantile)
-            detail_mask = importance >= threshold
-
-            detail_idx = np.where(detail_mask)[0]
-            smooth_idx = np.where(~detail_mask)[0]
-
-            # Encoder: mostly smooth, some detail
-            n_enc_detail = int(n_enc * self.enc_detail_frac)
-            n_enc_smooth = n_enc - n_enc_detail
-
-            if len(smooth_idx) < n_enc_smooth:
-                n_enc_smooth = len(smooth_idx)
-                n_enc_detail = n_enc - n_enc_smooth
-
-            enc_smooth = np.random.choice(smooth_idx, n_enc_smooth, replace=False)
-            if n_enc_detail > 0 and len(detail_idx) > 0:
-                enc_detail = np.random.choice(
-                    detail_idx,
-                    min(n_enc_detail, len(detail_idx)),
-                    replace=False
-                )
-                enc_idx = np.concatenate([enc_smooth, enc_detail])
-            else:
-                enc_idx = enc_smooth
-
-            # Decoder: remaining points (biased toward detail)
-            all_idx = np.arange(self.n_points)
-            remaining = np.setdiff1d(all_idx, enc_idx)
-
-            if remaining.size <= n_dec:
-                dec_idx = remaining
-            else:
-                # Subsample remaining points, biased toward detail if possible.
-                w = importance[remaining].astype(np.float64, copy=False)
-                w = np.clip(w, 0.0, None)
-                if float(w.sum()) > 0:
-                    p = w / w.sum()
-                    dec_idx = np.random.choice(remaining, size=n_dec, replace=False, p=p)
-                else:
-                    dec_idx = np.random.choice(remaining, size=n_dec, replace=False)
-
-        else:
+        if self.masking_strategy != "random":
             raise ValueError(f"Unknown masking_strategy: {self.masking_strategy}")
+
+        perm = np.random.permutation(self.n_points)
+        enc_idx = perm[:n_enc]
+        remaining = perm[n_enc:]
+        dec_idx = remaining[:n_dec]
 
         return enc_idx, dec_idx
 
@@ -244,25 +160,11 @@ class SingleScaleFieldDataset(Dataset):
             return int(self.n_points)
         return int(np.clip(int(self.decoder_n_points), 1, self.n_points))
 
-    def _sample_decoder_points_from_full_grid(self, field: np.ndarray) -> np.ndarray:
+    def _sample_decoder_points_from_full_grid(self) -> np.ndarray:
         n_dec = self._decoder_budget_with_full_grid_encoder()
         full_idx = self.full_grid_indices.astype(np.int32, copy=False)
         if n_dec >= full_idx.size or self.masking_strategy == "full_grid":
             return full_idx
-
-        if self.masking_strategy == "detail":
-            importance = self._compute_importance_scores(field)
-            if importance is not None:
-                weights = np.clip(importance[full_idx].astype(np.float64, copy=False), 0.0, None)
-                total = float(weights.sum())
-                if total > 0.0:
-                    probs = weights / total
-                    return np.random.choice(
-                        full_idx,
-                        size=n_dec,
-                        replace=False,
-                        p=probs,
-                    ).astype(np.int32, copy=False)
 
         return np.random.choice(full_idx, size=n_dec, replace=False).astype(
             np.int32,
@@ -286,13 +188,13 @@ class SingleScaleFieldDataset(Dataset):
 
         if self.encoder_full_grid:
             enc_idx = self.full_grid_indices
-            dec_idx = self._sample_decoder_points_from_full_grid(field)
+            dec_idx = self._sample_decoder_points_from_full_grid()
         elif self.masking_strategy == "full_grid":
             enc_idx = self.full_grid_indices
             dec_idx = self.full_grid_indices
         else:
             # Split points
-            enc_idx, dec_idx = self._split_encoder_decoder_points(field)
+            enc_idx, dec_idx = self._split_encoder_decoder_points()
 
         u_enc = field[enc_idx, None].astype(np.float32)
         x_enc = self.grid_coords[enc_idx].astype(np.float32)

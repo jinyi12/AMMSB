@@ -54,7 +54,12 @@ from mmsfm.fae.fae_latent_utils import (
     make_fae_apply_fns,
 )
 from data.transform_utils import load_transform_info, apply_inverse_transform
-from scripts.images.field_visualization import EASTERN_HUES, format_for_paper
+from scripts.images.field_visualization import (
+    EASTERN_HUES,
+    format_for_paper,
+    publication_figure_width,
+    publication_style_tokens,
+)
 
 
 # ============================================================================
@@ -141,16 +146,17 @@ SHORT_LABEL: Dict[str, str] = {
 
 
 # ============================================================================
-# Style constants (mirrors report.py)
+# Style constants (shared publication scale)
 # ============================================================================
-FIG_WIDTH = 7.0          # inches; all multi-panel figs
+_PUB_STYLE = publication_style_tokens()
+FIG_WIDTH = publication_figure_width(column_span=2)
 SUBPLOT_HEIGHT = 2     # inches per row
 FIELD_ROW_HEIGHT = 1.25
 
-FONT_TITLE  = 8
-FONT_LABEL  = 7
-FONT_LEGEND = 6.5
-FONT_TICK   = 7
+FONT_TITLE  = _PUB_STYLE["font_title"]
+FONT_LABEL  = _PUB_STYLE["font_label"]
+FONT_LEGEND = _PUB_STYLE["font_legend"]
+FONT_TICK   = _PUB_STYLE["font_tick"]
 
 C_OBS    = EASTERN_HUES[7]   # steel blue
 C_GEN    = EASTERN_HUES[4]   # red
@@ -161,9 +167,10 @@ CMAP_FIELD = "cividis"
 # EMA decay for training-curve smoothing
 EMA_ALPHA = 0.15
 
-# Default H-schedule for the Tran inclusion dataset (8 marginals, indices 0–7).
-# Maps normalised time fractions t/T = i/7 to filter-width H values.
-DEFAULT_H_SCHEDULE = [0.0, 1.0, 1.25, 1.5, 2.0, 2.5, 3.0, 6.0]
+# Default H-schedule for the updated Tran inclusion dataset (9 marginals, indices 0–8).
+# Maps normalised time fractions t/T = i/8 to filter-width H values.
+LEGACY_DEFAULT_H_SCHEDULE = [0.0, 1.0, 1.25, 1.5, 2.0, 2.5, 3.0, 6.0]
+DEFAULT_H_SCHEDULE = [0.0, 1.0, 1.25, 1.5, 2.0, 2.5, 3.0, 4.0, 6.0]
 
 # Groups included in cross-model comparison figures.
 # All four loss-type groups (l2, ntk, prior, ntk_prior) are included.
@@ -236,22 +243,47 @@ def _normalize_mathtext_label(label: str) -> str:
     return s
 
 
-def _time_fraction_to_H(t_frac: float) -> float:
+def _select_default_h_schedule(
+    *,
+    n_marginals: Optional[int] = None,
+    t_frac: Optional[float] = None,
+) -> list[float]:
+    if n_marginals == len(DEFAULT_H_SCHEDULE):
+        return DEFAULT_H_SCHEDULE
+    if n_marginals == len(LEGACY_DEFAULT_H_SCHEDULE):
+        return LEGACY_DEFAULT_H_SCHEDULE
+    if t_frac is not None:
+        candidates = [DEFAULT_H_SCHEDULE, LEGACY_DEFAULT_H_SCHEDULE]
+        return min(
+            candidates,
+            key=lambda schedule: float(
+                np.min(np.abs(np.linspace(0.0, 1.0, len(schedule)) - float(t_frac)))
+            ),
+        )
+    return DEFAULT_H_SCHEDULE
+
+
+def _time_fraction_to_H(t_frac: float, *, n_marginals: Optional[int] = None) -> float:
     """Map a normalised time fraction t/T to the corresponding H value."""
-    n = len(DEFAULT_H_SCHEDULE)
+    schedule = _select_default_h_schedule(n_marginals=n_marginals, t_frac=t_frac)
+    n = len(schedule)
     idx = round(t_frac * (n - 1))
     idx = max(0, min(idx, n - 1))
-    return DEFAULT_H_SCHEDULE[idx]
+    return schedule[idx]
 
 
 def _marginal_value_to_H(t_val: float, *, tidx: Optional[int] = None, n_marginals: Optional[int] = None) -> float:
     """Map a stored marginal key value to the physical filter width H."""
-    if tidx is not None and n_marginals == len(DEFAULT_H_SCHEDULE):
-        idx = max(0, min(int(tidx), len(DEFAULT_H_SCHEDULE) - 1))
-        return DEFAULT_H_SCHEDULE[idx]
+    schedule = _select_default_h_schedule(
+        n_marginals=n_marginals,
+        t_frac=float(t_val) if 0.0 <= float(t_val) <= 1.0 else None,
+    )
+    if tidx is not None and n_marginals == len(schedule):
+        idx = max(0, min(int(tidx), len(schedule) - 1))
+        return schedule[idx]
     if 0.0 <= float(t_val) <= 1.0:
-        return _time_fraction_to_H(float(t_val))
-    if any(abs(float(t_val) - float(h)) < 1e-8 for h in DEFAULT_H_SCHEDULE):
+        return _time_fraction_to_H(float(t_val), n_marginals=n_marginals)
+    if any(abs(float(t_val) - float(h)) < 1e-8 for h in schedule):
         return float(t_val)
     return float(t_val)
 
@@ -1290,7 +1322,7 @@ def fig8_generated_fields(out_dir: Path) -> None:
     ho_set = {int(idx) for idx in gt.get("held_out_indices", [])}
 
     # Build H_schedule for labels
-    H_meso = [1.0, 1.25, 1.5, 2.0, 2.5, 3.0]
+    H_meso = [1.0, 1.25, 1.5, 2.0, 2.5, 3.0, 4.0]
     full_H_schedule = build_default_H_schedule(H_meso, 6.0)
 
     n_show = max(_N_GEN_SHOW, 1)

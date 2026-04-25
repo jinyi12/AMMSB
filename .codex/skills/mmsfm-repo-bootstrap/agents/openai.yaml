@@ -1,4 +1,4 @@
 interface:
   display_name: "MMSFM Bootstrap"
-  short_description: "Orient and validate the MMSFM repo"
-  default_prompt: "Use $mmsfm-repo-bootstrap to orient within MMSFM, choose setup commands, and run the right validation surface."
+  short_description: "Orient the repo and pick validation"
+  default_prompt: "Use $mmsfm-repo-bootstrap to orient within MMSFM, choose setup or validation commands, keep work on the right active surface, prefer straightforward function-first implementations, and avoid non-faithful fallback bandages."

@@ -11,6 +11,7 @@ from mmsfm.fae.ntk_estimators import (
     estimate_psd_trace_hutchpp,
     estimate_psd_trace_of_square_hutchinson,
 )
+from scripts.fae.tran_evaluation.latent_encoding import compute_latent_codes
 
 
 def _lazy_jax():
@@ -497,8 +498,12 @@ def evaluate_latent_geometry(
     """Run latent-geometry diagnostics across all modeled time indices."""
     import jax.numpy as jnp
 
-    from scripts.fae.analyze_latent_noise_sweep import compute_latent_codes
     from mmsfm.fae.fae_latent_utils import make_fae_apply_fns
+    from mmsfm.fae.transformer_downstream import (
+        get_transformer_latent_shape,
+        is_transformer_token_autoencoder,
+        restore_transformer_latents,
+    )
 
     fields = np.asarray(fields_per_time, dtype=np.float32)
     coords = np.asarray(coords, dtype=np.float32)
@@ -526,8 +531,15 @@ def evaluate_latent_geometry(
     if bs_dec is not None:
         variables["batch_stats"] = bs_dec
 
+    is_transformer = bool(is_transformer_token_autoencoder(autoencoder))
+    transformer_latent_shape = list(get_transformer_latent_shape(autoencoder)) if is_transformer else None
+    latent_representation = "flattened_transformer_tokens" if is_transformer else "vector"
+    decoder_type = "transformer" if is_transformer else autoencoder.decoder.__class__.__name__.lower()
+
     def decode_flat(z_single, x_coords):
         z_b = z_single[None, ...]
+        if is_transformer:
+            z_b = restore_transformer_latents(autoencoder, z_b)
         x_b = x_coords[None, ...]
         out = autoencoder.decoder.apply(variables, z_b, x_b, train=False)
         return jnp.ravel(out[0])
@@ -623,10 +635,16 @@ def evaluate_latent_geometry(
     }
 
     return {
-        "schema_version": "latent_geometry_v3",
+        "schema_version": "latent_geometry_v4",
         "run_dir": None,
         "time_indices": list(range(n_times)),
         "config": asdict(config),
+        "latent_geometry_metadata": {
+            "latent_representation": latent_representation,
+            "transformer_latent_shape": transformer_latent_shape,
+            "decoder_type": decoder_type,
+            "run_role": None,
+        },
         "metric_definitions": metric_definitions,
         "effective_rank_definition": effective_rank_definition,
         "rho_vol_definition": rho_vol_definition,

@@ -18,6 +18,8 @@ _TOKEN_TYPE_PREVIOUS = 2
 
 
 class TokenBridgeCondition(NamedTuple):
+    global_tokens: jax.Array
+    previous_tokens: jax.Array
     context_tokens: jax.Array
     context_token_types: jax.Array
     interval_idx: jax.Array
@@ -65,6 +67,76 @@ def _zero_linear(module: eqx.nn.Linear) -> eqx.nn.Linear:
 
 def _modulate(x: jax.Array, shift: jax.Array, scale: jax.Array) -> jax.Array:
     return x * (1.0 + scale[None, :]) + shift[None, :]
+
+
+def _validate_state_tokens(y: jax.Array, *, num_latents: int, token_dim: int) -> jax.Array:
+    y_arr = jnp.asarray(y)
+    if y_arr.ndim != 2:
+        raise ValueError(
+            "TokenConditionalDiT expects latent tokens with shape [num_latents, token_dim]."
+        )
+    if y_arr.shape != (num_latents, token_dim):
+        raise ValueError(
+            "TokenConditionalDiT received unexpected token shape "
+            f"{tuple(y_arr.shape)}; expected {(num_latents, token_dim)}."
+        )
+    return y_arr
+
+
+def _validate_condition_tokens(
+    tokens: jax.Array,
+    *,
+    num_latents: int,
+    token_dim: int,
+    field_name: str,
+    dtype: jnp.dtype,
+) -> jax.Array:
+    tokens_arr = jnp.asarray(tokens, dtype=dtype)
+    if tokens_arr.ndim != 2 or tokens_arr.shape != (num_latents, token_dim):
+        raise ValueError(
+            f"TokenBridgeCondition {field_name} must have shape [{num_latents}, {token_dim}]."
+        )
+    return tokens_arr
+
+
+def _validate_context_tokens(
+    condition: TokenBridgeCondition,
+    *,
+    num_latents: int,
+    token_dim: int,
+    dtype: jnp.dtype,
+) -> tuple[jax.Array, jax.Array]:
+    context_tokens = jnp.asarray(condition.context_tokens, dtype=dtype)
+    context_token_types = jnp.asarray(condition.context_token_types, dtype=jnp.int32)
+    if context_tokens.ndim != 2 or context_tokens.shape[-1] != token_dim:
+        raise ValueError(
+            "TokenBridgeCondition context_tokens must have shape [context_len, token_dim]."
+        )
+    if context_tokens.shape[0] != context_token_types.shape[0]:
+        raise ValueError("TokenBridgeCondition token types must align with context tokens.")
+    if context_tokens.shape[0] % num_latents != 0:
+        raise ValueError(
+            "TokenBridgeCondition context length must be an integer multiple of num_latents."
+        )
+    return context_tokens, context_token_types
+
+
+def _build_time_context(
+    *,
+    interval_idx: jax.Array,
+    num_intervals: int,
+    interval_proj: eqx.nn.Linear,
+    time_embedder: _TimeEmbedder,
+    t: jax.Array | float,
+    dtype: jnp.dtype,
+) -> jax.Array:
+    interval_one_hot = jax.nn.one_hot(
+        jnp.asarray(interval_idx, dtype=jnp.int32),
+        num_intervals,
+        dtype=dtype,
+    )
+    interval_context = interval_proj(interval_one_hot)
+    return time_embedder(t).astype(dtype) + interval_context.astype(dtype)
 
 
 class _TimeEmbedder(eqx.Module):
@@ -160,6 +232,70 @@ class _TokenDiTBlock(eqx.Module):
         return x
 
 
+class _SetConditionedTokenDiTBlock(eqx.Module):
+    norm_self: eqx.nn.LayerNorm
+    norm_cross_query: eqx.nn.LayerNorm
+    norm_cross_memory: eqx.nn.LayerNorm
+    norm_mlp: eqx.nn.LayerNorm
+    self_attn: eqx.nn.MultiheadAttention
+    cross_attn: eqx.nn.MultiheadAttention
+    mlp: _MlpBlock
+    adaln: eqx.nn.Linear
+    emb_dim: int
+
+    def __init__(
+        self,
+        *,
+        emb_dim: int,
+        num_heads: int,
+        mlp_ratio: float,
+        key: jax.Array,
+    ) -> None:
+        key_self, key_cross, key_mlp, key_adaln = jax.random.split(key, 4)
+        self.norm_self = eqx.nn.LayerNorm(emb_dim, use_weight=False, use_bias=False)
+        self.norm_cross_query = eqx.nn.LayerNorm(emb_dim, use_weight=False, use_bias=False)
+        self.norm_cross_memory = eqx.nn.LayerNorm(emb_dim, use_weight=False, use_bias=False)
+        self.norm_mlp = eqx.nn.LayerNorm(emb_dim, use_weight=False, use_bias=False)
+        self.self_attn = eqx.nn.MultiheadAttention(
+            num_heads=num_heads,
+            query_size=emb_dim,
+            key=key_self,
+        )
+        self.cross_attn = eqx.nn.MultiheadAttention(
+            num_heads=num_heads,
+            query_size=emb_dim,
+            key=key_cross,
+        )
+        self.mlp = _MlpBlock(int(emb_dim * mlp_ratio), emb_dim, key=key_mlp)
+        self.adaln = _zero_linear(eqx.nn.Linear(emb_dim, 9 * emb_dim, key=key_adaln))
+        self.emb_dim = int(emb_dim)
+
+    def __call__(self, x: jax.Array, memory: jax.Array, condition: jax.Array) -> jax.Array:
+        modulation = self.adaln(jax.nn.gelu(condition))
+        (
+            shift_self,
+            scale_self,
+            gate_self,
+            shift_cross,
+            scale_cross,
+            gate_cross,
+            shift_mlp,
+            scale_mlp,
+            gate_mlp,
+        ) = jnp.split(modulation, 9, axis=-1)
+
+        x_self = _modulate(_layer_norm_sequence(self.norm_self, x), shift_self, scale_self)
+        x = x + gate_self[None, :] * self.self_attn(x_self, x_self, x_self)
+
+        x_cross = _modulate(_layer_norm_sequence(self.norm_cross_query, x), shift_cross, scale_cross)
+        memory_norm = _layer_norm_sequence(self.norm_cross_memory, memory)
+        x = x + gate_cross[None, :] * self.cross_attn(x_cross, memory_norm, memory_norm)
+
+        x_mlp = _modulate(_layer_norm_sequence(self.norm_mlp, x), shift_mlp, scale_mlp)
+        x = x + gate_mlp[None, :] * self.mlp(x_mlp)
+        return x
+
+
 class _FinalLayer(eqx.Module):
     norm: eqx.nn.LayerNorm
     adaln: eqx.nn.Linear
@@ -181,6 +317,258 @@ class _FinalLayer(eqx.Module):
 
 
 class TokenConditionalDiT(eqx.Module):
+    input_proj: eqx.nn.Linear
+    global_condition_proj: eqx.nn.Linear
+    previous_condition_proj: eqx.nn.Linear
+    time_embedder: _TimeEmbedder
+    interval_proj: eqx.nn.Linear
+    blocks: tuple[_SetConditionedTokenDiTBlock, ...]
+    final: _FinalLayer
+    slot_embedding: jax.Array
+    num_latents: int
+    token_dim: int
+    hidden_dim: int
+    n_layers: int
+    num_heads: int
+    mlp_ratio: float
+    time_emb_dim: int
+    num_intervals: int
+
+    def __init__(
+        self,
+        *,
+        num_latents: int,
+        token_dim: int,
+        hidden_dim: int = 256,
+        n_layers: int = 3,
+        num_heads: int = 4,
+        mlp_ratio: float = 2.0,
+        time_emb_dim: int = 32,
+        num_intervals: int,
+        key: jax.Array,
+    ) -> None:
+        if int(hidden_dim) % int(num_heads) != 0:
+            raise ValueError(
+                f"hidden_dim={hidden_dim} must be divisible by num_heads={num_heads}."
+            )
+        key_input, key_global, key_previous, key_slots, key_time, key_interval, key_blocks, key_final = (
+            jax.random.split(key, 8)
+        )
+        self.input_proj = eqx.nn.Linear(int(token_dim), int(hidden_dim), key=key_input)
+        self.global_condition_proj = eqx.nn.Linear(
+            int(token_dim),
+            int(hidden_dim),
+            use_bias=False,
+            key=key_global,
+        )
+        self.previous_condition_proj = eqx.nn.Linear(
+            int(token_dim),
+            int(hidden_dim),
+            use_bias=False,
+            key=key_previous,
+        )
+        self.slot_embedding = (
+            jax.random.normal(key_slots, (int(num_latents), int(hidden_dim)), dtype=jnp.float32)
+            * jnp.asarray(0.02, dtype=jnp.float32)
+        )
+        self.time_embedder = _TimeEmbedder(int(hidden_dim), int(time_emb_dim), key=key_time)
+        self.interval_proj = eqx.nn.Linear(int(num_intervals), int(hidden_dim), key=key_interval)
+        block_keys = jax.random.split(key_blocks, int(n_layers))
+        self.blocks = tuple(
+            _SetConditionedTokenDiTBlock(
+                emb_dim=int(hidden_dim),
+                num_heads=int(num_heads),
+                mlp_ratio=float(mlp_ratio),
+                key=subkey,
+            )
+            for subkey in block_keys
+        )
+        self.final = _FinalLayer(int(token_dim), int(hidden_dim), key=key_final)
+        self.num_latents = int(num_latents)
+        self.token_dim = int(token_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.n_layers = int(n_layers)
+        self.num_heads = int(num_heads)
+        self.mlp_ratio = float(mlp_ratio)
+        self.time_emb_dim = int(time_emb_dim)
+        self.num_intervals = int(num_intervals)
+
+    def _embed_state_tokens(self, tokens: jax.Array) -> jax.Array:
+        hidden = _linear_sequence(self.input_proj, tokens)
+        return hidden + self.slot_embedding.astype(hidden.dtype)
+
+    def _embed_context_tokens(self, tokens: jax.Array, token_types: jax.Array) -> jax.Array:
+        global_hidden = _linear_sequence(self.global_condition_proj, tokens)
+        previous_hidden = _linear_sequence(self.previous_condition_proj, tokens)
+        is_global = (token_types == _TOKEN_TYPE_GLOBAL)[:, None]
+        slot_blocks = max(tokens.shape[0] // self.num_latents, 1)
+        slot_ids = jnp.tile(self.slot_embedding, (slot_blocks, 1))[: tokens.shape[0]]
+        hidden = jnp.where(is_global, global_hidden, previous_hidden)
+        return hidden + slot_ids.astype(hidden.dtype)
+
+    def __call__(
+        self,
+        t: jax.Array | float,
+        y: jax.Array,
+        condition: TokenBridgeCondition,
+    ) -> jax.Array:
+        y_arr = _validate_state_tokens(y, num_latents=self.num_latents, token_dim=self.token_dim)
+        _validate_condition_tokens(
+            condition.global_tokens,
+            num_latents=self.num_latents,
+            token_dim=self.token_dim,
+            field_name="global_tokens",
+            dtype=y_arr.dtype,
+        )
+        _validate_condition_tokens(
+            condition.previous_tokens,
+            num_latents=self.num_latents,
+            token_dim=self.token_dim,
+            field_name="previous_tokens",
+            dtype=y_arr.dtype,
+        )
+        context_tokens, context_token_types = _validate_context_tokens(
+            condition,
+            num_latents=self.num_latents,
+            token_dim=self.token_dim,
+            dtype=y_arr.dtype,
+        )
+
+        x = self._embed_state_tokens(y_arr)
+        memory = self._embed_context_tokens(context_tokens, context_token_types).astype(x.dtype)
+        time_context = _build_time_context(
+            interval_idx=condition.interval_idx,
+            num_intervals=self.num_intervals,
+            interval_proj=self.interval_proj,
+            time_embedder=self.time_embedder,
+            t=t,
+            dtype=x.dtype,
+        )
+        for block in self.blocks:
+            x = block(x, memory, time_context)
+        return self.final(x, time_context)
+
+
+class _SlotwiseAdditiveTokenConditionalDiT(eqx.Module):
+    input_proj: eqx.nn.Linear
+    global_condition_proj: eqx.nn.Linear
+    previous_condition_proj: eqx.nn.Linear
+    time_embedder: _TimeEmbedder
+    interval_proj: eqx.nn.Linear
+    blocks: tuple[_TokenDiTBlock, ...]
+    final: _FinalLayer
+    position_embedding: jax.Array
+    num_latents: int
+    token_dim: int
+    hidden_dim: int
+    n_layers: int
+    num_heads: int
+    mlp_ratio: float
+    time_emb_dim: int
+    num_intervals: int
+
+    def __init__(
+        self,
+        *,
+        num_latents: int,
+        token_dim: int,
+        hidden_dim: int = 256,
+        n_layers: int = 3,
+        num_heads: int = 4,
+        mlp_ratio: float = 2.0,
+        time_emb_dim: int = 32,
+        num_intervals: int,
+        key: jax.Array,
+    ) -> None:
+        if int(hidden_dim) % int(num_heads) != 0:
+            raise ValueError(
+                f"hidden_dim={hidden_dim} must be divisible by num_heads={num_heads}."
+            )
+        key_input, key_global, key_previous, key_time, key_interval, key_blocks, key_final = jax.random.split(key, 7)
+        self.input_proj = eqx.nn.Linear(int(token_dim), int(hidden_dim), key=key_input)
+        self.global_condition_proj = eqx.nn.Linear(
+            int(token_dim),
+            int(hidden_dim),
+            use_bias=False,
+            key=key_global,
+        )
+        self.previous_condition_proj = eqx.nn.Linear(
+            int(token_dim),
+            int(hidden_dim),
+            use_bias=False,
+            key=key_previous,
+        )
+        self.time_embedder = _TimeEmbedder(int(hidden_dim), int(time_emb_dim), key=key_time)
+        self.interval_proj = eqx.nn.Linear(int(num_intervals), int(hidden_dim), key=key_interval)
+        block_keys = jax.random.split(key_blocks, int(n_layers))
+        self.blocks = tuple(
+            _TokenDiTBlock(
+                emb_dim=int(hidden_dim),
+                num_heads=int(num_heads),
+                mlp_ratio=float(mlp_ratio),
+                key=subkey,
+            )
+            for subkey in block_keys
+        )
+        self.final = _FinalLayer(int(token_dim), int(hidden_dim), key=key_final)
+        self.position_embedding = _get_1d_sincos_pos_embed(
+            int(hidden_dim),
+            int(num_latents),
+            dtype=jnp.float32,
+        )
+        self.num_latents = int(num_latents)
+        self.token_dim = int(token_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.n_layers = int(n_layers)
+        self.num_heads = int(num_heads)
+        self.mlp_ratio = float(mlp_ratio)
+        self.time_emb_dim = int(time_emb_dim)
+        self.num_intervals = int(num_intervals)
+
+    def _embed_state_tokens(self, tokens: jax.Array) -> jax.Array:
+        hidden = _linear_sequence(self.input_proj, tokens)
+        return hidden + self.position_embedding.astype(hidden.dtype)
+
+    def __call__(
+        self,
+        t: jax.Array | float,
+        y: jax.Array,
+        condition: TokenBridgeCondition,
+    ) -> jax.Array:
+        y_arr = _validate_state_tokens(y, num_latents=self.num_latents, token_dim=self.token_dim)
+        global_tokens = _validate_condition_tokens(
+            condition.global_tokens,
+            num_latents=self.num_latents,
+            token_dim=self.token_dim,
+            field_name="global_tokens",
+            dtype=y_arr.dtype,
+        )
+        previous_tokens = _validate_condition_tokens(
+            condition.previous_tokens,
+            num_latents=self.num_latents,
+            token_dim=self.token_dim,
+            field_name="previous_tokens",
+            dtype=y_arr.dtype,
+        )
+
+        x = self._embed_state_tokens(y_arr)
+        x = x + _linear_sequence(self.global_condition_proj, global_tokens).astype(x.dtype)
+        x = x + _linear_sequence(self.previous_condition_proj, previous_tokens).astype(x.dtype)
+
+        time_context = _build_time_context(
+            interval_idx=condition.interval_idx,
+            num_intervals=self.num_intervals,
+            interval_proj=self.interval_proj,
+            time_embedder=self.time_embedder,
+            t=t,
+            dtype=x.dtype,
+        )
+        for block in self.blocks:
+            x = block(x, time_context)
+        return self.final(x, time_context)
+
+
+class _LegacyTokenConditionalDiT(eqx.Module):
     input_proj: eqx.nn.Linear
     time_embedder: _TimeEmbedder
     interval_proj: eqx.nn.Linear
@@ -261,42 +649,26 @@ class TokenConditionalDiT(eqx.Module):
         y: jax.Array,
         condition: TokenBridgeCondition,
     ) -> jax.Array:
-        y_arr = jnp.asarray(y)
-        if y_arr.ndim != 2:
-            raise ValueError(
-                "TokenConditionalDiT expects latent tokens with shape [num_latents, token_dim]."
-            )
-        if y_arr.shape != (self.num_latents, self.token_dim):
-            raise ValueError(
-                "TokenConditionalDiT received unexpected token shape "
-                f"{tuple(y_arr.shape)}; expected {(self.num_latents, self.token_dim)}."
-            )
-
-        context_tokens = jnp.asarray(condition.context_tokens, dtype=y_arr.dtype)
-        context_token_types = jnp.asarray(condition.context_token_types, dtype=jnp.int32)
-        if context_tokens.ndim != 2 or context_tokens.shape[-1] != self.token_dim:
-            raise ValueError(
-                "TokenBridgeCondition context_tokens must have shape [context_len, token_dim]."
-            )
-        if context_tokens.shape[0] != context_token_types.shape[0]:
-            raise ValueError("TokenBridgeCondition token types must align with context tokens.")
-        if context_tokens.shape[0] % self.num_latents != 0:
-            raise ValueError(
-                "TokenBridgeCondition context length must be an integer multiple of num_latents."
-            )
+        y_arr = _validate_state_tokens(y, num_latents=self.num_latents, token_dim=self.token_dim)
+        context_tokens, context_token_types = _validate_context_tokens(
+            condition,
+            num_latents=self.num_latents,
+            token_dim=self.token_dim,
+            dtype=y_arr.dtype,
+        )
 
         state_types = jnp.full((self.num_latents,), _TOKEN_TYPE_STATE, dtype=jnp.int32)
         state_hidden = self._embed_tokens(y_arr, state_types)
         context_hidden = self._embed_tokens(context_tokens, context_token_types)
         x = jnp.concatenate([state_hidden, context_hidden], axis=0)
-
-        interval_one_hot = jax.nn.one_hot(
-            jnp.asarray(condition.interval_idx, dtype=jnp.int32),
-            self.num_intervals,
+        time_context = _build_time_context(
+            interval_idx=condition.interval_idx,
+            num_intervals=self.num_intervals,
+            interval_proj=self.interval_proj,
+            time_embedder=self.time_embedder,
+            t=t,
             dtype=x.dtype,
         )
-        interval_context = self.interval_proj(interval_one_hot)
-        time_context = self.time_embedder(t).astype(x.dtype) + interval_context.astype(x.dtype)
         for block in self.blocks:
             x = block(x, time_context)
         return self.final(x[: self.num_latents], time_context)
@@ -312,8 +684,22 @@ def build_token_conditional_dit(
     time_emb_dim: int = 32,
     num_intervals: int,
     key: jax.Array,
-) -> TokenConditionalDiT:
-    return TokenConditionalDiT(
+    conditioning_style: str = "set_conditioned_memory",
+) -> TokenConditionalDiT | _SlotwiseAdditiveTokenConditionalDiT | _LegacyTokenConditionalDiT:
+    style = str(conditioning_style).strip().lower()
+    if style == "set_conditioned_memory":
+        model_cls = TokenConditionalDiT
+    elif style == "slotwise_additive":
+        model_cls = _SlotwiseAdditiveTokenConditionalDiT
+    elif style == "mixed_sequence":
+        model_cls = _LegacyTokenConditionalDiT
+    else:
+        raise ValueError(
+            "conditioning_style must be 'set_conditioned_memory', 'slotwise_additive', "
+            "or 'mixed_sequence', "
+            f"got {conditioning_style!r}."
+        )
+    return model_cls(
         num_latents=int(token_shape[0]),
         token_dim=int(token_shape[1]),
         hidden_dim=int(hidden_dim),
@@ -348,12 +734,18 @@ def make_token_bridge_condition(
         )
 
     if mode == "coarse_only":
+        additive_global_tokens = global_arr
+        additive_previous_tokens = jnp.zeros_like(previous_arr)
         context_tokens = global_arr
         context_token_types = jnp.full((global_arr.shape[0],), _TOKEN_TYPE_GLOBAL, dtype=jnp.int32)
     elif mode == "previous_state":
+        additive_global_tokens = jnp.zeros_like(global_arr)
+        additive_previous_tokens = previous_arr
         context_tokens = previous_arr
         context_token_types = jnp.full((previous_arr.shape[0],), _TOKEN_TYPE_PREVIOUS, dtype=jnp.int32)
     else:
+        additive_global_tokens = global_arr
+        additive_previous_tokens = previous_arr
         context_tokens = jnp.concatenate([global_arr, previous_arr], axis=0)
         context_token_types = jnp.concatenate(
             [
@@ -364,6 +756,8 @@ def make_token_bridge_condition(
         )
 
     return TokenBridgeCondition(
+        global_tokens=additive_global_tokens,
+        previous_tokens=additive_previous_tokens,
         context_tokens=context_tokens,
         context_token_types=context_token_types,
         interval_idx=jnp.asarray(interval_idx, dtype=jnp.int32),
@@ -371,7 +765,7 @@ def make_token_bridge_condition(
 
 
 def integrate_token_conditional_interval(
-    drift_net: TokenConditionalDiT,
+    drift_net: TokenConditionalDiT | _SlotwiseAdditiveTokenConditionalDiT | _LegacyTokenConditionalDiT,
     y0: jax.Array,
     condition: TokenBridgeCondition,
     tau_start: jax.Array | float,
@@ -384,6 +778,7 @@ def integrate_token_conditional_interval(
     adjoint: diffrax.AbstractAdjoint | None = None,
     max_steps: int = 4096,
     time_mode: str,
+    save_times: jax.Array | None = None,
 ) -> jax.Array:
     """Integrate a single token-conditional SDE interval with explicit time semantics."""
     y0_arr = jnp.asarray(y0)
@@ -431,11 +826,17 @@ def integrate_token_conditional_interval(
         dt0=dt0_arr,
         y0=y0_arr,
         args=condition,
-        saveat=diffrax.SaveAt(t1=True),
+        saveat=(
+            diffrax.SaveAt(t1=True)
+            if save_times is None
+            else diffrax.SaveAt(ts=jnp.asarray(save_times, dtype=y0_arr.dtype))
+        ),
         adjoint=diffrax.RecursiveCheckpointAdjoint() if adjoint is None else adjoint,
         max_steps=max_steps,
     )
-    return sol.ys[-1]
+    if save_times is None:
+        return sol.ys[-1]
+    return sol.ys
 
 
 __all__ = [

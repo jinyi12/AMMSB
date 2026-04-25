@@ -9,7 +9,6 @@ if str(_REPO_ROOT) not in sys.path:
 
 from scripts.install_repo_skills import (
     backup_existing_path,
-    build_install_plan,
     default_global_skills_root,
     discover_repo_skills,
     install_skill,
@@ -27,31 +26,16 @@ def test_discover_repo_skills_finds_skill_directories(tmp_path):
     assert skills == [skill_dir]
 
 
-def test_build_install_plan_maps_repo_skills_to_destination(tmp_path):
-    repo_root = tmp_path / "repo"
-    destination_root = tmp_path / "global"
-    skill_dir = repo_root / ".codex" / "skills" / "demo-skill"
-    skill_dir.mkdir(parents=True)
-    (skill_dir / "SKILL.md").write_text("---\nname: demo-skill\ndescription: demo\n---\n")
-
-    plan = build_install_plan(repo_root, destination_root)
-
-    assert len(plan) == 1
-    assert plan[0].name == "demo-skill"
-    assert plan[0].source == skill_dir
-    assert plan[0].destination == destination_root / "demo-skill"
-
-
 def test_install_skill_creates_symlink_and_backs_up_existing_directory(tmp_path):
     source = tmp_path / "repo" / ".codex" / "skills" / "demo-skill"
-    destination = tmp_path / "global" / "demo-skill"
+    destination_root = tmp_path / "global"
+    destination = destination_root / "demo-skill"
     source.mkdir(parents=True)
     (source / "SKILL.md").write_text("---\nname: demo-skill\ndescription: demo\n---\n")
     destination.mkdir(parents=True)
     (destination / "SKILL.md").write_text("old")
 
-    install = type("Install", (), {"name": "demo-skill", "source": source, "destination": destination})
-    status, backup = install_skill(install, mode="symlink", backup_existing=True)
+    status, backup = install_skill(source, destination_root, mode="symlink", backup_existing=True)
 
     assert status == "installed"
     assert backup is not None

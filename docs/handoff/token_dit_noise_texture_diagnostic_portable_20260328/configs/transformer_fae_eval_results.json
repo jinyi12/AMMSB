@@ -1,0 +1,99 @@
+{
+  "test_mse": 0.0010770763270556926,
+  "test_rel_mse": 0.00727652042395942,
+  "collapse_diagnostics": null,
+  "held_out_results": {
+    "0.2857142984867096": {
+      "mse": 0.00035807550739264116,
+      "rel_mse": 0.0026741536009141018
+    },
+    "0.7142857313156128": {
+      "mse": 3.495567671052413e-05,
+      "rel_mse": 0.00036655567987706417
+    }
+  },
+  "training_time_results": {
+    "0.1428571492433548": {
+      "mse": 0.001069535966962576,
+      "rel_mse": 0.007257199557421641
+    },
+    "0.4285714328289032": {
+      "mse": 0.00015813149730092846,
+      "rel_mse": 0.0013025582156325733
+    },
+    "0.5714285969734192": {
+      "mse": 5.905672878725454e-05,
+      "rel_mse": 0.0005584475158797095
+    },
+    "0.8571428656578064": {
+      "mse": 2.4424704861303326e-05,
+      "rel_mse": 0.0002707434245587305
+    },
+    "1.0": {
+      "mse": 9.525699397272547e-06,
+      "rel_mse": 0.00012114496375938647
+    }
+  },
+  "architecture": {
+    "type": "fae_time_invariant",
+    "encoder_coord_dim": 2,
+    "decoder_coord_dim": 2,
+    "encoder_type": "transformer",
+    "latent_dim": 4096,
+    "latent_representation": "token_sequence",
+    "n_freqs": 64,
+    "fourier_sigma": 1.0,
+    "positional_encoding": "patch_sincos_2d",
+    "encoder_multiscale_sigmas": [],
+    "decoder_multiscale_sigmas": [],
+    "decoder_positional_encoding": "random_fourier_features",
+    "decoder_type": "transformer",
+    "decoder_features": [
+      128,
+      128,
+      128,
+      128
+    ],
+    "encoder_mlp_dim": 128,
+    "encoder_mlp_layers": 2,
+    "pooling_type": null,
+    "n_heads": 4,
+    "n_queries": 8,
+    "n_residual_blocks": 3,
+    "transformer_emb_dim": 128,
+    "transformer_num_latents": 32,
+    "transformer_encoder_depth": 6,
+    "transformer_cross_attn_depth": 2,
+    "transformer_decoder_depth": 4,
+    "transformer_mlp_ratio": 2,
+    "transformer_layer_norm_eps": 1e-05,
+    "transformer_tokenization": "patches",
+    "transformer_patch_size": 16,
+    "transformer_max_grid_size": [
+      128,
+      128
+    ],
+    "transformer_grid_size": [
+      128,
+      128
+    ],
+    "transformer_latent_shape": [
+      32,
+      128
+    ],
+    "function_space_compatible": true,
+    "transformer_num_heads": 4,
+    "transformer_decoder_query_mode": "coordinates",
+    "resolved_from_live_params": true,
+    "transformer_patch_kernel_shape": [
+      16,
+      16
+    ],
+    "transformer_decoder_memory_width": 128,
+    "transformer_decoder_query_width": 128
+  },
+  "wandb_run_id": "pgjepmxy",
+  "training_mode": "multi_scale",
+  "loss_type": "ntk_prior_balanced",
+  "optimizer": "adamw"
+}

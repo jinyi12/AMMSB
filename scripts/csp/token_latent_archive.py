@@ -5,8 +5,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+import zipfile
 
 import numpy as np
+from numpy.lib import format as npy_format
 
 from scripts.csp.fae_transport_spec import validate_fae_transport_info
 
@@ -54,6 +56,41 @@ class TokenFaeLatentArchive:
         return int(self.num_tokens * self.token_dim)
 
 
+@dataclass(frozen=True)
+class TokenFaeLatentArchiveContract:
+    path: Path
+    latent_test_root: np.ndarray
+    zt: np.ndarray
+    time_indices: np.ndarray
+    split: dict[str, Any] | None = None
+    dataset_path: str | None = None
+    fae_checkpoint_path: str | None = None
+
+    @property
+    def num_levels(self) -> int:
+        return int(self.zt.shape[0])
+
+    @property
+    def num_intervals(self) -> int:
+        return max(0, int(self.num_levels) - 1)
+
+    @property
+    def num_tokens(self) -> int:
+        return int(self.latent_test_root.shape[-2])
+
+    @property
+    def token_dim(self) -> int:
+        return int(self.latent_test_root.shape[-1])
+
+    @property
+    def token_shape(self) -> tuple[int, int]:
+        return (self.num_tokens, self.token_dim)
+
+    @property
+    def n_test(self) -> int:
+        return int(self.latent_test_root.shape[0])
+
+
 def _load_optional_object(payload: Any, key: str) -> Any:
     if key not in payload:
         return None
@@ -82,6 +119,53 @@ def _load_optional_int(payload: Any, key: str) -> int | None:
     if value.size == 0:
         return None
     return int(value[0])
+
+
+def _read_npy_header(fp) -> tuple[tuple[int, ...], bool, np.dtype]:
+    version = npy_format.read_magic(fp)
+    if version == (1, 0):
+        shape, fortran_order, dtype = npy_format.read_array_header_1_0(fp)
+    else:
+        shape, fortran_order, dtype = npy_format.read_array_header_2_0(fp)
+    return tuple(int(dim) for dim in shape), bool(fortran_order), np.dtype(dtype)
+
+
+def _load_last_axis0_slice_from_npz(
+    archive_path: Path,
+    entry_name: str,
+) -> tuple[np.ndarray, tuple[int, ...]]:
+    with zipfile.ZipFile(archive_path, "r") as archive_zip:
+        entry_path = f"{entry_name}.npy"
+        if entry_path not in archive_zip.namelist():
+            raise KeyError(f"Missing {entry_path} in token latent archive {archive_path}.")
+        with archive_zip.open(entry_path, "r") as fp:
+            shape, fortran_order, dtype = _read_npy_header(fp)
+            if len(shape) < 2:
+                raise ValueError(
+                    f"Expected {entry_name} to have at least two dimensions, got shape {shape}."
+                )
+            if fortran_order:
+                raise ValueError(
+                    f"Expected C-order token archive storage for {entry_name}, found Fortran order."
+                )
+            slice_shape = tuple(int(dim) for dim in shape[1:])
+            slice_elems = int(np.prod(slice_shape, dtype=np.int64))
+            slice_bytes = int(slice_elems * dtype.itemsize)
+            bytes_to_skip = int(max(0, shape[0] - 1) * slice_bytes)
+            remaining = bytes_to_skip
+            while remaining > 0:
+                chunk = fp.read(min(1024 * 1024, remaining))
+                if not chunk:
+                    raise EOFError(
+                        f"Unexpected EOF while skipping leading {entry_name} slices in {archive_path}."
+                    )
+                remaining -= len(chunk)
+            payload = fp.read(slice_bytes)
+            if len(payload) != int(slice_bytes):
+                raise EOFError(
+                    f"Unexpected EOF while reading the final {entry_name} slice in {archive_path}."
+                )
+    return np.frombuffer(payload, dtype=dtype).reshape(slice_shape).astype(np.float32, copy=False), shape
 
 
 def save_token_fae_latent_archive(
@@ -207,8 +291,50 @@ def load_token_fae_latent_archive(path: Path) -> TokenFaeLatentArchive:
     )
 
 
+def load_token_fae_latent_archive_contract(path: Path) -> TokenFaeLatentArchiveContract:
+    archive_path = Path(path).expanduser().resolve()
+    if not archive_path.exists():
+        raise FileNotFoundError(f"Missing token latent archive: {archive_path}")
+
+    with np.load(archive_path, allow_pickle=True) as payload:
+        zt = np.asarray(payload["zt"], dtype=np.float32).reshape(-1)
+        time_indices = np.asarray(payload["time_indices"], dtype=np.int64).reshape(-1)
+        split = _load_optional_object(payload, "split")
+        dataset_path = _load_optional_scalar(payload, "dataset_path")
+        fae_checkpoint_path = _load_optional_scalar(payload, "fae_checkpoint_path")
+    latent_test_root, latent_test_shape = _load_last_axis0_slice_from_npz(archive_path, "latent_test")
+
+    if len(latent_test_shape) != 4:
+        raise ValueError(
+            "Expected token latent archives with latent_test shape (T, N, L, D); "
+            f"got {latent_test_shape}."
+        )
+    if time_indices.shape[0] != int(latent_test_shape[0]) or zt.shape[0] != int(latent_test_shape[0]):
+        raise ValueError(
+            "Token latent archive contract mismatch: "
+            f"latent_test levels={latent_test_shape[0]}, zt={zt.shape}, time_indices={time_indices.shape}."
+        )
+    if not np.all(np.diff(zt) > 0.0):
+        raise ValueError(
+            "Expected stored zt to be strictly increasing in data order "
+            "(fine scale first, coarse scale last)."
+        )
+
+    return TokenFaeLatentArchiveContract(
+        path=archive_path,
+        latent_test_root=np.asarray(latent_test_root, dtype=np.float32),
+        zt=zt,
+        time_indices=time_indices,
+        split=split if isinstance(split, dict) else None,
+        dataset_path=dataset_path,
+        fae_checkpoint_path=fae_checkpoint_path,
+    )
+
+
 __all__ = [
     "TokenFaeLatentArchive",
+    "TokenFaeLatentArchiveContract",
     "load_token_fae_latent_archive",
+    "load_token_fae_latent_archive_contract",
     "save_token_fae_latent_archive",
 ]

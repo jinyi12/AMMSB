@@ -7,6 +7,8 @@ import glob
 import json
 import os
 import warnings
+from collections.abc import Mapping
+from pathlib import Path
 from typing import Callable, Optional, Sequence
 
 import jax
@@ -41,6 +43,7 @@ from mmsfm.fae.run_artifacts import (
     save_model_info,
     setup_output_directory,
 )
+from mmsfm.fae.fae_latent_utils import load_fae_warmstart_variables
 from mmsfm.fae.multiscale_dataset_naive import (
     TimeGroupedBatchSampler,
     load_held_out_data_naive,
@@ -56,8 +59,22 @@ SetupFn = Callable[
     [object, argparse.Namespace],
     tuple[Callable, list, Optional[Callable]],
 ]
-"""Return (loss_fn, metrics, reconstruct_fn) or
-(loss_fn, metrics, reconstruct_fn, extra_init_params_fn)."""
+"""Return (loss_fn, metrics, reconstruct_fn) plus optional setup extras.
+
+Supported tuple layouts are:
+- (loss_fn, metrics, reconstruct_fn)
+- (loss_fn, metrics, reconstruct_fn, extra_init_params_fn)
+- (loss_fn, metrics, reconstruct_fn, extra_init_params_fn, extra_init_aux_state_fn, aux_update_fn)
+- (
+    loss_fn,
+    metrics,
+    reconstruct_fn,
+    extra_init_params_fn,
+    extra_init_aux_state_fn,
+    aux_update_fn,
+    eval_vis_fn,
+  )
+"""
 
 
 def _estimate_sobolev_balance_from_dataset(
@@ -317,12 +334,40 @@ def run_training_from_datasets(
     key, subkey = jax.random.split(key)
     autoencoder, architecture_info = build_autoencoder_fn(subkey, args, decoder_features)
 
+    initial_variables = None
+    init_checkpoint_raw = str(getattr(args, "init_checkpoint", "") or "").strip()
+    if init_checkpoint_raw:
+        initial_variables = load_fae_warmstart_variables(
+            Path(init_checkpoint_raw).expanduser().resolve()
+        )
+
     extra_init_params_fn = None
+    extra_init_aux_state_fn = None
+    pre_step_aux_update_fn = None
+    aux_update_fn = None
+    extra_eval_vis_fn = None
     if setup_fn is not None:
+        # Setup tuple contract:
+        #   (loss_fn, metrics, reconstruct_fn,
+        #    extra_init_params_fn?, extra_init_aux_state_fn?,
+        #    aux_update_fn?, eval_vis_fn?)                       legacy
+        #   (loss_fn, metrics, reconstruct_fn,
+        #    extra_init_params_fn?, extra_init_aux_state_fn?,
+        #    pre_step_aux_update_fn?, aux_update_fn?, eval_vis_fn?)  extended
         setup_result = setup_fn(autoencoder, args)
         loss_fn, metrics, reconstruct_fn = setup_result[:3]
         if len(setup_result) >= 4:
             extra_init_params_fn = setup_result[3]
+        if len(setup_result) >= 5:
+            extra_init_aux_state_fn = setup_result[4]
+        if len(setup_result) >= 8:
+            pre_step_aux_update_fn = setup_result[5]
+            aux_update_fn = setup_result[6]
+            extra_eval_vis_fn = setup_result[7]
+        elif len(setup_result) >= 6:
+            aux_update_fn = setup_result[5]
+        if len(setup_result) == 7:
+            extra_eval_vis_fn = setup_result[6]
     else:
         latent_noise_scale = getattr(args, "latent_noise_scale", 0.0) or 0.0
         domain = RandomlySampledEuclidean(s=0.0)
@@ -392,7 +437,8 @@ def run_training_from_datasets(
     if wandb_run is not None:
 
         def vis_callback(state, epoch):
-            return visualize_sample_reconstructions(
+            figures = {}
+            recon_fig = visualize_sample_reconstructions(
                 autoencoder,
                 state,
                 test_loader,
@@ -401,6 +447,25 @@ def run_training_from_datasets(
                 reconstruct_fn=reconstruct_fn,
                 key=jax.random.PRNGKey(args.seed + int(epoch) + 1000),
             )
+            if recon_fig is not None:
+                figures["reconstructions"] = recon_fig
+            if extra_eval_vis_fn is not None:
+                extra_payload = extra_eval_vis_fn(state, epoch)
+                if isinstance(extra_payload, Mapping):
+                    figures.update(
+                        {
+                            str(name): fig
+                            for name, fig in extra_payload.items()
+                            if fig is not None
+                        }
+                    )
+                elif extra_payload is not None:
+                    figures["diagnostics"] = extra_payload
+            if not figures:
+                return None
+            if tuple(figures.keys()) == ("reconstructions",):
+                return figures["reconstructions"]
+            return figures
 
     best_model_path = (
         os.path.join(paths["checkpoints"], "best_state.pkl")
@@ -428,7 +493,11 @@ def run_training_from_datasets(
         save_best_model=args.save_best_model,
         best_model_path=best_model_path,
         optimizer_config=optimizer_config,
+        initial_variables=initial_variables,
         extra_init_params_fn=extra_init_params_fn,
+        extra_init_aux_state_fn=extra_init_aux_state_fn,
+        pre_step_aux_update_fn=pre_step_aux_update_fn,
+        aux_update_fn=aux_update_fn,
     )
 
     key, init_meta_key = jax.random.split(key)
@@ -455,6 +524,15 @@ def run_training_from_datasets(
     state = result["state"]
     training_loss = result["training_loss_history"]
     np.save(os.path.join(paths["logs"], "training_loss.npy"), np.array(training_loss, dtype=np.float32))
+    if getattr(trainer, "aux_history", None):
+        aux_history_filename = (
+            "joint_csp_sigma_history.json"
+            if getattr(args, "joint_transport_regularizer", "") == "latent_csp"
+            else "aux_history.json"
+        )
+        aux_history_path = os.path.join(paths["logs"], aux_history_filename)
+        with open(aux_history_path, "w") as file:
+            json.dump(trainer.aux_history, file, indent=2)
 
     fig, ax = plt.subplots(figsize=(8, 4))
     ax.semilogy(training_loss)
@@ -683,6 +761,7 @@ def run_training_from_datasets(
         "output_dir": paths["root"],
         "wandb_run_id": wandb_run_id,
         "test_metrics": test_metrics,
+        "aux_state": getattr(state, "aux_state", None),
     }
 
 

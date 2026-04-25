@@ -122,3 +122,101 @@ def test_resolve_live_architecture_info_prefers_live_transformer_shapes() -> Non
     assert resolved["transformer_patch_kernel_shape"] == [32, 32]
     assert resolved["transformer_decoder_memory_width"] == 256
     assert resolved["transformer_decoder_query_width"] == 256
+
+
+def test_resolve_live_architecture_info_supports_nested_transformer_decoder_layout() -> None:
+    architecture_info = {
+        "encoder_type": "transformer",
+        "decoder_type": "transformer",
+        "latent_dim": 128,
+        "transformer_patch_size": 16,
+    }
+    params = {
+        "encoder": {
+            "patch_encoder": {
+                "latent_tokens": np.zeros((64, 256), dtype=np.float32),
+            }
+        },
+        "decoder": {
+            "coordinate_decoder": {
+                "decoder_core": {
+                    "memory_proj": {
+                        "kernel": np.zeros((256, 192), dtype=np.float32),
+                    },
+                    "query_proj": {
+                        "kernel": np.zeros((64, 192), dtype=np.float32),
+                    },
+                }
+            }
+        },
+    }
+
+    resolved = resolve_live_architecture_info(architecture_info, params)
+
+    assert resolved["resolved_from_live_params"] is True
+    assert resolved["transformer_decoder_memory_width"] == 192
+    assert resolved["transformer_decoder_query_width"] == 192
+
+
+def test_resolve_live_architecture_info_extracts_transformer_dit_prior_config() -> None:
+    architecture_info = {
+        "encoder_type": "transformer",
+        "decoder_type": "transformer",
+        "latent_dim": 128,
+    }
+    params = {
+        "encoder": {},
+        "decoder": {},
+        "prior": {
+            "input_proj": {
+                "kernel": np.zeros((16, 32), dtype=np.float32),
+            },
+            "time_embedder": {
+                "dense_0": {
+                    "kernel": np.zeros((8, 32), dtype=np.float32),
+                },
+            },
+            "block_0": {
+                "attn": {
+                    "query": {
+                        "kernel": np.zeros((32, 4, 8), dtype=np.float32),
+                    },
+                },
+                "mlp": {
+                    "fc_0": {
+                        "kernel": np.zeros((32, 64), dtype=np.float32),
+                    },
+                },
+            },
+            "block_1": {
+                "attn": {
+                    "query": {
+                        "kernel": np.zeros((32, 4, 8), dtype=np.float32),
+                    },
+                },
+                "mlp": {
+                    "fc_0": {
+                        "kernel": np.zeros((32, 64), dtype=np.float32),
+                    },
+                },
+            },
+            "final": {
+                "proj": {
+                    "kernel": np.zeros((32, 16), dtype=np.float32),
+                },
+            },
+        },
+    }
+
+    resolved = resolve_live_architecture_info(architecture_info, params)
+
+    assert resolved["prior_architecture"] == "transformer_dit"
+    assert resolved["prior_token_mode"] == "token_native"
+    assert resolved["prior_n_layers"] == 2
+    assert resolved["prior_token_dim"] == 16
+    assert resolved["prior_hidden_dim"] == 32
+    assert resolved["prior_output_token_dim"] == 16
+    assert resolved["prior_time_emb_dim"] == 8
+    assert resolved["prior_num_heads"] == 4
+    assert resolved["prior_head_dim"] == 8
+    assert resolved["prior_mlp_ratio"] == 2.0

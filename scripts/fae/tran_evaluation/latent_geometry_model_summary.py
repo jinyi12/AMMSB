@@ -11,6 +11,7 @@ import numpy as np
 MODEL_METRICS: list[dict[str, Any]] = [
     {
         "key": "trace_g_mean_over_time",
+        "per_time_key": "trace_g_mean",
         "label": "trace_g",
         "title": "Pullback trace",
         "display": r"$\langle \mathrm{Tr}(g)\rangle_t$",
@@ -20,6 +21,7 @@ MODEL_METRICS: list[dict[str, Any]] = [
     },
     {
         "key": "effective_rank_mean_over_time",
+        "per_time_key": "effective_rank_mean",
         "label": "r_eff",
         "title": "Effective rank",
         "display": r"$\langle r_{\mathrm{eff}}(g)\rangle_t$",
@@ -29,6 +31,7 @@ MODEL_METRICS: list[dict[str, Any]] = [
     },
     {
         "key": "rho_vol_mean_over_time",
+        "per_time_key": "rho_vol_mean",
         "label": "rho_vol",
         "title": "Volumetric robustness",
         "display": r"$\langle \rho_{\mathrm{vol},\gamma}\rangle_t$",
@@ -37,7 +40,18 @@ MODEL_METRICS: list[dict[str, Any]] = [
         "ylim": (0.0, 1.05),
     },
     {
+        "key": "near_null_mass_mean_over_time",
+        "per_time_key": "near_null_mass_mean",
+        "label": "near_null",
+        "title": "Near-null mass",
+        "display": r"$\langle m_{\mathrm{null}}\rangle_t$",
+        "direction": "lower_better",
+        "yscale": None,
+        "ylim": (0.0, 1.05),
+    },
+    {
         "key": "hessian_frob_p99_mean_over_time",
+        "per_time_key": "hessian_frob_p99",
         "label": "hessian_p99",
         "title": "Curvature proxy",
         "display": r"$\langle q_{0.99}(\|H_z D\|_F^2)\rangle_t$",
@@ -47,16 +61,9 @@ MODEL_METRICS: list[dict[str, Any]] = [
     },
 ]
 
-TRACK_ORDER = {
-    "deterministic_primary": 0,
-    "denoiser_secondary": 1,
-}
-
-LOSS_ORDER = {
-    "l2": 0,
-    "ntk_scaled": 1,
-    "ntk_prior_balanced": 2,
-    "denoiser": 3,
+PAIR_ROLE_ORDER = {
+    "baseline": 0,
+    "treatment": 1,
 }
 
 
@@ -86,6 +93,25 @@ def _format_pct(value: float) -> str:
     return f"{100.0 * float(value):+.1f}%"
 
 
+def _format_scalar(value: float) -> str:
+    if not np.isfinite(value):
+        return "nan"
+    if value == 0.0:
+        return "0"
+    abs_value = abs(float(value))
+    if abs_value >= 1e4 or abs_value < 1e-2:
+        return f"{value:.3e}"
+    if abs_value >= 1e2:
+        return f"{value:.2f}"
+    if abs_value >= 1.0:
+        return f"{value:.3f}"
+    return f"{value:.4f}"
+
+
+def _format_direction(direction: str) -> str:
+    return str(direction).replace("_", " ")
+
+
 def _extract_series(per_time: list[dict[str, Any]], key: str) -> np.ndarray:
     vals = [_safe_float(row.get(key)) for row in per_time]
     arr = np.asarray(vals, dtype=np.float64)
@@ -112,11 +138,46 @@ def _series_stats(values: np.ndarray) -> dict[str, Any]:
     }
 
 
+def _resolve_regularizer(
+    *,
+    regularizer: Any = None,
+    prior_flag: Any = 0,
+    use_prior: Any = False,
+) -> str:
+    raw = str(regularizer or "").strip().lower()
+    if raw in {"none", "diffusion_prior", "sigreg"}:
+        return raw
+    if bool(use_prior):
+        return "diffusion_prior"
+    try:
+        if int(prior_flag) != 0:
+            return "diffusion_prior"
+    except Exception:
+        pass
+    return "none"
+
+
+def _signed_relative_delta(baseline: dict[str, Any], treatment: dict[str, Any], metric: dict[str, Any]) -> float:
+    key = metric["key"]
+    b = _safe_float(baseline.get(key))
+    t = _safe_float(treatment.get(key))
+    if not np.isfinite(b) or not np.isfinite(t):
+        return float("nan")
+
+    denom = abs(b) + 1e-12
+    if metric["direction"] == "higher_better":
+        return (t - b) / denom
+    if metric["direction"] == "lower_better":
+        return (b - t) / denom
+    raise ValueError(f"Unknown metric direction: {metric['direction']}")
+
+
 def _summarise_run(results: dict[str, Any]) -> dict[str, Any]:
     per_time = list(results.get("per_time", []))
     gs = results.get("global_summary", {})
     flags = results.get("robustness_flags", {}).get("overall", {})
     meta = results.get("model_metadata", {})
+    geom_meta = results.get("latent_geometry_metadata", {})
 
     trace_stats = _series_stats(_extract_series(per_time, "trace_g_mean"))
     rank_stats = _series_stats(_extract_series(per_time, "effective_rank_mean"))
@@ -127,6 +188,12 @@ def _summarise_run(results: dict[str, Any]) -> dict[str, Any]:
     collapse = bool(flags.get("collapse_risk", False))
     folding = bool(flags.get("folding_risk", False))
     risk_count = int(collapse) + int(folding)
+    regularizer = _resolve_regularizer(
+        regularizer=meta.get("regularizer"),
+        prior_flag=meta.get("prior_flag", 0),
+        use_prior=meta.get("use_prior", False),
+    )
+    prior_flag = int(meta.get("prior_flag", 1 if regularizer != "none" else 0))
 
     trace_mean = _safe_float(gs.get("trace_g_mean_over_time"))
     if not np.isfinite(trace_mean):
@@ -144,37 +211,32 @@ def _summarise_run(results: dict[str, Any]) -> dict[str, Any]:
     return {
         "run_dir": str(results.get("run_dir", "")),
         "matrix_cell_id": str(meta.get("matrix_cell_id", "")),
-        "decoder_type": str(meta.get("decoder_type", "")),
+        "run_role": str(meta.get("run_role", geom_meta.get("run_role", ""))),
+        "run_label": str(meta.get("run_label", "")),
+        "decoder_type": str(meta.get("decoder_type", geom_meta.get("decoder_type", ""))),
         "optimizer": str(meta.get("optimizer", "")),
         "loss_type": str(meta.get("loss_type", "")),
         "scale": str(meta.get("scale", "")),
-        "prior_flag": int(meta.get("prior_flag", 0)),
+        "regularizer": regularizer,
+        "prior_flag": prior_flag,
         "track": str(meta.get("track", "")),
+        "latent_representation": str(geom_meta.get("latent_representation", "")),
+        "transformer_latent_shape": list(geom_meta.get("transformer_latent_shape") or []),
         "trace_g_mean_over_time": trace_mean,
         "trace_g_std_over_time": _safe_float(trace_stats["std"]),
         "trace_g_ci95_over_time": trace_stats["ci95"],
-        "trace_g_min_over_time": _safe_float(trace_stats["min"]),
-        "trace_g_max_over_time": _safe_float(trace_stats["max"]),
         "effective_rank_mean_over_time": rank_mean,
         "effective_rank_std_over_time": _safe_float(rank_stats["std"]),
         "effective_rank_ci95_over_time": rank_stats["ci95"],
-        "effective_rank_min_over_time": _safe_float(rank_stats["min"]),
-        "effective_rank_max_over_time": _safe_float(rank_stats["max"]),
         "rho_vol_mean_over_time": rho_mean,
         "rho_vol_std_over_time": _safe_float(rho_stats["std"]),
         "rho_vol_ci95_over_time": rho_stats["ci95"],
-        "rho_vol_min_over_time": _safe_float(rho_stats["min"]),
-        "rho_vol_max_over_time": _safe_float(rho_stats["max"]),
         "near_null_mass_mean_over_time": null_mean,
         "near_null_mass_std_over_time": _safe_float(null_stats["std"]),
         "near_null_mass_ci95_over_time": null_stats["ci95"],
-        "near_null_mass_min_over_time": _safe_float(null_stats["min"]),
-        "near_null_mass_max_over_time": _safe_float(null_stats["max"]),
         "hessian_frob_p99_mean_over_time": _safe_float(hess_stats["mean"]),
         "hessian_frob_p99_std_over_time": _safe_float(hess_stats["std"]),
         "hessian_frob_p99_ci95_over_time": hess_stats["ci95"],
-        "hessian_frob_p99_min_over_time": _safe_float(hess_stats["min"]),
-        "hessian_frob_p99_max_over_time": _safe_float(hess_stats["max"]),
         "hessian_frob_p99_max": _safe_float(gs.get("hessian_frob_p99_max", hess_stats["max"])),
         "collapse_risk": collapse,
         "folding_risk": folding,
@@ -183,256 +245,193 @@ def _summarise_run(results: dict[str, Any]) -> dict[str, Any]:
 
 
 def _summary_sort_key(summary: dict[str, Any]) -> tuple[Any, ...]:
-    track = str(summary.get("track", ""))
-    decoder = str(summary.get("decoder_type", ""))
-    optimizer = str(summary.get("optimizer", ""))
-    scale = str(summary.get("scale", ""))
-    loss = str(summary.get("loss_type", ""))
-    prior = int(summary.get("prior_flag", 0))
     return (
-        TRACK_ORDER.get(track, 99),
-        decoder,
-        optimizer,
-        scale,
-        LOSS_ORDER.get(loss, 99),
-        prior,
+        PAIR_ROLE_ORDER.get(str(summary.get("run_role", "")).lower(), 99),
+        str(summary.get("matrix_cell_id", "")),
     )
 
 
-def _find_summary(
-    summaries: list[dict[str, Any]],
+def _build_sign_conventions() -> dict[str, str]:
+    sign: dict[str, str] = {}
+    for metric in MODEL_METRICS:
+        if metric["direction"] == "higher_better":
+            sign[metric["key"]] = f"positive means larger {metric['title'].lower()}"
+        else:
+            sign[metric["key"]] = f"positive means lower {metric['title'].lower()}"
+    return sign
+
+
+def _compute_pairwise_deltas(
+    baseline_results: dict[str, Any],
+    treatment_results: dict[str, Any],
     *,
-    decoder_type: str,
-    optimizer: str,
-    loss_type: str,
-    scale: str,
-    prior_flag: int,
-    track: str,
-) -> dict[str, Any] | None:
-    for summary in summaries:
-        if (
-            str(summary["decoder_type"]) == decoder_type
-            and str(summary["optimizer"]) == optimizer
-            and str(summary["loss_type"]) == loss_type
-            and str(summary["scale"]) == scale
-            and int(summary["prior_flag"]) == int(prior_flag)
-            and str(summary["track"]) == track
-        ):
-            return summary
-    return None
-
-
-def _relative_improvement(
-    baseline: dict[str, Any],
-    treatment: dict[str, Any],
-    metric: dict[str, Any],
-) -> float:
-    key = metric["key"]
-    mode = metric["direction"]
-    b = _safe_float(baseline.get(key))
-    t = _safe_float(treatment.get(key))
-    if not np.isfinite(b) or not np.isfinite(t):
-        return float("nan")
-    if mode == "higher_better":
-        denom = abs(b) + 1e-12
-        return (t - b) / denom
-    if mode == "lower_better":
-        denom = abs(b) + 1e-12
-        return (b - t) / denom
-    if mode == "abs_higher_better":
-        b_abs = abs(b)
-        t_abs = abs(t)
-        denom = b_abs + 1e-12
-        return (t_abs - b_abs) / denom
-    raise ValueError(f"Unknown direction mode: {mode}")
-
-
-def _compute_effect_tables(
-    summaries: list[dict[str, Any]],
-    *,
-    effect_baseline_scope: str = "deterministic_primary",
-    effect_scale_scope: str = "multi_1248",
+    baseline_summary: dict[str, Any],
+    treatment_summary: dict[str, Any],
 ) -> dict[str, Any]:
-    optimizers = ["adam", "muon"]
-    ntk_rows: list[dict[str, Any]] = []
-    prior_rows: list[dict[str, Any]] = []
-    chain_rows: list[dict[str, Any]] = []
+    baseline_time = list(baseline_results.get("per_time", []))
+    treatment_time = list(treatment_results.get("per_time", []))
+    if len(baseline_time) != len(treatment_time):
+        raise RuntimeError("Baseline and treatment latent-geometry runs produced different numbers of time marginals.")
 
-    for optimizer in optimizers:
-        l2_run = _find_summary(
-            summaries,
-            decoder_type="film",
-            optimizer=optimizer,
-            loss_type="l2",
-            scale=effect_scale_scope,
-            prior_flag=0,
-            track=effect_baseline_scope,
+    baseline_indices = list(baseline_results.get("time_indices", list(range(len(baseline_time)))))
+    treatment_indices = list(treatment_results.get("time_indices", list(range(len(treatment_time)))))
+    if baseline_indices != treatment_indices:
+        raise RuntimeError("Baseline and treatment latent-geometry runs use different dataset time indices.")
+
+    global_rows: list[dict[str, Any]] = []
+    for metric in MODEL_METRICS:
+        key = metric["key"]
+        b = _safe_float(baseline_summary.get(key))
+        t = _safe_float(treatment_summary.get(key))
+        global_rows.append(
+            {
+                "metric_key": key,
+                "metric_label": metric["label"],
+                "metric_title": metric["title"],
+                "direction": metric["direction"],
+                "baseline_value": b,
+                "treatment_value": t,
+                "absolute_delta": t - b if np.isfinite(b) and np.isfinite(t) else float("nan"),
+                "signed_relative_delta": _signed_relative_delta(baseline_summary, treatment_summary, metric),
+            }
         )
-        ntk_run = _find_summary(
-            summaries,
-            decoder_type="film",
-            optimizer=optimizer,
-            loss_type="ntk_scaled",
-            scale=effect_scale_scope,
-            prior_flag=0,
-            track=effect_baseline_scope,
-        )
-        if l2_run is not None and ntk_run is not None:
-            rel = {metric["key"]: _relative_improvement(l2_run, ntk_run, metric) for metric in MODEL_METRICS}
-            ntk_rows.append(
+
+    per_time_rows: list[dict[str, Any]] = []
+    for time_pos, (dataset_time_idx, b_row, t_row) in enumerate(zip(baseline_indices, baseline_time, treatment_time)):
+        metrics: list[dict[str, Any]] = []
+        for metric in MODEL_METRICS:
+            b = _safe_float(b_row.get(metric["per_time_key"]))
+            t = _safe_float(t_row.get(metric["per_time_key"]))
+            denom = abs(b) + 1e-12
+            if np.isfinite(b) and np.isfinite(t):
+                if metric["direction"] == "higher_better":
+                    signed_rel = (t - b) / denom
+                else:
+                    signed_rel = (b - t) / denom
+                abs_delta = t - b
+            else:
+                signed_rel = float("nan")
+                abs_delta = float("nan")
+            metrics.append(
                 {
-                    "optimizer": optimizer,
-                    "baseline": str(l2_run.get("matrix_cell_id", "")),
-                    "treatment": str(ntk_run.get("matrix_cell_id", "")),
-                    "relative_changes": rel,
+                    "metric_key": metric["key"],
+                    "metric_label": metric["label"],
+                    "baseline_value": b,
+                    "treatment_value": t,
+                    "absolute_delta": abs_delta,
+                    "signed_relative_delta": signed_rel,
                 }
             )
-
-        ntk_prior1 = _find_summary(
-            summaries,
-            decoder_type="film",
-            optimizer=optimizer,
-            loss_type="ntk_prior_balanced",
-            scale=effect_scale_scope,
-            prior_flag=1,
-            track=effect_baseline_scope,
+        per_time_rows.append(
+            {
+                "time_position": int(time_pos),
+                "dataset_time_index": int(dataset_time_idx),
+                "metrics": metrics,
+            }
         )
-        if ntk_run is not None and ntk_prior1 is not None:
-            rel = {metric["key"]: _relative_improvement(ntk_run, ntk_prior1, metric) for metric in MODEL_METRICS}
-            prior_rows.append(
-                {
-                    "optimizer": optimizer,
-                    "baseline": str(ntk_run.get("matrix_cell_id", "")),
-                    "treatment": str(ntk_prior1.get("matrix_cell_id", "")),
-                    "relative_changes": rel,
-                }
-            )
-
-        if l2_run is not None and ntk_run is not None and ntk_prior1 is not None:
-            chain_rows.append(
-                {
-                    "optimizer": optimizer,
-                    "standard": str(l2_run.get("matrix_cell_id", "")),
-                    "ntk": str(ntk_run.get("matrix_cell_id", "")),
-                    "ntk_prior": str(ntk_prior1.get("matrix_cell_id", "")),
-                }
-            )
-
-    sign_conventions = {
-        "trace_g_mean_over_time": "positive means larger Tr(g)",
-        "effective_rank_mean_over_time": "positive means larger effective rank",
-        "rho_vol_mean_over_time": "positive means larger volumetric robustness",
-        "near_null_mass_mean_over_time": "positive means lower near-null mass",
-        "hessian_frob_p99_mean_over_time": "positive means lower Hessian p99",
-    }
 
     return {
-        "effect_baseline_scope": effect_baseline_scope,
-        "effect_scale_scope": effect_scale_scope,
-        "metrics": [metric["key"] for metric in MODEL_METRICS],
-        "sign_conventions": sign_conventions,
-        "ntk_effect": ntk_rows,
-        "prior_effect": prior_rows,
-        "ntk_prior_chain": chain_rows,
+        "schema_version": "latent_geom_pairwise_v1",
+        "baseline": {
+            "matrix_cell_id": str(baseline_summary.get("matrix_cell_id", "")),
+            "run_label": str(baseline_summary.get("run_label", "")),
+            "run_dir": str(baseline_summary.get("run_dir", "")),
+        },
+        "treatment": {
+            "matrix_cell_id": str(treatment_summary.get("matrix_cell_id", "")),
+            "run_label": str(treatment_summary.get("run_label", "")),
+            "run_dir": str(treatment_summary.get("run_dir", "")),
+        },
+        "sign_conventions": _build_sign_conventions(),
+        "global_metrics": global_rows,
+        "per_time": per_time_rows,
     }
 
 
-def _write_effect_tables(
-    effects: dict[str, Any],
-    *,
-    out_dir: Path,
-) -> None:
-    """Write paired NTK/prior effects as tables for presentation."""
-    scale_scope = str(effects.get("effect_scale_scope", "")).strip() or "selected scale"
-    effect_specs = [
-        (
-            "ntk_effect",
-            f"NTK effect: L2 -> NTK-scaled ({scale_scope}, prior=0)",
-            "latent_geom_ntk_effect_table",
-        ),
-        (
-            "prior_effect",
-            f"Prior effect (on top of NTK): NTK -> NTK+Prior ({scale_scope})",
-            "latent_geom_prior_effect_table",
-        ),
-    ]
+def _write_pair_delta_table(pairwise: dict[str, Any], *, out_dir: Path) -> None:
+    baseline = str(dict(pairwise.get("baseline", {})).get("run_label", "")).strip() or "baseline"
+    treatment = str(dict(pairwise.get("treatment", {})).get("run_label", "")).strip() or "treatment"
+    rows = list(pairwise.get("global_metrics", []))
+    sign = dict(pairwise.get("sign_conventions", {}))
 
-    sign = effects.get("sign_conventions", {})
-    sign = sign if isinstance(sign, dict) else {}
-
-    for effect_key, title, basename in effect_specs:
-        rows = list(effects.get(effect_key, []))
-        md_lines: list[str] = [f"# {title}", ""]
-
-        if sign:
-            md_lines.append("Sign convention for Δ (positive means improvement):")
-            md_lines.append("")
-            for spec in MODEL_METRICS:
-                msg = str(sign.get(spec["key"], "")).strip()
-                if msg:
-                    md_lines.append(f"- `{spec['label']}`: {msg}")
-            md_lines.append("")
-
-        header = ["optimizer", "baseline", "treatment", *[spec["label"] for spec in MODEL_METRICS]]
-        md_lines.append("| " + " | ".join(header) + " |")
-        md_lines.append("| " + " | ".join(["---"] * len(header)) + " |")
-
-        csv_path = out_dir / f"{basename}.csv"
-        md_path = out_dir / f"{basename}.md"
-
-        csv_rows: list[list[Any]] = [header]
-
-        if not rows:
-            md_lines.append("| (none) |  |  | " + " | ".join([""] * len(MODEL_METRICS)) + " |")
-        else:
-            for row in rows:
-                rel = row.get("relative_changes", {})
-                rel = rel if isinstance(rel, dict) else {}
-
-                optimizer = str(row.get("optimizer", "")).upper()
-                baseline = str(row.get("baseline", ""))
-                treatment = str(row.get("treatment", ""))
-                deltas = [_safe_float(rel.get(spec["key"])) for spec in MODEL_METRICS]
-                md_deltas = [_format_pct(val) for val in deltas]
-
-                md_lines.append("| " + " | ".join([optimizer, baseline, treatment, *md_deltas]) + " |")
-                csv_rows.append([optimizer, baseline, treatment, *deltas])
-
+    md_lines = [f"# Pairwise latent-geometry deltas: {baseline} vs {treatment}", ""]
+    if sign:
+        md_lines.append("Sign convention for Δrel (positive means improvement):")
         md_lines.append("")
-        md_lines.append("Metric definitions and plotting conventions live in `docs/latent_geometry_plotting.md`.")
+        for metric in MODEL_METRICS:
+            msg = str(sign.get(metric["key"], "")).strip()
+            if msg:
+                md_lines.append(f"- {metric['title']} (`{metric['label']}`): {msg}")
         md_lines.append("")
 
-        md_path.write_text("\n".join(md_lines).rstrip() + "\n")
+    header = ["metric", "direction", "baseline", "treatment", "delta_abs", "delta_rel"]
+    md_lines.append("| " + " | ".join(header) + " |")
+    md_lines.append("| " + " | ".join(["---"] * len(header)) + " |")
 
-        with csv_path.open("w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerows(csv_rows)
+    csv_rows: list[list[Any]] = [header]
+    for row in rows:
+        delta_rel = _safe_float(row.get("signed_relative_delta"))
+        delta_abs = _safe_float(row.get("absolute_delta"))
+        md_lines.append(
+            "| "
+            + " | ".join(
+                [
+                    str(row.get("metric_title", row.get("metric_label", ""))),
+                    _format_direction(str(row.get("direction", ""))),
+                    _format_scalar(_safe_float(row.get("baseline_value"))),
+                    _format_scalar(_safe_float(row.get("treatment_value"))),
+                    _format_scalar(delta_abs),
+                    _format_pct(delta_rel),
+                ]
+            )
+            + " |"
+        )
+        csv_rows.append(
+            [
+                str(row.get("metric_label", "")),
+                str(row.get("direction", "")),
+                _safe_float(row.get("baseline_value")),
+                _safe_float(row.get("treatment_value")),
+                delta_abs,
+                delta_rel,
+            ]
+        )
+
+    (out_dir / "latent_geom_pair_delta_table.md").write_text("\n".join(md_lines).rstrip() + "\n")
+    with (out_dir / "latent_geom_pair_delta_table.csv").open("w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerows(csv_rows)
 
 
-def _write_summary_files(
+def _write_pair_summary_files(
     summaries: list[dict[str, Any]],
     *,
-    paired_effects: dict[str, Any],
+    pairwise: dict[str, Any],
     out_dir: Path,
     selection: dict[str, Any],
 ) -> None:
     payload = {
-        "schema_version": "latent_geom_model_summary_v4",
+        "schema_version": "latent_geom_pair_summary_v1",
         "selection": selection,
-        "paired_effects": paired_effects,
+        "pairwise": pairwise,
         "runs": summaries,
     }
-    (out_dir / "latent_geom_model_summary.json").write_text(json.dumps(payload, indent=2))
+    (out_dir / "latent_geom_pair_summary.json").write_text(json.dumps(payload, indent=2))
 
     columns = [
+        "run_role",
+        "run_label",
         "run_dir",
         "matrix_cell_id",
         "decoder_type",
         "optimizer",
         "loss_type",
         "scale",
+        "regularizer",
         "prior_flag",
         "track",
+        "latent_representation",
+        "transformer_latent_shape",
         "trace_g_mean_over_time",
         "trace_g_std_over_time",
         "effective_rank_mean_over_time",
@@ -455,10 +454,13 @@ def _write_summary_files(
             val = summary.get(col, "")
             if isinstance(val, bool):
                 values.append("1" if val else "0")
+                continue
+            if isinstance(val, list):
+                text = json.dumps(val)
             else:
                 text = str(val)
-                if "," in text:
-                    text = f"\"{text}\""
-                values.append(text)
+            if "," in text:
+                text = f"\"{text}\""
+            values.append(text)
         csv_lines.append(",".join(values))
-    (out_dir / "latent_geom_model_summary.csv").write_text("\n".join(csv_lines) + "\n")
+    (out_dir / "latent_geom_pair_summary.csv").write_text("\n".join(csv_lines) + "\n")

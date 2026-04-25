@@ -18,6 +18,7 @@ r_b ranges from 0 to r_max (a few estimated correlation lengths).
 
 from __future__ import annotations
 
+import math
 from typing import Dict, Optional, Tuple
 
 import numpy as np
@@ -131,6 +132,284 @@ def ensemble_directional_correlation(
         "all_e1": all_e1,
         "all_e2": all_e2,
     }
+
+
+# ============================================================================
+# Exact-query single-field pair-correlation
+# ============================================================================
+
+def _reshape_square_field(
+    field: NDArray[np.floating],
+    resolution: int,
+) -> NDArray[np.float64]:
+    arr = np.asarray(field, dtype=np.float64)
+    if arr.ndim == 2:
+        if arr.shape != (resolution, resolution):
+            raise ValueError(
+                f"2-D field must have shape {(resolution, resolution)}, got {arr.shape}."
+            )
+        return arr
+    if arr.ndim != 1 or arr.size != resolution * resolution:
+        raise ValueError(
+            f"Flat field must have size {resolution * resolution}, got shape {arr.shape}."
+        )
+    return arr.reshape(resolution, resolution)
+
+
+def _reshape_square_field_ensemble(
+    fields: NDArray[np.floating],
+    resolution: int,
+) -> NDArray[np.float64]:
+    arr = np.asarray(fields, dtype=np.float64)
+    if arr.ndim == 3:
+        if arr.shape[1:] != (resolution, resolution):
+            raise ValueError(
+                f"3-D field ensemble must have shape (K, {resolution}, {resolution}), got {arr.shape}."
+            )
+        return arr
+    if arr.ndim != 2 or arr.shape[1] != resolution * resolution:
+        raise ValueError(
+            f"Flat field ensemble must have shape (K, {resolution * resolution}), got {arr.shape}."
+        )
+    return arr.reshape(arr.shape[0], resolution, resolution)
+
+
+def _summed_linear_autocorrelation(signals: NDArray[np.float64]) -> NDArray[np.float64]:
+    """Sum non-negative linear autocorrelations over a batch of 1-D signals."""
+    batched = np.asarray(signals, dtype=np.float64)
+    if batched.ndim != 2:
+        raise ValueError(f"signals must have shape (batch, length), got {batched.shape}.")
+    n_points = int(batched.shape[1])
+    n_fft = 2 * n_points
+    spectrum = np.fft.rfft(batched, n=n_fft, axis=1)
+    power = np.real(spectrum * np.conj(spectrum))
+    acf = np.fft.irfft(power, n=n_fft, axis=1)[:, :n_points]
+    return np.sum(acf, axis=0, dtype=np.float64)
+
+
+def _pooled_paircorr_from_centered_lines(
+    centered: NDArray[np.float64],
+) -> NDArray[np.float64]:
+    """Pooled directional pair-correlation for centered fields along the last axis."""
+    if centered.ndim != 3:
+        raise ValueError(f"centered must have shape (K, n_lines, n_points), got {centered.shape}.")
+    n_points = int(centered.shape[-1])
+    numerator = _summed_linear_autocorrelation(centered.reshape(-1, n_points))
+    squared_by_point = np.sum(centered**2, axis=(0, 1), dtype=np.float64)
+    prefix = np.concatenate([np.asarray([0.0], dtype=np.float64), np.cumsum(squared_by_point, dtype=np.float64)])
+    lags = np.arange(n_points, dtype=np.int64)
+    left_var = prefix[n_points - lags]
+    right_var = prefix[n_points] - prefix[lags]
+    denom = np.sqrt(left_var * right_var)
+    curve = np.zeros((n_points,), dtype=np.float64)
+    valid = denom > 1e-30
+    curve[valid] = numerator[valid] / denom[valid]
+    return curve
+
+
+def rollout_ensemble_directional_paircorr(
+    fields: NDArray[np.floating],
+    resolution: int,
+) -> Dict[str, NDArray[np.float64] | int]:
+    """Rollout-only pooled ensemble pair-correlation without a full covariance matrix."""
+    ensemble = _reshape_square_field_ensemble(fields, int(resolution))
+    n_fields = int(ensemble.shape[0])
+    if n_fields < 2:
+        raise ValueError(
+            "Rollout ensemble pair-correlation requires at least two fields; "
+            f"got {n_fields}."
+        )
+
+    centered = ensemble - np.mean(ensemble, axis=0, keepdims=True)
+    horizontal = _pooled_paircorr_from_centered_lines(centered)
+    vertical = _pooled_paircorr_from_centered_lines(np.transpose(centered, (0, 2, 1)))
+    return {
+        "R_e1_mean": horizontal,
+        "R_e2_mean": vertical,
+        "lags_pixels": np.arange(int(resolution), dtype=np.int64),
+        "n_fields": n_fields,
+    }
+
+
+def rollout_ensemble_paircorr_bootstrap(
+    fields: NDArray[np.floating],
+    resolution: int,
+    *,
+    n_bootstrap: int,
+    seed: int,
+    max_lag_pixels: int | None = None,
+) -> Dict[str, NDArray[np.float64] | int]:
+    """Bootstrap pooled ensemble pair-correlation over the sample index."""
+    ensemble = _reshape_square_field_ensemble(fields, int(resolution))
+    n_fields = int(ensemble.shape[0])
+    if n_fields < 2:
+        raise ValueError(
+            "Rollout ensemble pair-correlation bootstrap requires at least two fields; "
+            f"got {n_fields}."
+        )
+    n_lags = int(resolution) if max_lag_pixels is None else max(1, min(int(resolution), int(max_lag_pixels)))
+    rng = np.random.default_rng(int(seed))
+    replicates_e1 = np.zeros((int(n_bootstrap), n_lags), dtype=np.float64)
+    replicates_e2 = np.zeros((int(n_bootstrap), n_lags), dtype=np.float64)
+    for idx in range(int(n_bootstrap)):
+        sampled_indices = rng.integers(0, n_fields, size=n_fields, endpoint=False)
+        summary = rollout_ensemble_directional_paircorr(ensemble[sampled_indices], int(resolution))
+        replicates_e1[idx] = np.asarray(summary["R_e1_mean"][:n_lags], dtype=np.float64)
+        replicates_e2[idx] = np.asarray(summary["R_e2_mean"][:n_lags], dtype=np.float64)
+
+    return {
+        "R_e1_lower": np.percentile(replicates_e1, 2.5, axis=0),
+        "R_e1_upper": np.percentile(replicates_e1, 97.5, axis=0),
+        "R_e1_se": (
+            np.std(replicates_e1, axis=0, ddof=1)
+            if int(n_bootstrap) > 1
+            else np.zeros((n_lags,), dtype=np.float64)
+        ),
+        "R_e2_lower": np.percentile(replicates_e2, 2.5, axis=0),
+        "R_e2_upper": np.percentile(replicates_e2, 97.5, axis=0),
+        "R_e2_se": (
+            np.std(replicates_e2, axis=0, ddof=1)
+            if int(n_bootstrap) > 1
+            else np.zeros((n_lags,), dtype=np.float64)
+        ),
+        "R_e1_replicates": replicates_e1,
+        "R_e2_replicates": replicates_e2,
+        "n_fields": n_fields,
+    }
+
+
+def overlap_corrected_line_correlation(
+    signal: NDArray[np.floating],
+    lag: int,
+) -> float:
+    """Overlap-corrected sample correlation for one 1-D line at a fixed lag."""
+    x = np.asarray(signal, dtype=np.float64).reshape(-1)
+    n = int(x.size)
+    if lag < 0 or lag >= n:
+        raise ValueError(f"lag must be in [0, {n - 1}], got {lag}.")
+    if lag == 0:
+        return 1.0
+
+    left = x[: n - lag]
+    right = x[lag:]
+    left_centered = left - np.mean(left)
+    right_centered = right - np.mean(right)
+    left_norm = float(np.linalg.norm(left_centered))
+    right_norm = float(np.linalg.norm(right_centered))
+    denom = left_norm * right_norm
+    if denom < 1e-30:
+        return 0.0
+    return float(np.dot(left_centered, right_centered) / denom)
+
+
+def exact_query_field_paircorr(
+    field: NDArray[np.floating],
+    resolution: int,
+) -> Dict[str, NDArray[np.float64]]:
+    """Directional single-field pair-correlation curves for the exact-query path."""
+    field_2d = _reshape_square_field(field, int(resolution))
+    res = int(resolution)
+    line_curves_e1 = np.zeros((res, res), dtype=np.float64)
+    line_curves_e2 = np.zeros((res, res), dtype=np.float64)
+
+    for row in range(res):
+        for lag in range(res):
+            line_curves_e1[row, lag] = overlap_corrected_line_correlation(field_2d[row, :], lag)
+    for col in range(res):
+        for lag in range(res):
+            line_curves_e2[col, lag] = overlap_corrected_line_correlation(field_2d[:, col], lag)
+
+    return {
+        "R_e1_mean": np.mean(line_curves_e1, axis=0),
+        "R_e2_mean": np.mean(line_curves_e2, axis=0),
+        "lags_pixels": np.arange(res, dtype=np.int64),
+        "line_curves_e1": line_curves_e1,
+        "line_curves_e2": line_curves_e2,
+    }
+
+
+def exact_query_generated_paircorr_summary(
+    fields: NDArray[np.floating],
+    resolution: int,
+) -> Dict[str, NDArray[np.float64]]:
+    """Compatibility wrapper for rollout generated curves on the pooled estimator."""
+    return rollout_ensemble_directional_paircorr(fields, resolution)
+
+
+def exact_query_line_block_length(
+    line_curves: NDArray[np.floating],
+    *,
+    max_lag_pixels: int | None = None,
+) -> int:
+    """Estimate the line-index dependence length for block resampling."""
+    curves = np.asarray(line_curves, dtype=np.float64)
+    if curves.ndim != 2:
+        raise ValueError(f"line_curves must have shape (n_lines, n_lags), got {curves.shape}.")
+    n_lines = int(curves.shape[0])
+    if n_lines <= 1:
+        return 1
+
+    lag_limit = int(curves.shape[1]) if max_lag_pixels is None else int(max_lag_pixels)
+    lag_limit = max(1, min(int(curves.shape[1]), lag_limit))
+    summary = np.mean(curves[:, :lag_limit], axis=1)
+    threshold = 1.0 / math.e
+    for lag in range(1, n_lines):
+        if overlap_corrected_line_correlation(summary, lag) <= threshold:
+            return lag
+    return max(1, int(math.ceil(math.sqrt(float(n_lines)))))
+
+
+def exact_query_paircorr_bootstrap_band(
+    line_curves: NDArray[np.floating],
+    *,
+    n_bootstrap: int,
+    seed: int,
+    block_length: int | None = None,
+    max_lag_pixels: int | None = None,
+) -> Dict[str, NDArray[np.float64] | int]:
+    """Moving-block bootstrap for mean line-curve estimators."""
+    curves = np.asarray(line_curves, dtype=np.float64)
+    if curves.ndim != 2:
+        raise ValueError(f"line_curves must have shape (n_lines, n_lags), got {curves.shape}.")
+    n_lines, n_lags = int(curves.shape[0]), int(curves.shape[1])
+    if n_lines == 0:
+        raise ValueError("line_curves must contain at least one line.")
+    if block_length is None:
+        block_length = exact_query_line_block_length(curves, max_lag_pixels=max_lag_pixels)
+    block_length = max(1, min(int(block_length), n_lines))
+    n_blocks = int(math.ceil(float(n_lines) / float(block_length)))
+    block_starts = np.arange(0, n_lines - block_length + 1, dtype=np.int64)
+    rng = np.random.default_rng(int(seed))
+    replicates = np.zeros((int(n_bootstrap), n_lags), dtype=np.float64)
+    for idx in range(int(n_bootstrap)):
+        sampled_starts = rng.choice(block_starts, size=n_blocks, replace=True)
+        sampled_indices = np.concatenate(
+            [
+                np.arange(int(start), int(start) + block_length, dtype=np.int64)
+                for start in sampled_starts
+            ]
+        )[:n_lines]
+        replicates[idx] = np.mean(curves[sampled_indices], axis=0)
+
+    return {
+        "lower": np.percentile(replicates, 2.5, axis=0),
+        "upper": np.percentile(replicates, 97.5, axis=0),
+        "se": np.std(replicates, axis=0, ddof=1) if int(n_bootstrap) > 1 else np.zeros(n_lags, dtype=np.float64),
+        "replicates": replicates,
+        "block_length": int(block_length),
+    }
+
+
+def exact_query_default_r_max_pixels(
+    R_obs_e1: NDArray[np.floating],
+    R_obs_e2: NDArray[np.floating],
+    resolution: int,
+) -> int:
+    """Default lag cutoff for exact-query pair-correlation mismatch."""
+    xi_e1 = float(correlation_lengths(np.asarray(R_obs_e1, dtype=np.float64), pixel_size=1.0)["xi_e"])
+    xi_e2 = float(correlation_lengths(np.asarray(R_obs_e2, dtype=np.float64), pixel_size=1.0)["xi_e"])
+    max_xi = max(xi_e1, xi_e2)
+    return max(4, min(int(resolution) // 2, int(math.ceil(3.0 * max_xi))))
 
 
 # ============================================================================

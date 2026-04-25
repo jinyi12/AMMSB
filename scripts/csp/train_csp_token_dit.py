@@ -22,6 +22,7 @@ from scripts.csp.train_utils import format_duration, resolve_log_every
 
 MODEL_TYPE = "conditional_bridge_token_dit"
 TRAINING_OBJECTIVE = "paired_conditional_bridge_matching"
+TOKEN_CONDITIONING = "set_conditioned_memory"
 
 
 def _parse_args() -> argparse.Namespace:
@@ -51,7 +52,7 @@ def _parse_args() -> argparse.Namespace:
         "--condition_mode",
         type=str,
         choices=("coarse_only", "previous_state", "global_and_previous"),
-        default="global_and_previous",
+        default="previous_state",
     )
     parser.add_argument("--endpoint_epsilon", type=float, default=1e-3)
     parser.add_argument("--sample_count", type=int, default=8)
@@ -92,6 +93,7 @@ def main() -> None:
         time_emb_dim=int(args.dit_time_emb_dim),
         num_intervals=archive.num_intervals,
         key=model_key,
+        conditioning_style=TOKEN_CONDITIONING,
     )
     sigma = float(args.sigma)
     sigma_fn = constant_sigma(sigma)
@@ -112,7 +114,7 @@ def main() -> None:
     print("  interval_sample : stratified equal-weight average over all intervals", flush=True)
     print("  time_param      : local interval time", flush=True)
     print("  interval_embed  : projected one-hot interval embedding", flush=True)
-    print("  architecture    : token-native DiT", flush=True)
+    print(f"  architecture    : token-native DiT ({TOKEN_CONDITIONING})", flush=True)
     print(f"  sigma           : {sigma:.6g}", flush=True)
     print(f"  endpoint_eps    : {float(args.endpoint_epsilon):.6g}", flush=True)
     print(f"  num_steps       : {args.num_steps}", flush=True)
@@ -191,6 +193,7 @@ def main() -> None:
             "training_signal": "exact_brownian_bridge_interior_state_regression",
             "transport_latent_format": "token_native",
             "token_shape": list(map(int, archive.token_shape)),
+            "token_conditioning": TOKEN_CONDITIONING,
         }
     )
     with (config_dir / "args.json").open("w", encoding="utf-8") as handle:

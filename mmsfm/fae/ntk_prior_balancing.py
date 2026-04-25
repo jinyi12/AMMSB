@@ -78,6 +78,93 @@ def estimate_trace_per_output(
     return jnp.where(jnp.isfinite(trace_per_output), trace_per_output, 0.0)
 
 
+def _resolve_prior_balance_observations(
+    *,
+    ntk_state,
+    recon_trace_per_output: jax.Array,
+    prior_trace_per_output: jax.Array,
+    is_trace_update,
+) -> tuple[jax.Array, jax.Array]:
+    """Return the latest observed traces, reusing the previous observation off-update."""
+
+    is_trace_update = jnp.asarray(is_trace_update, dtype=jnp.bool_)
+    recon_trace_candidate = jax.lax.stop_gradient(jnp.asarray(recon_trace_per_output))
+    prior_trace_candidate = jax.lax.stop_gradient(
+        jnp.asarray(prior_trace_per_output, dtype=recon_trace_candidate.dtype)
+    )
+
+    prev_recon_trace_obs = jnp.asarray(
+        ntk_state.get("recon_trace_obs", ntk_state.get("recon_trace", recon_trace_candidate)),
+        dtype=recon_trace_candidate.dtype,
+    )
+    prev_prior_trace_obs = jnp.asarray(
+        ntk_state.get("prior_trace_obs", ntk_state.get("prior_trace", prior_trace_candidate)),
+        dtype=prior_trace_candidate.dtype,
+    )
+
+    recon_trace_obs = jnp.where(is_trace_update, recon_trace_candidate, prev_recon_trace_obs)
+    prior_trace_obs = jnp.where(is_trace_update, prior_trace_candidate, prev_prior_trace_obs)
+    return recon_trace_obs, prior_trace_obs
+
+
+def _aggregate_prior_balance_traces_online_ema(
+    *,
+    ntk_state,
+    recon_trace_obs: jax.Array,
+    prior_trace_obs: jax.Array,
+    total_trace_ema_decay: float,
+    is_trace_update,
+) -> tuple[jax.Array, jax.Array]:
+    """Aggregate observed traces into a running online EMA."""
+
+    is_trace_update = jnp.asarray(is_trace_update, dtype=jnp.bool_)
+    prev_recon_trace_ema = jnp.asarray(
+        ntk_state.get("recon_trace_ema", recon_trace_obs),
+        dtype=recon_trace_obs.dtype,
+    )
+    prev_prior_trace_ema = jnp.asarray(
+        ntk_state.get("prior_trace_ema", prior_trace_obs),
+        dtype=prior_trace_obs.dtype,
+    )
+
+    recon_trace_ema_candidate = (
+        float(total_trace_ema_decay) * prev_recon_trace_ema
+        + (1.0 - float(total_trace_ema_decay)) * recon_trace_obs
+    )
+    prior_trace_ema_candidate = (
+        float(total_trace_ema_decay) * prev_prior_trace_ema
+        + (1.0 - float(total_trace_ema_decay)) * prior_trace_obs
+    )
+
+    recon_trace_ema = jnp.where(is_trace_update, recon_trace_ema_candidate, prev_recon_trace_ema)
+    prior_trace_ema = jnp.where(is_trace_update, prior_trace_ema_candidate, prev_prior_trace_ema)
+    return recon_trace_ema, prior_trace_ema
+
+
+def _compute_prior_balance_weights(
+    *,
+    recon_trace_agg: jax.Array,
+    prior_trace_agg: jax.Array,
+    epsilon: float,
+    prior_loss_weight: float,
+) -> dict[str, jax.Array]:
+    """Convert aggregated recon/prior traces into inverse-trace balance weights."""
+
+    shared_trace_total = recon_trace_agg + prior_trace_agg
+    numerator = 0.5 * shared_trace_total
+    eps = float(epsilon)
+    prior_loss_weight_arr = jnp.asarray(prior_loss_weight, dtype=numerator.dtype)
+    recon_weight = jax.lax.stop_gradient(numerator / (recon_trace_agg + eps))
+    prior_weight = jax.lax.stop_gradient(
+        prior_loss_weight_arr * numerator / (prior_trace_agg + eps)
+    )
+    return {
+        "shared_trace_total": shared_trace_total,
+        "recon_weight": recon_weight,
+        "prior_weight": prior_weight,
+    }
+
+
 def compute_prior_balance_state(
     *,
     ntk_state,
@@ -86,41 +173,37 @@ def compute_prior_balance_state(
     total_trace_ema_decay: float,
     epsilon: float,
     prior_loss_weight: float,
+    is_trace_update=True,
 ) -> dict[str, jax.Array]:
-    """Return EMA-smoothed recon/prior NTK weights and logged state."""
+    """Return observed traces, online-EMA aggregates, and aggregate-based weights."""
 
-    recon_trace_sg = jax.lax.stop_gradient(recon_trace_per_output)
-    prior_trace_sg = jax.lax.stop_gradient(prior_trace_per_output)
-
-    prev_recon_trace_ema = ntk_state.get("recon_trace_ema", recon_trace_sg)
-    prev_recon_trace_ema = jnp.asarray(prev_recon_trace_ema, dtype=recon_trace_sg.dtype)
-    recon_trace_ema = (
-        float(total_trace_ema_decay) * prev_recon_trace_ema
-        + (1.0 - float(total_trace_ema_decay)) * recon_trace_sg
+    recon_trace_obs, prior_trace_obs = _resolve_prior_balance_observations(
+        ntk_state=ntk_state,
+        recon_trace_per_output=recon_trace_per_output,
+        prior_trace_per_output=prior_trace_per_output,
+        is_trace_update=is_trace_update,
     )
-
-    prev_prior_trace_ema = ntk_state.get("prior_trace_ema", prior_trace_sg)
-    prev_prior_trace_ema = jnp.asarray(prev_prior_trace_ema, dtype=prior_trace_sg.dtype)
-    prior_trace_ema = (
-        float(total_trace_ema_decay) * prev_prior_trace_ema
-        + (1.0 - float(total_trace_ema_decay)) * prior_trace_sg
+    recon_trace_ema, prior_trace_ema = _aggregate_prior_balance_traces_online_ema(
+        ntk_state=ntk_state,
+        recon_trace_obs=recon_trace_obs,
+        prior_trace_obs=prior_trace_obs,
+        total_trace_ema_decay=total_trace_ema_decay,
+        is_trace_update=is_trace_update,
     )
-
-    shared_trace_total = recon_trace_ema + prior_trace_ema
-    numerator = 0.5 * shared_trace_total
-    eps = float(epsilon)
-    recon_weight = jax.lax.stop_gradient(numerator / (recon_trace_ema + eps))
-    prior_weight = jax.lax.stop_gradient(
-        float(prior_loss_weight) * numerator / (prior_trace_ema + eps)
+    weights = _compute_prior_balance_weights(
+        recon_trace_agg=recon_trace_ema,
+        prior_trace_agg=prior_trace_ema,
+        epsilon=epsilon,
+        prior_loss_weight=prior_loss_weight,
     )
     return {
-        "recon_trace": recon_trace_sg,
+        "recon_trace": recon_trace_obs,
+        "recon_trace_obs": recon_trace_obs,
         "recon_trace_ema": recon_trace_ema,
-        "prior_trace": prior_trace_sg,
+        "prior_trace": prior_trace_obs,
+        "prior_trace_obs": prior_trace_obs,
         "prior_trace_ema": prior_trace_ema,
-        "shared_trace_total": shared_trace_total,
-        "recon_weight": recon_weight,
-        "prior_weight": prior_weight,
+        **weights,
     }
 
 
@@ -134,29 +217,36 @@ def diagnostic_prior_balance_state(
 ) -> dict[str, jax.Array]:
     """Compute diagnostic recon/prior weights from current traces and saved EMAs."""
 
-    recon_trace = jnp.asarray(recon_trace_per_output)
-    prior_trace = jnp.asarray(prior_trace_per_output, dtype=recon_trace.dtype)
+    recon_trace_obs = jnp.asarray(recon_trace_per_output)
+    prior_trace_obs = jnp.asarray(prior_trace_per_output, dtype=recon_trace_obs.dtype)
     recon_trace_ema = jnp.asarray(
-        ntk_state.get("recon_trace_ema", recon_trace),
-        dtype=recon_trace.dtype,
+        ntk_state.get(
+            "recon_trace_ema",
+            ntk_state.get("recon_trace_obs", ntk_state.get("recon_trace", recon_trace_obs)),
+        ),
+        dtype=recon_trace_obs.dtype,
     )
     prior_trace_ema = jnp.asarray(
-        ntk_state.get("prior_trace_ema", prior_trace),
-        dtype=prior_trace.dtype,
+        ntk_state.get(
+            "prior_trace_ema",
+            ntk_state.get("prior_trace_obs", ntk_state.get("prior_trace", prior_trace_obs)),
+        ),
+        dtype=prior_trace_obs.dtype,
     )
-    shared_trace_total = recon_trace_ema + prior_trace_ema
-    numerator = 0.5 * shared_trace_total
-    eps = float(epsilon)
-    recon_weight = numerator / (recon_trace_ema + eps)
-    prior_weight = float(prior_loss_weight) * numerator / (prior_trace_ema + eps)
+    weights = _compute_prior_balance_weights(
+        recon_trace_agg=recon_trace_ema,
+        prior_trace_agg=prior_trace_ema,
+        epsilon=epsilon,
+        prior_loss_weight=prior_loss_weight,
+    )
     return {
-        "recon_trace": recon_trace,
-        "prior_trace": prior_trace,
+        "recon_trace": recon_trace_obs,
+        "recon_trace_obs": recon_trace_obs,
+        "prior_trace": prior_trace_obs,
+        "prior_trace_obs": prior_trace_obs,
         "recon_trace_ema": recon_trace_ema,
         "prior_trace_ema": prior_trace_ema,
-        "shared_trace_total": shared_trace_total,
-        "recon_weight": recon_weight,
-        "prior_weight": prior_weight,
+        **weights,
     }
 
 
@@ -457,12 +547,12 @@ def build_ntk_prior_balanced_loss_fn(
 
         recon_trace_default = jnp.asarray(1.0, dtype=u_pred.dtype)
         prior_trace_default = jnp.asarray(1.0, dtype=latents.dtype)
-        prev_recon_trace = jnp.asarray(
-            ntk_state.get("recon_trace", recon_trace_default),
+        prev_recon_trace_obs = jnp.asarray(
+            ntk_state.get("recon_trace_obs", ntk_state.get("recon_trace", recon_trace_default)),
             dtype=u_pred.dtype,
         )
-        prev_prior_trace = jnp.asarray(
-            ntk_state.get("prior_trace", prior_trace_default),
+        prev_prior_trace_obs = jnp.asarray(
+            ntk_state.get("prior_trace_obs", ntk_state.get("prior_trace", prior_trace_default)),
             dtype=latents.dtype,
         )
 
@@ -488,7 +578,7 @@ def build_ntk_prior_balanced_loss_fn(
             )
 
         def frozen_branch(_):
-            return prev_recon_trace, prev_prior_trace
+            return prev_recon_trace_obs, prev_prior_trace_obs
 
         recon_trace_per_output, prior_trace_per_output = jax.lax.cond(
             is_trace_update,
@@ -503,6 +593,7 @@ def build_ntk_prior_balanced_loss_fn(
             total_trace_ema_decay=total_trace_ema_decay,
             epsilon=epsilon,
             prior_loss_weight=prior_weight,
+            is_trace_update=is_trace_update,
         )
         total_loss = (
             balance_state["recon_weight"] * recon_loss
@@ -553,11 +644,19 @@ class PriorBalanceDiagnosticMetric(Metric):
 
     def __call__(self, state, key, test_dataloader):
         recon_trace_sum = 0.0
+        recon_trace_obs_sum = 0.0
+        recon_trace_ema_sum = 0.0
         prior_trace_sum = 0.0
+        prior_trace_obs_sum = 0.0
+        prior_trace_ema_sum = 0.0
         recon_weight_sum = 0.0
+        recon_weight_ema_sum = 0.0
         prior_weight_sum = 0.0
+        prior_weight_ema_sum = 0.0
         shared_trace_total_sum = 0.0
+        shared_trace_total_ema_sum = 0.0
         trace_ratio_sum = 0.0
+        trace_ratio_ema_sum = 0.0
         mse_sum = 0.0
         n_seen = 0
 
@@ -579,12 +678,22 @@ class PriorBalanceDiagnosticMetric(Metric):
             )
 
             recon_trace_sum += float(diag["recon_trace"])
+            recon_trace_obs_sum += float(diag["recon_trace_obs"])
+            recon_trace_ema_sum += float(diag["recon_trace_ema"])
             prior_trace_sum += float(diag["prior_trace"])
+            prior_trace_obs_sum += float(diag["prior_trace_obs"])
+            prior_trace_ema_sum += float(diag["prior_trace_ema"])
             recon_weight_sum += float(diag["recon_weight"])
+            recon_weight_ema_sum += float(diag["recon_weight"])
             prior_weight_sum += float(diag["prior_weight"])
+            prior_weight_ema_sum += float(diag["prior_weight"])
             shared_trace_total_sum += float(diag["shared_trace_total"])
+            shared_trace_total_ema_sum += float(diag["shared_trace_total"])
             trace_ratio_sum += float(
                 diag["prior_trace"] / jnp.maximum(diag["recon_trace"], jnp.asarray(1e-12))
+            )
+            trace_ratio_ema_sum += float(
+                diag["prior_trace_ema"] / jnp.maximum(diag["recon_trace_ema"], jnp.asarray(1e-12))
             )
             mse_sum += float(mse)
             n_seen += 1
@@ -592,11 +701,19 @@ class PriorBalanceDiagnosticMetric(Metric):
         denom = max(n_seen, 1)
         return {
             "ntk_recon_trace": recon_trace_sum / denom,
+            "ntk_recon_trace_obs": recon_trace_obs_sum / denom,
+            "ntk_recon_trace_ema": recon_trace_ema_sum / denom,
             "ntk_prior_trace": prior_trace_sum / denom,
+            "ntk_prior_trace_obs": prior_trace_obs_sum / denom,
+            "ntk_prior_trace_ema": prior_trace_ema_sum / denom,
             "ntk_recon_weight": recon_weight_sum / denom,
+            "ntk_recon_weight_ema": recon_weight_ema_sum / denom,
             "ntk_prior_weight": prior_weight_sum / denom,
+            "ntk_prior_weight_ema": prior_weight_ema_sum / denom,
             "ntk_shared_trace_total": shared_trace_total_sum / denom,
+            "ntk_shared_trace_total_ema": shared_trace_total_ema_sum / denom,
             "ntk_trace_ratio": trace_ratio_sum / denom,
+            "ntk_trace_ratio_ema": trace_ratio_ema_sum / denom,
             "mse": mse_sum / denom,
         }
 

@@ -308,7 +308,7 @@ def main() -> None:
 
     # Tran-inclusion specific metadata
     parser.add_argument("--tran-D-large", type=float, default=None, help="Large inclusion diameter")
-    parser.add_argument("--tran-H-meso-list", type=str, default="", help="Mesoscale filter sizes (e.g., 1D,1.25D,1.5D,2D,2.5D,3D)")
+    parser.add_argument("--tran-H-meso-list", type=str, default="", help="Mesoscale filter sizes (e.g., 1D,1.25D,1.5D,2D,2.5D,3D,4D)")
     parser.add_argument("--tran-inclusion-value", type=float, default=None, help="Inclusion conductivity value")
     parser.add_argument("--tran-vol-frac-large", type=float, default=None, help="Volume fraction of large inclusions")
     parser.add_argument("--tran-vol-frac-small", type=float, default=None, help="Volume fraction of small inclusions")

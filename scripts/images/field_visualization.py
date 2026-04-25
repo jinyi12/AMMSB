@@ -18,6 +18,14 @@ except ImportError:  # pragma: no cover - optional dependency
 
 __all__ = [
     "format_for_paper",
+    "math_correlation_axis_label",
+    "math_density_axis_label",
+    "math_lag_axis_label",
+    "math_pc_axis_label",
+    "math_quantile_axis_label",
+    "publication_figure_width",
+    "publication_grid_figure_size",
+    "publication_style_tokens",
     "reconstruct_fields_from_coefficients",
     "plot_field_snapshots",
     "plot_field_evolution_gif",
@@ -38,6 +46,27 @@ __all__ = [
 
 _NUMERIC_EPS = 1e-12
 BAMAKO_CMAP = plt.get_cmap("cividis")
+_MM_PER_INCH = 25.4
+_PUBLICATION_SINGLE_COLUMN_MM = 90.0
+_PUBLICATION_DOUBLE_COLUMN_MM = 180.0
+_PUBLICATION_STYLE_TOKENS: dict[str, float] = {
+    "font_base": 7.0,
+    "font_title": 7.6,
+    "font_label": 7.0,
+    "font_legend": 6.25,
+    "font_legend_title": 6.25,
+    "font_tick": 6.25,
+    "font_annotation": 6.25,
+    "font_colorbar": 7.0,
+    "font_panel_label": 8.0,
+    "line_width": 0.9,
+    "line_width_emphasis": 1.2,
+    "marker_area": 9.0,
+    "marker_area_small": 6.5,
+    "marker_area_dense": 3.0,
+    "colorbar_fraction": 0.038,
+    "colorbar_pad": 0.024,
+}
 
 
 # =============================================================================
@@ -55,8 +84,95 @@ EASTERN_HUES: list[str] = [
 ]
 
 
+def _mm_to_in(mm: float) -> float:
+    return float(mm) / _MM_PER_INCH
+
+
+def publication_style_tokens() -> dict[str, float]:
+    """Return the shared publication sizing scale for repo plots."""
+    return dict(_PUBLICATION_STYLE_TOKENS)
+
+
+def publication_figure_width(column_span: int = 1, *, fraction: float = 1.0) -> float:
+    """Return a print-oriented figure width in inches.
+
+    The widths follow common journal page geometry:
+    single column = 90 mm, double column = 180 mm.
+    """
+    span = int(column_span)
+    if span not in (1, 2):
+        raise ValueError(f"column_span must be 1 or 2, got {column_span}.")
+    base_mm = _PUBLICATION_DOUBLE_COLUMN_MM if span == 2 else _PUBLICATION_SINGLE_COLUMN_MM
+    return _mm_to_in(base_mm) * float(fraction)
+
+
+def publication_grid_figure_size(
+    n_cols: int,
+    n_rows: int,
+    *,
+    column_span: int = 1,
+    width_fraction: float = 1.0,
+    panel_height_in: float = 1.85,
+    extra_height_in: float = 0.0,
+    min_panel_width_in: float = 1.45,
+    max_width_in: float | None = None,
+) -> tuple[float, float]:
+    """Return a compact figure size for a panel grid at print scale."""
+    cols = int(n_cols)
+    rows = int(n_rows)
+    if cols <= 0 or rows <= 0:
+        raise ValueError(f"n_cols and n_rows must be positive, got {n_cols}, {n_rows}.")
+
+    width = max(
+        publication_figure_width(int(column_span), fraction=float(width_fraction)),
+        float(min_panel_width_in) * cols,
+    )
+    if max_width_in is not None:
+        width = min(width, float(max_width_in))
+    height = float(panel_height_in) * rows + float(extra_height_in)
+    return float(width), float(height)
+
+
+def math_pc_axis_label(axis_index: int, *, context: str | None = None) -> str:
+    """Return a principal-coordinate label with consistent math notation."""
+    base = rf"$\mathrm{{PC}}_{int(axis_index)}$"
+    if context in (None, ""):
+        return base
+    return f"{str(context).strip()} {base}"
+
+
+def math_density_axis_label(variable_tex: str) -> str:
+    """Return a one-point probability-density axis label."""
+    return rf"$p({variable_tex})$"
+
+
+def math_quantile_axis_label(role: str) -> str:
+    """Return an empirical quantile label for QQ plots."""
+    token = str(role).strip().lower()
+    tag = {
+        "obs": "obs",
+        "observed": "obs",
+        "ref": "ref",
+        "reference": "ref",
+        "gen": "gen",
+        "generated": "gen",
+    }.get(token, token or "obs")
+    return rf"$Q_{{\mathrm{{{tag}}}}}(p)$"
+
+
+def math_lag_axis_label(*, normalizer_tex: str = "D") -> str:
+    """Return a normalized lag axis label."""
+    return rf"$\tau / {normalizer_tex}$"
+
+
+def math_correlation_axis_label(*, symbol_tex: str = "R") -> str:
+    """Return a correlation-function axis label."""
+    return rf"${symbol_tex}(\tau)$"
+
+
 def format_for_paper() -> None:
     """Apply publication-style defaults for matplotlib figures."""
+    style = publication_style_tokens()
     plt.rcParams.update({"image.cmap": getattr(BAMAKO_CMAP, "name", "cividis")})
     plt.rcParams.update(
         {
@@ -79,11 +195,27 @@ def format_for_paper() -> None:
         }
     )
     plt.rcParams.update({"font.family": "serif"})
-    plt.rcParams.update({"font.size": 10})
+    plt.rcParams.update({"font.size": style["font_base"]})
+    plt.rcParams.update({"axes.titlesize": style["font_title"]})
+    plt.rcParams.update({"axes.labelsize": style["font_label"]})
+    plt.rcParams.update({"xtick.labelsize": style["font_tick"]})
+    plt.rcParams.update({"ytick.labelsize": style["font_tick"]})
+    plt.rcParams.update({"legend.fontsize": style["font_legend"]})
+    plt.rcParams.update({"legend.title_fontsize": style["font_legend_title"]})
+    plt.rcParams.update({"figure.titlesize": style["font_panel_label"]})
     plt.rcParams.update({"mathtext.fontset": "custom"})
     plt.rcParams.update({"mathtext.rm": "serif"})
     plt.rcParams.update({"mathtext.it": "serif:italic"})
     plt.rcParams.update({"mathtext.bf": "serif:bold"})
+    plt.rcParams.update({"axes.linewidth": 0.8})
+    plt.rcParams.update({"lines.linewidth": style["line_width"]})
+    plt.rcParams.update({"patch.linewidth": 0.7})
+    plt.rcParams.update({"grid.linewidth": 0.6})
+    plt.rcParams.update({"grid.alpha": 0.18})
+    plt.rcParams.update({"legend.frameon": False})
+    plt.rcParams.update({"pdf.fonttype": 42})
+    plt.rcParams.update({"ps.fonttype": 42})
+    plt.rcParams.update({"svg.fonttype": "none"})
     try:
         from cycler import cycler
 

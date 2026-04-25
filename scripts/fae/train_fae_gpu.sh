@@ -12,7 +12,7 @@ python scripts/fae/train_fae.py \
   --L-domain 6.0 \
   --scale-mode log_standardize \
   --tran-D-large 1.0 \
-  --tran-H-meso-list "1D,1.25D,1.5D,2D,2.5D,3D" \
+  --tran-H-meso-list "1D,1.25D,1.5D,2D,2.5D,3D,4D" \
   --tran-inclusion-value 1000 \
   --tran-vol-frac-large 0.2 \
   --tran-vol-frac-small 0.1 \

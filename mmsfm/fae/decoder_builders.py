@@ -89,18 +89,14 @@ def build_transformer_decoder(
     out_dim: int,
     features: tuple[int, ...],
     positional_encoding: PositionalEncoding,
+    *,
     transformer_emb_dim: int = 256,
-    transformer_num_latents: int = 16,
     transformer_decoder_depth: int = 4,
     transformer_num_heads: int = 8,
     transformer_mlp_ratio: int = 2,
     transformer_layer_norm_eps: float = 1e-5,
-    transformer_tokenization: str = "patches",
-    transformer_patch_size: int = 8,
-    transformer_grid_size: tuple[int, int] | None = None,
-) -> TransformerCrossAttentionDecoder:
+) -> Decoder:
     """Build a coordinate-query transformer decoder inspired by FunDiff."""
-    del transformer_num_latents, transformer_tokenization, transformer_patch_size, transformer_grid_size
     return TransformerCrossAttentionDecoder(
         out_dim=out_dim,
         features=features,
@@ -127,14 +123,10 @@ def build_decoder(
     wire_layers: int = 2,
     film_norm_type: str = "layernorm",
     transformer_emb_dim: int = 256,
-    transformer_num_latents: int = 16,
     transformer_decoder_depth: int = 4,
     transformer_num_heads: int = 8,
     transformer_mlp_ratio: int = 2,
     transformer_layer_norm_eps: float = 1e-5,
-    transformer_tokenization: str = "patches",
-    transformer_patch_size: int = 8,
-    transformer_grid_size: tuple[int, int] | None = None,
 ) -> tuple[object, dict]:
     """Build decoder based on type.
 
@@ -187,18 +179,13 @@ def build_decoder(
             features=features,
             positional_encoding=positional_encoding,
             transformer_emb_dim=transformer_emb_dim,
-            transformer_num_latents=transformer_num_latents,
             transformer_decoder_depth=transformer_decoder_depth,
             transformer_num_heads=transformer_num_heads,
             transformer_mlp_ratio=transformer_mlp_ratio,
             transformer_layer_norm_eps=transformer_layer_norm_eps,
-            transformer_tokenization=transformer_tokenization,
-            transformer_patch_size=transformer_patch_size,
-            transformer_grid_size=transformer_grid_size,
         )
         config = {
             "transformer_emb_dim": transformer_emb_dim,
-            "transformer_num_latents": transformer_num_latents,
             "transformer_decoder_depth": transformer_decoder_depth,
             "transformer_num_heads": transformer_num_heads,
             "transformer_mlp_ratio": transformer_mlp_ratio,

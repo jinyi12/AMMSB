@@ -1,0 +1,45 @@
+Token-Native CSP Latent Conditional Evaluation
+==================================================
+conditional_eval_mode: chatterjee_knn
+k_neighbors: 200
+n_test_samples: 50
+n_ecmmd_conditions: 50
+n_realizations: 200
+n_corpus: 50000
+ecmmd_k_values_requested: [20]
+ecmmd_bootstrap_reps: 64
+adaptive_metric_dim_cap: 24
+adaptive_reference_bootstrap_reps: 64
+adaptive_ess_min: 32
+
+pair_H1p5_to_H1: H=1.5 -> H=1 (modeled marginal 2/5 -> 1/5, dataset idx 3 -> 1)
+                 latent W1 = 5.0893 +/- 0.0510 (median=5.1041, range=[4.9845, 5.1901])
+                 latent W2 = 5.0910 +/- 0.0510 (median=5.1060, range=[4.9863, 5.1919])
+                 latent W1 null = 5.3414 +/- 0.0279 (skill=+0.0472)
+                 latent W2 null = 5.3583 +/- 0.0185 (skill=+0.0499)
+                 latent ECMMD bandwidth = 6.0856
+                 latent ECMMD K=20 (req=20): single=9.1610e-04, z=12.102, p=1.03e-33, p_boot=0.0154; D_n=8.8609e-04, z=15.353, p=3.39e-53, p_boot=0.0154
+
+pair_H2_to_H1p5: H=2 -> H=1.5 (modeled marginal 3/5 -> 2/5, dataset idx 4 -> 3)
+                 latent W1 = 4.3001 +/- 0.0446 (median=4.3002, range=[4.2045, 4.4309])
+                 latent W2 = 4.3025 +/- 0.0446 (median=4.3020, range=[4.2069, 4.4331])
+                 latent W1 null = 4.5672 +/- 0.0257 (skill=+0.0585)
+                 latent W2 null = 4.5827 +/- 0.0192 (skill=+0.0612)
+                 latent ECMMD bandwidth = 5.3595
+                 latent ECMMD K=20 (req=20): single=8.7875e-04, z=16.349, p=4.43e-60, p_boot=0.0308; D_n=9.1598e-04, z=19.297, p=5.67e-83, p_boot=0.0154
+
+pair_H3_to_H2: H=3 -> H=2 (modeled marginal 4/5 -> 3/5, dataset idx 6 -> 4)
+               latent W1 = 3.5813 +/- 0.0674 (median=3.5784, range=[3.4348, 3.7224])
+               latent W2 = 3.5855 +/- 0.0675 (median=3.5823, range=[3.4399, 3.7274])
+               latent W1 null = 3.9211 +/- 0.0361 (skill=+0.0867)
+               latent W2 null = 3.9378 +/- 0.0348 (skill=+0.0895)
+               latent ECMMD bandwidth = 4.6835
+               latent ECMMD K=20 (req=20): single=2.0857e-03, z=12.925, p=3.26e-38, p_boot=0.215; D_n=2.1869e-03, z=17.347, p=2.07e-67, p_boot=0.0154
+
+pair_H6_to_H3: H=6 -> H=3 (modeled marginal 5/5 -> 4/5, dataset idx 7 -> 6)
+               latent W1 = 2.4412 +/- 0.0764 (median=2.4351, range=[2.2583, 2.5991])
+               latent W2 = 2.4502 +/- 0.0771 (median=2.4447, range=[2.2661, 2.6088])
+               latent W1 null = 2.8814 +/- 0.0890 (skill=+0.1528)
+               latent W2 null = 2.9066 +/- 0.0923 (skill=+0.1570)
+               latent ECMMD bandwidth = 3.4056
+               latent ECMMD K=20 (req=20): single=3.1908e-02, z=20.625, p=1.63e-94, p_boot=0.0154; D_n=3.2149e-02, z=21.004, p=6.01e-98, p_boot=0.0154

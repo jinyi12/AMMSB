@@ -5,9 +5,15 @@ This document centralizes the **metric definitions** and **plot styling conventi
 Relevant code:
 
 - Per-run evaluation plots: `scripts/fae/tran_evaluation/report.py`
-- Cross-model comparison plots + effect tables: `scripts/fae/tran_evaluation/compare_latent_geometry_models.py`
+- Pairwise comparison plots + delta tables: `scripts/fae/tran_evaluation/compare_latent_geometry_models.py`
 - Metric computation: `scripts/fae/tran_evaluation/latent_geometry.py`
 - Latent scatter diagnostics: `scripts/fae/tran_evaluation/visualize_autoencoder_latent_space.py`
+
+The maintained comparison surface is the canonical transformer pair selected by
+default in `scripts/fae/tran_evaluation/compare_latent_geometry_models.py` and
+documented in `docs/experiments/transformer_pair_geometry.md`. The companion
+CSV is a provenance record only. Historical publication-era latent128 chain
+plots and effect tables are not the active workflow.
 
 ## 1. Notation
 
@@ -140,8 +146,9 @@ Conventions used in this repo:
 
 ### 4.2 Cross-model comparisons
 
-- Model-metric bar plots: color encodes the **configuration** (loss/prior/scale/decoder), shared across optimizers; optimizer category is a hatch (ADAM = none, MUON = `//`).
-- Canonical chain plots: color encodes the **stage** (L2/NTK/NTK+Prior), shared across optimizers; optimizer category is a linestyle (ADAM = solid, MUON = dashed).
+- Pairwise bar plots: one bar per run role, baseline in `C_GEN` red and treatment in `C_OBS` steel blue.
+- Time-resolved pairwise plots: y-axis is signed relative change versus baseline, so positive values always mean improvement under the maintained metric direction convention.
+- Maintained outputs are `latent_geom_pair_metric_*.{png,pdf}` and `latent_geom_pair_time_delta_*.{png,pdf}`.
 
 ### 4.3 Per-run latent-geometry plots
 
@@ -155,4 +162,5 @@ Conventions used in this repo:
 Sequential time-ordered latent scatter plots and publication field-image panels use `cmaps.bamako` from `import colormaps as cmaps`.
 
 - This replaces the older `viridis` default.
-- The latent-128 publication execution flow is documented in [docs/publication_latent128_msbm_execution.md](publication_latent128_msbm_execution.md).
+- The maintained transformer-pair execution flow is documented in [docs/experiments/transformer_pair_geometry.md](experiments/transformer_pair_geometry.md).
+- The latent-128 publication execution flow is historical and documented in [docs/publication_latent128_msbm_execution.md](publication_latent128_msbm_execution.md).

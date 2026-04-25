@@ -17,6 +17,8 @@ from functional_autoencoders.positional_encodings import (
     PositionalEncoding,
 )
 
+_XAVIER_UNIFORM = nn.initializers.xavier_uniform()
+
 
 def _normalize_patch_size(patch_size: int | Sequence[int]) -> tuple[int, int]:
     if isinstance(patch_size, int):
@@ -287,12 +289,18 @@ def _get_2d_sincos_pos_embed(
         raise ValueError("2D sinusoidal embeddings require an even embed_dim.")
 
     grid_h, grid_w = int(grid_size[0]), int(grid_size[1])
-    yy = jnp.arange(grid_h, dtype=jnp.float32)
-    xx = jnp.arange(grid_w, dtype=jnp.float32)
-    grid_y, grid_x = jnp.meshgrid(yy, xx, indexing="ij")
-    emb_y = _get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid_y.reshape(-1))
-    emb_x = _get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid_x.reshape(-1))
-    return jnp.concatenate([emb_y, emb_x], axis=1)[None, :, :]
+    y_positions = jnp.arange(grid_h, dtype=jnp.float32)
+    x_positions = jnp.arange(grid_w, dtype=jnp.float32)
+
+    # Match the original fundiff MAE-style embedding layout, including the
+    # axis ordering that matters for rectangular grids.
+    grid = jnp.meshgrid(x_positions, y_positions, indexing="ij")
+    grid = jnp.stack(grid, axis=0)
+    grid = jnp.reshape(grid, (2, 1, grid_h, grid_w))
+
+    emb_h = _get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[0])
+    emb_w = _get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[1])
+    return jnp.concatenate([emb_h, emb_w], axis=1)[None, :, :]
 
 
 class _PatchEmbed(nn.Module):
@@ -307,6 +315,7 @@ class _PatchEmbed(nn.Module):
             self.emb_dim,
             kernel_size=(patch_h, patch_w),
             strides=(patch_h, patch_w),
+            kernel_init=_XAVIER_UNIFORM,
             name="proj",
         )(inputs)
         x = jnp.reshape(x, (x.shape[0], -1, self.emb_dim))
@@ -321,9 +330,9 @@ class _MlpBlock(nn.Module):
 
     @nn.compact
     def __call__(self, inputs: jnp.ndarray) -> jnp.ndarray:
-        x = nn.Dense(self.hidden_dim)(inputs)
+        x = nn.Dense(self.hidden_dim, kernel_init=_XAVIER_UNIFORM)(inputs)
         x = nn.gelu(x)
-        x = nn.Dense(self.out_dim)(x)
+        x = nn.Dense(self.out_dim, kernel_init=_XAVIER_UNIFORM)(x)
         return x
 
 
@@ -386,11 +395,15 @@ class _PointTokenEncoder(nn.Module):
     def __call__(self, u: jnp.ndarray, x: jnp.ndarray) -> jnp.ndarray:
         x_pos = self.positional_encoding(x)
         tokens = jnp.concatenate([u, x_pos], axis=-1)
-        tokens = nn.Dense(self.emb_dim, name="token_proj")(tokens)
+        tokens = nn.Dense(
+            self.emb_dim,
+            kernel_init=_XAVIER_UNIFORM,
+            name="token_proj",
+        )(tokens)
 
         latent_tokens = self.param(
             "latent_tokens",
-            nn.initializers.normal(stddev=0.02),
+            nn.initializers.normal(),
             (self.num_latents, self.emb_dim),
         )
         latents = jnp.broadcast_to(
@@ -479,7 +492,7 @@ class _PatchTokenEncoder(nn.Module):
 
         latent_tokens = self.param(
             "latent_tokens",
-            nn.initializers.normal(stddev=0.02),
+            nn.initializers.normal(),
             (self.num_latents, self.emb_dim),
         )
         latents = jnp.broadcast_to(
@@ -568,7 +581,6 @@ class TransformerLatentEncoder(Encoder):
             name="point_encoder",
         )(u, x)
 
-
 class _CoordinateQueryReadout(nn.Module):
     out_dim: int
     features: Sequence[int]
@@ -577,7 +589,11 @@ class _CoordinateQueryReadout(nn.Module):
     def __call__(self, inputs: jnp.ndarray) -> jnp.ndarray:
         x = inputs
         for i, width in enumerate(self.features):
-            x = nn.Dense(int(width), name=f"mlp_{i}")(x)
+            x = nn.Dense(
+                int(width),
+                kernel_init=_XAVIER_UNIFORM,
+                name=f"mlp_{i}",
+            )(x)
             x = nn.gelu(x)
         return nn.Dense(self.out_dim, name="readout")(x)
 
@@ -611,8 +627,35 @@ class _PointTokenDecoder(nn.Module):
             )
 
         x_pos = self.positional_encoding(x)
+        return _CoordinateQueryDecoder(
+            out_dim=self.out_dim,
+            features=self.features,
+            emb_dim=self.emb_dim,
+            depth=self.depth,
+            num_heads=self.num_heads,
+            mlp_ratio=self.mlp_ratio,
+            layer_norm_eps=self.layer_norm_eps,
+            name="decoder_core",
+        )(x_pos, z)
+
+
+class _CoordinateQueryDecoder(nn.Module):
+    out_dim: int
+    features: Sequence[int]
+    emb_dim: int
+    depth: int
+    num_heads: int
+    mlp_ratio: int
+    layer_norm_eps: float
+
+    @nn.compact
+    def __call__(
+        self,
+        x_pos: jnp.ndarray,
+        memory_tokens: jnp.ndarray,
+    ) -> jnp.ndarray:
         queries = nn.Dense(self.emb_dim, name="query_proj")(x_pos)
-        memory = nn.Dense(self.emb_dim, name="memory_proj")(z)
+        memory = nn.Dense(self.emb_dim, name="memory_proj")(memory_tokens)
 
         for i in range(self.depth):
             queries = _CrossAttentionBlock(

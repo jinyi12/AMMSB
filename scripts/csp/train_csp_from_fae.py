@@ -80,7 +80,7 @@ def _parse_args() -> argparse.Namespace:
         "--condition_mode",
         type=str,
         choices=("coarse_only", "previous_state", "global_and_previous"),
-        default="global_and_previous",
+        default="previous_state",
     )
     parser.add_argument("--endpoint_epsilon", type=float, default=1e-3)
     parser.add_argument("--sample_count", type=int, default=16)

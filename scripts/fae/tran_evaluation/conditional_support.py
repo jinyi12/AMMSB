@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from math import isqrt
 from typing import Any, Literal, cast
 
 import numpy as np
@@ -32,6 +33,14 @@ class AdaptiveReferenceConfig:
     bootstrap_reps: int = 64
     mean_rse_tol: float = 0.10
     eig_rse_tol: float = 0.15
+
+
+def minimal_adaptive_ess_target(n_conditions: int) -> int:
+    """Minimal ESS rule: floor(sqrt(n)) clipped to [8, 32]."""
+    n = int(n_conditions)
+    if n <= 0:
+        raise ValueError(f"n_conditions must be positive, got {n_conditions!r}.")
+    return int(min(32, max(8, isqrt(n))))
 
 
 def validate_conditional_eval_mode(condition_mode: str | None) -> ConditionEvalMode:
@@ -122,6 +131,73 @@ def wasserstein1_wasserstein2_latents(
         sw1 /= float(n_proj)
         sw2_sq /= float(n_proj)
         return float(max(sw1, 0.0)), float(np.sqrt(max(sw2_sq, 0.0)))
+
+
+def wasserstein2_latents(
+    samples_a: np.ndarray,
+    samples_b: np.ndarray,
+    weights_a: np.ndarray | None = None,
+    weights_b: np.ndarray | None = None,
+) -> float:
+    """Compute latent-space W2, preferring the GPU GeomLoss Sinkhorn proxy when available."""
+    a = np.asarray(samples_a, dtype=np.float64)
+    b = np.asarray(samples_b, dtype=np.float64)
+    wa = normalise_weights(weights_a, len(a))
+    wb = normalise_weights(weights_b, len(b))
+
+    try:
+        import torch
+        from geomloss import SamplesLoss
+
+        if torch.cuda.is_available():
+            device = torch.device("cuda")
+            a_t = torch.as_tensor(a, dtype=torch.float32, device=device)
+            b_t = torch.as_tensor(b, dtype=torch.float32, device=device)
+            wa_t = torch.as_tensor(wa, dtype=torch.float32, device=device)
+            wb_t = torch.as_tensor(wb, dtype=torch.float32, device=device)
+
+            pooled = np.concatenate([a, b], axis=0)
+            pooled_scale = float(np.sqrt(max(np.mean(np.var(pooled, axis=0)), 0.0)))
+            blur = max(1e-3, 0.05 * pooled_scale)
+
+            sinkhorn = SamplesLoss(
+                loss="sinkhorn",
+                p=2,
+                blur=blur,
+                backend="tensorized",
+                debias=False,
+            )
+            # GeomLoss uses the ground cost 0.5 * ||x-y||^2 for p=2.
+            sinkhorn_cost = float(sinkhorn(wa_t, a_t, wb_t, b_t).detach().cpu())
+            return float(np.sqrt(max(2.0 * sinkhorn_cost, 0.0)))
+    except ImportError:
+        pass
+
+    try:
+        import ot
+
+        m2 = cdist(a, b, metric="sqeuclidean").astype(np.float64)
+        w2_sq = ot.emd2(wa, wb, m2)
+        return float(np.sqrt(max(w2_sq, 0.0)))
+
+    except ImportError:
+        n_proj = 128
+        grid = (np.arange(512, dtype=np.float64) + 0.5) / 512.0
+        rng = np.random.default_rng(0)
+        dim = int(a.shape[1])
+        directions = rng.standard_normal((n_proj, dim))
+        directions /= np.linalg.norm(directions, axis=1, keepdims=True)
+
+        sw2_sq = 0.0
+        for direction in directions:
+            proj_a = a @ direction
+            proj_b = b @ direction
+            qa = weighted_projection_quantiles(proj_a, wa, grid)
+            qb = weighted_projection_quantiles(proj_b, wb, grid)
+            sw2_sq += float(np.mean((qa - qb) ** 2))
+
+        sw2_sq /= float(n_proj)
+        return float(np.sqrt(max(sw2_sq, 0.0)))
 
 
 def parse_float_list_arg(value: str) -> list[float]:
@@ -648,6 +724,28 @@ def pack_reference_support_arrays(
         packed_indices[row, :take] = candidate_indices
 
     return packed_support, packed_weights, packed_indices, counts
+
+
+def pack_reference_support_metadata(
+    sampling_specs: list[tuple[np.ndarray, np.ndarray] | dict[str, object]],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Pack variable-length local empirical support metadata without materializing support values."""
+    if not sampling_specs:
+        raise ValueError("sampling_specs must be non-empty.")
+
+    counts = np.asarray([sampling_spec_indices(spec).shape[0] for spec in sampling_specs], dtype=np.int64)
+    max_support = int(max(1, np.max(counts)))
+    packed_weights = np.zeros((len(sampling_specs), max_support), dtype=np.float32)
+    packed_indices = -np.ones((len(sampling_specs), max_support), dtype=np.int64)
+
+    for row, spec in enumerate(sampling_specs):
+        candidate_indices = sampling_spec_indices(spec)
+        candidate_weights = normalise_weights(sampling_spec_weights(spec), candidate_indices.shape[0])
+        take = int(candidate_indices.shape[0])
+        packed_weights[row, :take] = candidate_weights.astype(np.float32)
+        packed_indices[row, :take] = candidate_indices
+
+    return packed_weights, packed_indices, counts
 
 
 def summarize_reference_sampling_specs(

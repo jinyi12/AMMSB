@@ -1,0 +1,4 @@
+matrix_row_id,family_slug,optimizer,base_loss,regularizer,beta,joint_training,status,owner_script,best_run_dir,notes
+adamw_beta,fae_film_adamw_l2_beta_minmax,adamw,l2,none,1e-4,none,active,scripts/fae/experiments/ablation_adam/adamw_l2_minmax.sh,,FiLM baseline with beta regularization on the refreshed minmax archive
+adamw_sigreg,fae_film_adamw_sigreg_l2_minmax,adamw,l2,sigreg,0.0,none,active,scripts/fae/experiments/sigreg/rerun_film_adamw_sigreg_l2_minmax.sh,,FiLM baseline with clean-latent SIGReg regularization
+adamw_sigreg_joint_latent_csp,fae_film_adamw_sigreg_joint_latent_csp,adamw,l2,sigreg,0.0,JointTrainingWithLatentCSP,paused,scripts/fae/experiments/sigreg/rerun_film_adamw_sigreg_joint_csp_l2_minmax.sh,,Manual warm-start-only FiLM latent128 joint FAE plus latent-CSP surface with fixed sigma; fresh joint runs and dynamic sigma updates are currently disabled

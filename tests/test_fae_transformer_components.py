@@ -8,16 +8,54 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from flax.core import unfreeze
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from mmsfm.fae.fae_training_components import build_autoencoder
+from mmsfm.fae.fae_latent_utils import build_fae_from_checkpoint
 from mmsfm.fae.fae_latent_utils import make_fae_apply_fns
+from mmsfm.fae.sigreg_support import (
+    setup_transformer_sigreg_training,
+)
+from mmsfm.fae.transformer_autoencoder import _get_2d_sincos_pos_embed
 from mmsfm.fae.transformer_dit_prior import TransformerDiTPrior
-from mmsfm.fae.transformer_downstream import make_transformer_fae_apply_fns
+from mmsfm.fae.transformer_downstream import (
+    make_transformer_fae_apply_fns,
+    restore_transformer_latents,
+)
 from mmsfm.fae.transformer_prior_support import setup_transformer_prior_training
+
+
+def _fundiff_reference_1d_sincos_pos_embed_from_grid(
+    embed_dim: int,
+    pos: jnp.ndarray,
+) -> jnp.ndarray:
+    omega = jnp.arange(embed_dim // 2, dtype=jnp.float32)
+    omega /= embed_dim / 2.0
+    omega = 1.0 / (10000.0**omega)
+    out = jnp.einsum("m,d->md", pos.reshape(-1), omega)
+    return jnp.concatenate([jnp.sin(out), jnp.cos(out)], axis=1)
+
+
+def _fundiff_reference_2d_sincos_pos_embed(
+    embed_dim: int,
+    grid_size: tuple[int, int],
+) -> jnp.ndarray:
+    grid_h = int(grid_size[0])
+    grid_w = int(grid_size[1])
+    grid = jnp.meshgrid(
+        jnp.arange(grid_w, dtype=jnp.float32),
+        jnp.arange(grid_h, dtype=jnp.float32),
+        indexing="ij",
+    )
+    grid = jnp.stack(grid, axis=0)
+    grid = jnp.reshape(grid, (2, 1, grid_h, grid_w))
+    emb_h = _fundiff_reference_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[0])
+    emb_w = _fundiff_reference_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[1])
+    return jnp.concatenate([emb_h, emb_w], axis=1)[None, :, :]
 
 
 def test_build_autoencoder_supports_transformer_encoder_and_decoder() -> None:
@@ -150,6 +188,127 @@ def test_build_autoencoder_supports_patchified_transformer_encoder_and_decoder()
     assert architecture_info["transformer_max_grid_size"] == [4, 4]
     assert architecture_info["transformer_grid_size"] == [4, 4]
     assert architecture_info["transformer_decoder_query_mode"] == "coordinates"
+
+
+@pytest.mark.parametrize("grid_size", [(2, 4), (4, 2), (4, 8)])
+def test_patch_transformer_2d_sincos_pos_embed_matches_fundiff_rectangular_layout(
+    grid_size: tuple[int, int],
+) -> None:
+    ours = _get_2d_sincos_pos_embed(8, grid_size)
+    reference = _fundiff_reference_2d_sincos_pos_embed(8, grid_size)
+
+    np.testing.assert_allclose(ours, reference, rtol=1e-6, atol=1e-6)
+
+
+def test_build_autoencoder_supports_rectangular_patchified_transformer_encoder_and_decoder() -> None:
+    key = jax.random.PRNGKey(70)
+    autoencoder, architecture_info = build_autoencoder(
+        key=key,
+        latent_dim=8,
+        n_freqs=4,
+        fourier_sigma=1.0,
+        decoder_features=(16, 16),
+        encoder_type="transformer",
+        decoder_type="transformer",
+        transformer_emb_dim=16,
+        transformer_num_latents=4,
+        transformer_encoder_depth=2,
+        transformer_cross_attn_depth=1,
+        transformer_decoder_depth=2,
+        transformer_mlp_ratio=2,
+        transformer_tokenization="patches",
+        transformer_patch_size=2,
+        transformer_grid_size=(4, 8),
+        n_heads=4,
+    )
+
+    batch_size = 2
+    height = 4
+    width = 8
+    n_points = height * width
+    u = jnp.ones((batch_size, n_points, 1), dtype=jnp.float32)
+    x = jnp.stack(
+        jnp.meshgrid(
+            jnp.linspace(0.0, 1.0, width, dtype=jnp.float32),
+            jnp.linspace(0.0, 1.0, height, dtype=jnp.float32),
+            indexing="xy",
+        ),
+        axis=-1,
+    )
+    x = jnp.reshape(x, (1, n_points, 2))
+    x = jnp.broadcast_to(x, (batch_size, n_points, 2))
+
+    variables = autoencoder.init(jax.random.PRNGKey(71), u, x, x, train=False)
+    encoder_vars = {
+        "params": variables["params"]["encoder"],
+        "batch_stats": variables.get("batch_stats", {}).get("encoder", {}),
+    }
+    decoder_vars = {
+        "params": variables["params"]["decoder"],
+        "batch_stats": variables.get("batch_stats", {}).get("decoder", {}),
+    }
+    latents = autoencoder.encoder.apply(encoder_vars, u, x, train=False)
+    decoded = autoencoder.apply(variables, u, x, x, train=False)
+    subset_x = x[:, ::3, :]
+    decoded_subset = autoencoder.decoder.apply(
+        decoder_vars,
+        latents,
+        subset_x,
+        train=False,
+    )
+
+    assert latents.shape == (batch_size, 4, 16)
+    assert decoded.shape == (batch_size, n_points, 1)
+    assert decoded_subset.shape == (batch_size, subset_x.shape[1], 1)
+    assert architecture_info["transformer_grid_size"] == [4, 8]
+    assert architecture_info["transformer_max_grid_size"] == [4, 8]
+
+
+def test_restore_transformer_latents_accepts_flattened_and_token_inputs() -> None:
+    autoencoder, _architecture_info = build_autoencoder(
+        key=jax.random.PRNGKey(90),
+        latent_dim=8,
+        n_freqs=4,
+        fourier_sigma=1.0,
+        decoder_features=(16, 16),
+        encoder_type="transformer",
+        decoder_type="transformer",
+        transformer_emb_dim=16,
+        transformer_num_latents=4,
+        transformer_encoder_depth=2,
+        transformer_cross_attn_depth=1,
+        transformer_decoder_depth=2,
+        transformer_mlp_ratio=2,
+        transformer_tokenization="patches",
+        transformer_patch_size=2,
+        transformer_grid_size=(4, 4),
+        n_heads=4,
+    )
+
+    batch_size = 2
+    side = 4
+    n_points = side * side
+    u = jnp.ones((batch_size, n_points, 1), dtype=jnp.float32)
+    coords = jnp.linspace(0.0, 1.0, side, dtype=jnp.float32)
+    x = jnp.stack(jnp.meshgrid(coords, coords, indexing="ij"), axis=-1)
+    x = jnp.reshape(x, (1, n_points, 2))
+    x = jnp.broadcast_to(x, (batch_size, n_points, 2))
+
+    variables = autoencoder.init(jax.random.PRNGKey(91), u, x, x, train=False)
+    encoder_vars = {
+        "params": variables["params"]["encoder"],
+        "batch_stats": variables.get("batch_stats", {}).get("encoder", {}),
+    }
+    token_latents = autoencoder.encoder.apply(encoder_vars, u, x, train=False)
+    flat_latents = jnp.reshape(token_latents, (batch_size, -1))
+
+    restored_from_flat = restore_transformer_latents(autoencoder, flat_latents)
+    restored_from_tokens = restore_transformer_latents(autoencoder, token_latents)
+
+    assert restored_from_flat.shape == (batch_size, 4, 16)
+    assert restored_from_tokens.shape == (batch_size, 4, 16)
+    np.testing.assert_allclose(np.asarray(restored_from_flat), np.asarray(token_latents))
+    np.testing.assert_allclose(np.asarray(restored_from_tokens), np.asarray(token_latents))
 
 
 def test_transformer_decoder_subset_queries_match_dense_decode_selection() -> None:
@@ -303,6 +462,81 @@ def test_transformer_downstream_apply_fns_are_owned_separately() -> None:
     np.testing.assert_allclose(u_generic, u_tokens, rtol=1e-5, atol=1e-5)
 
 
+def test_build_fae_from_checkpoint_migrates_legacy_transformer_decoder_layout() -> None:
+    seed = 27
+    key = jax.random.PRNGKey(seed)
+    _, build_key = jax.random.split(key)
+    autoencoder, architecture_info = build_autoencoder(
+        key=build_key,
+        latent_dim=8,
+        n_freqs=4,
+        fourier_sigma=1.0,
+        decoder_features=(16, 16),
+        encoder_type="transformer",
+        decoder_type="transformer",
+        transformer_emb_dim=16,
+        transformer_num_latents=4,
+        transformer_encoder_depth=2,
+        transformer_cross_attn_depth=1,
+        transformer_decoder_depth=2,
+        transformer_mlp_ratio=2,
+        transformer_tokenization="patches",
+        transformer_patch_size=2,
+        transformer_grid_size=(4, 4),
+        n_heads=4,
+    )
+
+    batch_size = 2
+    side = 4
+    n_points = side * side
+    u = jnp.ones((batch_size, n_points, 1), dtype=jnp.float32)
+    coords = jnp.linspace(0.0, 1.0, side, dtype=jnp.float32)
+    x = jnp.stack(jnp.meshgrid(coords, coords, indexing="ij"), axis=-1)
+    x = jnp.reshape(x, (1, n_points, 2))
+    x = jnp.broadcast_to(x, (batch_size, n_points, 2))
+
+    variables = autoencoder.init(jax.random.PRNGKey(28), u, x, x, train=False)
+    current_encode, current_decode = make_transformer_fae_apply_fns(
+        autoencoder,
+        variables["params"],
+        variables.get("batch_stats", {}),
+        latent_format="tokens",
+    )
+    token_latents = current_encode(np.asarray(u), np.asarray(x))
+    current_decoded = current_decode(token_latents, np.asarray(x))
+
+    legacy_params = unfreeze(variables["params"])
+    legacy_decoder = dict(legacy_params["decoder"])
+    legacy_coordinate_decoder = dict(legacy_decoder["coordinate_decoder"])
+    legacy_decoder_core = dict(legacy_coordinate_decoder.pop("decoder_core"))
+    legacy_coordinate_decoder.update(legacy_decoder_core)
+    legacy_decoder["coordinate_decoder"] = legacy_coordinate_decoder
+    legacy_params["decoder"] = legacy_decoder
+
+    checkpoint = {
+        "architecture": architecture_info,
+        "args": {"seed": seed, "train_ratio": 0.5},
+        "params": legacy_params,
+        "batch_stats": variables.get("batch_stats", {}),
+    }
+    rebuilt_autoencoder, rebuilt_params, rebuilt_batch_stats, rebuilt_meta = build_fae_from_checkpoint(
+        checkpoint
+    )
+    rebuilt_decoder = rebuilt_params["decoder"]["coordinate_decoder"]
+    rebuilt_encode, rebuilt_decode = make_transformer_fae_apply_fns(
+        rebuilt_autoencoder,
+        rebuilt_params,
+        rebuilt_batch_stats,
+        latent_format="tokens",
+    )
+    rebuilt_decoded = rebuilt_decode(token_latents, np.asarray(x))
+
+    assert rebuilt_meta["architecture"]["decoder_type"] == "transformer"
+    assert "decoder_core" in rebuilt_decoder
+    assert "query_proj" not in rebuilt_decoder
+    np.testing.assert_allclose(rebuilt_decoded, current_decoded, rtol=1e-5, atol=1e-5)
+
+
 def test_patch_transformer_encoder_is_permutation_robust_under_jit() -> None:
     key = jax.random.PRNGKey(4)
     autoencoder, _ = build_autoencoder(
@@ -400,7 +634,7 @@ def test_patch_transformer_encoder_supports_lower_resolution_runtime_grid() -> N
 def test_build_autoencoder_rejects_mixed_transformer_and_vector_components() -> None:
     key = jax.random.PRNGKey(8)
 
-    with pytest.raises(ValueError, match="requires encoder_type='transformer' and decoder_type='transformer' together"):
+    with pytest.raises(ValueError, match="Active transformer FAE variants require a transformer encoder"):
         build_autoencoder(
             key=key,
             latent_dim=8,
@@ -420,6 +654,48 @@ def test_build_autoencoder_rejects_mixed_transformer_and_vector_components() -> 
             transformer_grid_size=(4, 4),
             n_heads=4,
         )
+
+
+def test_build_autoencoder_rejects_retired_transformer_vector_encoder_type() -> None:
+    with pytest.raises(ValueError, match="transformer_vector.*retired"):
+        build_autoencoder(
+            key=jax.random.PRNGKey(9),
+            latent_dim=12,
+            n_freqs=4,
+            fourier_sigma=1.0,
+            decoder_features=(16, 16),
+            encoder_type="transformer_vector",
+            decoder_type="transformer",
+            transformer_emb_dim=16,
+            transformer_encoder_depth=2,
+            transformer_cross_attn_depth=1,
+            transformer_decoder_depth=2,
+            transformer_mlp_ratio=2,
+            transformer_tokenization="patches",
+            transformer_patch_size=2,
+            transformer_grid_size=(4, 4),
+            n_heads=4,
+        )
+
+
+def test_build_fae_from_checkpoint_rejects_retired_transformer_vector_checkpoint() -> None:
+    checkpoint = {
+        "architecture": {
+            "type": "fae_transformer_vector",
+            "encoder_type": "transformer_vector",
+            "decoder_type": "transformer",
+            "latent_dim": 12,
+            "n_freqs": 4,
+            "fourier_sigma": 1.0,
+            "decoder_features": [16, 16],
+        },
+        "args": {"seed": 0, "train_ratio": 0.5},
+        "params": {},
+        "batch_stats": {},
+    }
+
+    with pytest.raises(ValueError, match="retired transformer_vector architecture"):
+        build_fae_from_checkpoint(checkpoint)
 
 
 def test_transformer_dit_prior_matches_encoder_token_shapes_for_point_and_patch_modes() -> None:
@@ -697,14 +973,144 @@ def test_transformer_prior_ntk_balanced_metric_runs_on_state() -> None:
 
     assert set(metric_values.keys()) == {
         "ntk_recon_trace",
+        "ntk_recon_trace_obs",
+        "ntk_recon_trace_ema",
         "ntk_prior_trace",
+        "ntk_prior_trace_obs",
+        "ntk_prior_trace_ema",
         "ntk_recon_weight",
+        "ntk_recon_weight_ema",
         "ntk_prior_weight",
+        "ntk_prior_weight_ema",
         "ntk_shared_trace_total",
+        "ntk_shared_trace_total_ema",
         "ntk_trace_ratio",
+        "ntk_trace_ratio_ema",
         "mse",
     }
     for value in metric_values.values():
+        assert np.isfinite(float(value))
+
+
+def test_transformer_sigreg_setup_adds_diagnostic_metric_without_extra_params() -> None:
+    autoencoder, _ = build_autoencoder(
+        key=jax.random.PRNGKey(74),
+        latent_dim=32,
+        n_freqs=4,
+        fourier_sigma=1.0,
+        decoder_features=(16, 16),
+        encoder_type="transformer",
+        decoder_type="transformer",
+        transformer_emb_dim=8,
+        transformer_num_latents=4,
+        transformer_encoder_depth=1,
+        transformer_cross_attn_depth=1,
+        transformer_decoder_depth=1,
+        transformer_mlp_ratio=2,
+        transformer_tokenization="points",
+        n_heads=2,
+    )
+
+    args = SimpleNamespace(
+        loss_type="l2",
+        sigreg_weight=1.0,
+        sigreg_num_slices=16,
+        sigreg_num_points=5,
+        sigreg_t_max=3.0,
+        ntk_epsilon=1e-8,
+        ntk_total_trace_ema_decay=0.99,
+        ntk_trace_update_interval=100,
+        ntk_hutchinson_probes=1,
+        ntk_output_chunk_size=0,
+        ntk_trace_estimator="rhutch",
+    )
+
+    loss_fn, metrics, reconstruct_fn = setup_transformer_sigreg_training(autoencoder, args)
+
+    assert callable(loss_fn)
+    assert len(metrics) == 1
+    assert reconstruct_fn is None
+
+
+def test_transformer_sigreg_metrics_run_on_state() -> None:
+    autoencoder, _ = build_autoencoder(
+        key=jax.random.PRNGKey(75),
+        latent_dim=32,
+        n_freqs=4,
+        fourier_sigma=1.0,
+        decoder_features=(16, 16),
+        encoder_type="transformer",
+        decoder_type="transformer",
+        transformer_emb_dim=8,
+        transformer_num_latents=4,
+        transformer_encoder_depth=1,
+        transformer_cross_attn_depth=1,
+        transformer_decoder_depth=1,
+        transformer_mlp_ratio=2,
+        transformer_tokenization="points",
+        n_heads=2,
+    )
+
+    args = SimpleNamespace(
+        loss_type="ntk_sigreg_balanced",
+        sigreg_weight=1.0,
+        sigreg_num_slices=8,
+        sigreg_num_points=5,
+        sigreg_t_max=3.0,
+        ntk_epsilon=1e-8,
+        ntk_total_trace_ema_decay=0.99,
+        ntk_trace_update_interval=100,
+        ntk_hutchinson_probes=1,
+        ntk_output_chunk_size=0,
+        ntk_trace_estimator="rhutch",
+    )
+
+    _, metrics, _ = setup_transformer_sigreg_training(autoencoder, args)
+    assert len(metrics) == 2
+
+    u_enc, x_enc, u_dec, x_dec = (
+        jnp.ones((2, 6, 1), dtype=jnp.float32),
+        jnp.linspace(0.0, 1.0, 12, dtype=jnp.float32).reshape(2, 6, 1).repeat(2, axis=-1),
+        jnp.ones((2, 6, 1), dtype=jnp.float32),
+        jnp.linspace(0.0, 1.0, 12, dtype=jnp.float32).reshape(2, 6, 1).repeat(2, axis=-1),
+    )
+
+    variables = autoencoder.init(jax.random.PRNGKey(76), u_enc, x_enc, x_dec, train=False)
+    state = SimpleNamespace(
+        params=variables["params"],
+        batch_stats=variables.get("batch_stats", {}),
+    )
+
+    sigreg_values = metrics[0](state, jax.random.PRNGKey(77), [(u_dec, x_dec, u_enc, x_enc)])
+    assert set(sigreg_values.keys()) == {
+        "sigreg",
+        "mse",
+        "latent_mean_sq",
+        "latent_var_mean",
+        "latent_var_std",
+    }
+    for value in sigreg_values.values():
+        assert np.isfinite(float(value))
+
+    ntk_values = metrics[1](state, jax.random.PRNGKey(78), [(u_dec, x_dec, u_enc, x_enc)])
+    assert set(ntk_values.keys()) == {
+        "ntk_recon_trace",
+        "ntk_recon_trace_obs",
+        "ntk_recon_trace_ema",
+        "ntk_prior_trace",
+        "ntk_prior_trace_obs",
+        "ntk_prior_trace_ema",
+        "ntk_recon_weight",
+        "ntk_recon_weight_ema",
+        "ntk_prior_weight",
+        "ntk_prior_weight_ema",
+        "ntk_shared_trace_total",
+        "ntk_shared_trace_total_ema",
+        "ntk_trace_ratio",
+        "ntk_trace_ratio_ema",
+        "mse",
+    }
+    for value in ntk_values.values():
         assert np.isfinite(float(value))
 
 

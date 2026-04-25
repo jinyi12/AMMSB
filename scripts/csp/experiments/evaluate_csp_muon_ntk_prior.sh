@@ -12,9 +12,9 @@ cd "$REPO_ROOT"
 ENV_NAME="${ENV_NAME:-3MASB}"
 CSP_RUN_DIR="${CSP_RUN_DIR:-results/csp/latent128_muon_ntk_prior/main}"
 PROFILE="${PROFILE:-publication}"  # smoke | publication
+RESOURCE_PROFILE="${RESOURCE_PROFILE:-shared_safe}"
 BACKGROUND="${BACKGROUND:-0}"
 NOHUP_LOG="${NOHUP_LOG:-}"
-CONDITIONAL_CORPUS_LATENTS_PATH="${CONDITIONAL_CORPUS_LATENTS_PATH:-data/corpus_latents_ntk_prior.npz}"
 EXTRA_ARGS=()
 
 while [[ $# -gt 0 ]]; do
@@ -46,23 +46,18 @@ while [[ $# -gt 0 ]]; do
       EXTRA_ARGS+=("$1" "$2")
       shift 2
       ;;
-    --conditional_realizations)
+    --conditional_rollout_realizations)
       CONDITIONAL_REALIZATIONS="$2"
       EXTRA_ARGS+=("$1" "$2")
       shift 2
       ;;
-    --conditional_n_test_samples)
+    --conditional_rollout_n_test_samples)
       CONDITIONAL_TEST_SAMPLES="$2"
       EXTRA_ARGS+=("$1" "$2")
       shift 2
       ;;
-    --conditional_k_neighbors)
+    --conditional_rollout_k_neighbors)
       CONDITIONAL_K_NEIGHBORS="$2"
-      EXTRA_ARGS+=("$1" "$2")
-      shift 2
-      ;;
-    --conditional_corpus_latents_path)
-      CONDITIONAL_CORPUS_LATENTS_PATH="$2"
       EXTRA_ARGS+=("$1" "$2")
       shift 2
       ;;
@@ -121,7 +116,7 @@ case "$PROFILE" in
     N_GT_NEIGHBORS="${N_GT_NEIGHBORS:-32}"
     CONDITIONAL_REALIZATIONS="${CONDITIONAL_REALIZATIONS:-8}"
     CONDITIONAL_TEST_SAMPLES="${CONDITIONAL_TEST_SAMPLES:-8}"
-    CONDITIONAL_K_NEIGHBORS="${CONDITIONAL_K_NEIGHBORS:-32}"
+    CONDITIONAL_K_NEIGHBORS="${CONDITIONAL_K_NEIGHBORS:-16}"
     OUTPUT_DIR="${OUTPUT_DIR:-${CSP_RUN_DIR}/eval/smoke_n32}"
     ;;
   publication)
@@ -129,7 +124,7 @@ case "$PROFILE" in
     N_GT_NEIGHBORS="${N_GT_NEIGHBORS:-512}"
     CONDITIONAL_REALIZATIONS="${CONDITIONAL_REALIZATIONS:-200}"
     CONDITIONAL_TEST_SAMPLES="${CONDITIONAL_TEST_SAMPLES:-50}"
-    CONDITIONAL_K_NEIGHBORS="${CONDITIONAL_K_NEIGHBORS:-200}"
+    CONDITIONAL_K_NEIGHBORS="${CONDITIONAL_K_NEIGHBORS:-16}"
     OUTPUT_DIR="${OUTPUT_DIR:-${CSP_RUN_DIR}/eval/n512}"
     ;;
   *)
@@ -156,11 +151,24 @@ CMD=(
   --seed "${SEED}"
   --coarse_split "${COARSE_SPLIT}"
   --coarse_selection "${COARSE_SELECTION}"
-  --conditional_corpus_latents_path "${CONDITIONAL_CORPUS_LATENTS_PATH}"
-  --conditional_realizations "${CONDITIONAL_REALIZATIONS}"
-  --conditional_n_test_samples "${CONDITIONAL_TEST_SAMPLES}"
-  --conditional_k_neighbors "${CONDITIONAL_K_NEIGHBORS}"
+  --resource_profile "${RESOURCE_PROFILE}"
+  --conditional_rollout_realizations "${CONDITIONAL_REALIZATIONS}"
+  --conditional_rollout_n_test_samples "${CONDITIONAL_TEST_SAMPLES}"
+  --conditional_rollout_k_neighbors "${CONDITIONAL_K_NEIGHBORS}"
 )
+
+if [[ -n "${CPU_THREADS:-}" ]]; then
+  CMD+=(--cpu_threads "${CPU_THREADS}")
+fi
+if [[ -n "${CPU_CORES:-}" ]]; then
+  CMD+=(--cpu_cores "${CPU_CORES}")
+fi
+if [[ -n "${MEMORY_BUDGET_GB:-}" ]]; then
+  CMD+=(--memory_budget_gb "${MEMORY_BUDGET_GB}")
+fi
+if [[ -n "${CONDITION_CHUNK_SIZE:-}" ]]; then
+  CMD+=(--condition_chunk_size "${CONDITION_CHUNK_SIZE}")
+fi
 
 if [[ ${#EXTRA_ARGS[@]} -gt 0 ]]; then
   CMD+=("${EXTRA_ARGS[@]}")
@@ -174,10 +182,10 @@ echo "  CSP run          : ${CSP_RUN_DIR}"
 echo "  Output           : ${OUTPUT_DIR}"
 echo "  Realizations     : ${N_REALIZATIONS}"
 echo "  GT neighbors     : ${N_GT_NEIGHBORS}"
-echo "  Cond realizations: ${CONDITIONAL_REALIZATIONS}"
-echo "  Cond test samples: ${CONDITIONAL_TEST_SAMPLES}"
-echo "  Cond k-neighbors : ${CONDITIONAL_K_NEIGHBORS}"
-echo "  Cond corpus      : ${CONDITIONAL_CORPUS_LATENTS_PATH}"
+echo "  Conditional rollout n : ${CONDITIONAL_REALIZATIONS}"
+echo "  Conditional rollout m : ${CONDITIONAL_TEST_SAMPLES}"
+echo "  Conditional rollout k : ${CONDITIONAL_K_NEIGHBORS}"
+echo "  Resource profile  : ${RESOURCE_PROFILE}"
 echo "  Coarse split     : ${COARSE_SPLIT}"
 echo "  Coarse selection : ${COARSE_SELECTION}"
 if [[ ${#EXTRA_ARGS[@]} -gt 0 ]]; then

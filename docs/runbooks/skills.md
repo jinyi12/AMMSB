@@ -1,83 +1,50 @@
 # Skills Runbook
 
-## Scope
+Repo-local Codex skills live under `.codex/skills/` and install into `$CODEX_HOME/skills` or `~/.codex/skills`.
 
-Repo-local Codex skills are versioned under `.codex/skills/`.
+The installed root also contains `.system/` skills that are not repo-managed. Ignore `*.bak.*` backup directories when auditing the installed inventory.
 
-These skills capture MMSFM-specific workflows inside the repository rather than only in external agent memory.
+## Install
 
-## Skill Map
+- Run `make install-skills` or `python scripts/install_repo_skills.py`.
+- Repo skills install as symlinks by default, so `.codex/skills/` stays the source of truth.
+- Restart Codex after installation. Skills are not hot-loaded into an existing session.
 
-- `.codex/skills/mmsfm-repo-bootstrap/`
-- `.codex/skills/mmsfm-tran-eval/`
-- `.codex/skills/mmsfm-latent-msbm-debug/`
-- `.codex/skills/mmsfm-experiment-registry/`
-- `.codex/skills/mmsfm-structural-refactor/`
+## Shared Rules
 
-## Install And Discovery
+- Keep shared policy here, not copied into every skill.
+- Understand the experiment before changing code.
+- Keep matched experimental conditions on the same shared code path except where they truly differ.
+- Ask instead of guessing when a scientific choice is unclear.
+- Fail loudly. Do not add silent fallbacks or hidden defaults for scientific parameters.
+- Keep changes direct: short entrypoints, shared functions, small owned modules.
+- Prefer plain functions over new classes. Only add a class when long-lived state or a real shared interface is genuinely required.
+- Do not introduce base classes, managers, processors, services, or orchestrators just to organize code.
+- Use names like `runtime` only when the file really owns run reconstruction or execution wiring. Do not grow generic `contract` or wrapper layers.
+- Keep metadata and summary files only when a real reader needs them.
+- Avoid degradation handling, fallback, hacks, heuristics, local stabilizations, or post-processing bandages that are not faithful general algorithms.
+- When a skill meaning changes, update the matching `agents/openai.yaml` and docs in the same patch.
+- Run the narrowest validation that can catch the change.
 
-Repo-local skills are not auto-discovered from the repository checkout itself in this environment.
+## Repo Skills
 
-The discoverable skill root is:
+- `mmsfm-repo-bootstrap`: repo orientation, setup, validation, and active versus protected boundaries
+- `mmsfm-tran-eval`: work in `scripts/fae/tran_evaluation/`, including reruns, debugging, and local cleanup
+- `mmsfm-latent-msbm-debug`: latent-MSBM compatibility run inspection, checkpoint loading, and time-grid reconstruction
+- `mmsfm-experiment-registry`: experiment docs, registries, and short shell scripts
+- `mmsfm-manuscript-writing`: manuscript prose rewrites that keep claims aligned with what is defined, proved, implemented, or measured
+- `mmsfm-structural-refactor`: active-code simplification, deduplication, and file shrinkage without architecture growth
 
-- `$CODEX_HOME/skills` when `CODEX_HOME` is set
-- otherwise `~/.codex/skills`
+## System Skills
 
-Install the repo-local skills into that global discovery directory with:
-
-```bash
-make install-skills
-```
-
-or:
-
-```bash
-python scripts/install_repo_skills.py
-```
-
-The installer symlinks repo skills into the global skill directory by default so the repository remains the source of truth.
-
-Important limitation:
-
-- installing a skill does not hot-load it into an already-running Codex session
-- start a new Codex session after installation so the runtime can discover the skills
-
-Immediate workaround in the current session:
-
-- reference the skill by path in the prompt or paste the skill contents explicitly
-- automatic trigger/use as a discovered skill still requires installation plus a new session
-
-## Intended Use
-
-`mmsfm-repo-bootstrap`
-
-- repo orientation
-- setup and validation selection
-- repo-health and hotspot scans
-
-`mmsfm-tran-eval`
-
-- running or debugging the Tran evaluation family
-- choosing between full, conditional, diagnostic, and geometry-comparison entrypoints
-
-`mmsfm-latent-msbm-debug`
-
-- inspecting run directories
-- verifying `args.txt`, `args.json`, `zt`, `time_indices`, checkpoints, and corpus latents
-
-`mmsfm-experiment-registry`
-
-- keeping experiment docs, run registries, and pipeline scripts aligned
-
-`mmsfm-structural-refactor`
-
-- structural cleanup of active MMSFM code
-- hotspot-driven refactor planning
-- boundary-aware extraction and deduplication
+- `.system/openai-docs`: OpenAI docs lookup
+- `.system/skill-creator`: skill authoring guidance
+- `.system/skill-installer`: install curated or remote skills
 
 ## References
 
 - [../../AGENTS.md](../../AGENTS.md)
 - [bootstrap.md](bootstrap.md)
+- [repo-health.md](repo-health.md)
 - [tran-evaluation.md](tran-evaluation.md)
 - [../experiments/index.md](../experiments/index.md)

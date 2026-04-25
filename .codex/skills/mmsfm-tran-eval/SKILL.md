@@ -1,34 +1,20 @@
 ---
 name: mmsfm-tran-eval
-description: Use when running, debugging, or refactoring the MMSFM Tran evaluation family, including full evaluation, latent conditional evaluation, diagnostics, corpus encoding, and latent geometry comparison. Read docs/runbooks/tran-evaluation.md and docs/evaluation_pipeline.md first.
+description: Use when running or fixing the Tran evaluation scripts in `scripts/fae/tran_evaluation/`, including conditional and compatibility-only paths.
 ---
 
 # MMSFM Tran Evaluation
 
-## Use This Skill When
+Use this skill for work inside `scripts/fae/tran_evaluation/`, including conditional evaluation and latent-MSBM compatibility support.
 
-- working in `scripts/fae/tran_evaluation/`
-- choosing between `evaluate.py`, `evaluate_conditional.py`, `evaluate_conditional_diagnostic.py`, `encode_corpus.py`, or `compare_latent_geometry_models.py`
-- debugging time-index mapping, run resolution, or latent-MSBM runtime wiring
+1. Read `docs/runbooks/tran-evaluation.md` and `docs/evaluation_pipeline.md`.
+2. Inspect the entrypoint and the local modules it already uses.
+3. Keep fixes local to `scripts/fae/tran_evaluation/`.
+4. Share code across evaluation modes when the scientific steps are the same.
+5. Patch existing loaders, metrics, and report code before adding files.
+6. Prefer plain functions over new classes. Do not add evaluation managers or orchestration objects.
+7. Do not paper over failures with degradation handling, fallback branches, hacks, heuristics, local stabilizations, or post-processing bandages that are not faithful general algorithms.
+8. Run `make test-tran-eval`.
+9. Run `make smoke-tran-eval` before wider reruns.
 
-## Workflow
-
-1. Read `docs/runbooks/tran-evaluation.md`.
-2. Read `docs/evaluation_pipeline.md`.
-3. For shared support logic, inspect:
-   `run_support.py`, `conditional_support.py`, `conditional_metrics.py`, and `latent_msbm_runtime.py`.
-4. Run `make test-tran-eval`.
-5. Run `make smoke-tran-eval` before wider reruns.
-
-## Refactor Rules
-
-- Keep reusable logic out of the giant entry scripts when ownership is clear.
-- Keep Tran-evaluation-specific helpers in the same package, not in repo-global helper bins.
-- Keep plotting, runtime loading, and metrics support in separate modules when reused by multiple entrypoints.
-
-## Primary References
-
-- `docs/runbooks/tran-evaluation.md`
-- `docs/evaluation_pipeline.md`
-- `docs/latent_geometry_formulation.md`
-- `docs/latent_geometry_plotting.md`
+Use `docs/runbooks/csp.md` instead when the task is new downstream transport work rather than evaluation or compatibility support.
