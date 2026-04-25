@@ -74,8 +74,7 @@ summary and delta tables. The pairwise plots remain useful as diagnostics or
 appendix material, but a standalone latent-geometry figure is no longer
 required for the fixed two-run comparison.
 
-## Historical note
+## Historical Note
 
-The latent128 FiLM publication geometry workflow is historical only. The old
-wrapper `scripts/fae/experiments/evaluate_latent_geometry_latent128.sh` is
-retained as a signpost, not as an active maintained launcher.
+The latent128 FiLM publication geometry workflow is historical only and is not
+part of the active experiment surface.

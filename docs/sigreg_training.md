@@ -37,7 +37,6 @@ Use the narrow validation surface for this family:
 
 ```bash
 pytest -q \
-  tests/test_sigreg.py \
   tests/test_fae_training_entrypoints.py \
   tests/test_fae_transformer_components.py \
   tests/test_ntk_clt.py \

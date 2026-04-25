@@ -58,7 +58,6 @@ test-tran-eval:
 		tests/test_tran_evaluation_conditional_support.py \
 		tests/test_tran_evaluation_conditional_metrics.py \
 		tests/test_tran_evaluation_coarse_cache.py \
-		tests/test_tran_evaluation_latent_msbm_runtime.py \
 		tests/test_tran_evaluation_statistics.py \
 		tests/test_latent_geometry_model_comparison.py \
 		tests/test_latent_geometry.py
